@@ -88,8 +88,10 @@ launches. The portal path works on Wayland and PipeWire-enabled X11 desktops.
 - Manual recording can be started, saved, and discarded from the settings page or
   through console commands. Starting and stopping/saving can also use separate,
   optional keyboard or controller bindings; both are unbound by default.
-- Full recordings and death replays use independent capture sessions. Death
-  replays retain the latest 30 seconds by default, configurable from 10 to 60
+- Full recordings, manual recordings, and death replays share one capture
+  session (at most one video capture thread and one FMOD audio thread at a
+  time); every recording scheme slices from the same source. Death replays
+  retain the latest 30 seconds by default, configurable from 10 to 60
   seconds, save after death, and resume automatically after respawn.
 - Continuous capture keeps only successful segments. Deaths, room transitions,
   pauses, SpeedrunTool loads, and custom respawn-point changes affect the final
