@@ -240,9 +240,12 @@ public static class AutoRecorder {
 
     public static void StopManual(Level? level, bool save) {
         manualMode = false;
-        if (source is null) return;
+        // Stopping manual recording never destroys the shared source: it must live until no
+        // scheme uses it anymore. If the player saves, the current full segment is finalized
+        // in the background from the still-running source; if they discard, only the current
+        // full segment is dropped. Death replay (if enabled) keeps using the same source.
         if (save && level is not null) FinalizeCurrent(level);
-        else DiscardCurrentRecording();
+        else DiscardFullTimeline();
     }
 
     public static void UpdateRecordingSwitches() {
@@ -574,9 +577,10 @@ public static class AutoRecorder {
             RecordingClip? finalClip = CurrentClip(recording.MediaTimeSeconds);
             if (finalClip is not null) clips.Add(finalClip);
         }
-        source = null;
-        Task stop = recording.StopAsync();
-        List<RecordingFinalizationJob> jobs = [];
+        // Save the current full-recording segment from the still-running shared source.
+        // The source is NOT destroyed here: other schemes (e.g. death replay) may still need
+        // it, and it must live until nothing uses it anymore. Tearing it down is done by
+        // StopAndReset once no scheme is active.
         if (fullRecordingEnabled && clips.Count > 0) {
             string output = Path.Combine(
                 FullRecordingRoot,
@@ -584,11 +588,9 @@ public static class AutoRecorder {
                 $"{DateTime.Now:yyyyMMdd-HHmmss}-{Sanitize(areaSid)}.mp4"
             );
             lastOutput = output;
-            jobs.Insert(0, new RecordingFinalizationJob(clips, output, "完整录像", reconstructBgm,
-                MicroblocksQolUtilsModule.Settings.RecordingRemoveFreezeFrames));
+            FinalizeFromSource([new RecordingFinalizationJob(clips, output, "完整录像", reconstructBgm,
+                MicroblocksQolUtilsModule.Settings.RecordingRemoveFreezeFrames)]);
         }
-        jobs.AddRange(TakeDeathReplayJobs());
-        FinishStoppedRecording(recording, stop, jobs);
         ResetFullRecordingState();
     }
 
@@ -697,7 +699,7 @@ public static class AutoRecorder {
             // Finalize the queued death replay clips against the still-running shared source.
             // Do not stop the source and do not delete its temporary files; the full/auto
             // recording keeps using them.
-            FinalizeJobs(TakeDeathReplayJobs());
+            FinalizeFromSource(TakeDeathReplayJobs());
         }
         ResetDeathReplayState(waitForStablePlayer: true);
     }
@@ -752,15 +754,6 @@ public static class AutoRecorder {
         ResetDeathReplayState(waitForStablePlayer: false);
     }
 
-    private static void DiscardCurrentRecording() {
-        NativeRoomRecording? recording = source;
-        source = null;
-        if (recording is not null) {
-            FinishStoppedRecording(recording, recording.StopAsync(), []);
-        }
-        DiscardFullTimeline();
-    }
-
     private static void StopAndReset(bool deleteSource) {
         NativeRoomRecording? recording = source;
         source = null;
@@ -812,7 +805,7 @@ public static class AutoRecorder {
         _ = FinishJobsCore(jobs, finalizationId, stop, temporaryFiles, awaitSourceDrained: true);
     }
 
-    private static void FinalizeJobs(IReadOnlyList<RecordingFinalizationJob> jobs) {
+    private static void FinalizeFromSource(IReadOnlyList<RecordingFinalizationJob> jobs) {
         if (jobs.Count == 0) return;
         // This finalization reads the shared source while it is still being captured, so it
         // registers itself as an active reader. The run-end teardown waits for all such readers
