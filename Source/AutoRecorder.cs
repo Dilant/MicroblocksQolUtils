@@ -23,6 +23,7 @@ public static class AutoRecorder {
     private static MusicPosition deathReplayMusicStart;
     private static double branchStartSeconds;
     private static double deathReplayBranchStartSeconds;
+    private static double fullSegmentBaseSeconds;
     private static bool branchSeamlessFromPrevious;
     private static bool deathReplayBranchSeamlessFromPrevious;
     private static double? pauseResumeAfterMediaSeconds;
@@ -49,9 +50,9 @@ public static class AutoRecorder {
     private static bool autoRecorderWasEnabled;
     private static bool deathReplayWasEnabled;
     private static int finalizingCount;
+    private static long currentFinalizationId;
     private static int cleanupRunning;
     private static long nextFinalizationId;
-    private static long finalizationUpdateSequence;
     private static string lastOutput = "";
     private static string lastCleanupStatus = "—";
 
@@ -63,7 +64,7 @@ public static class AutoRecorder {
     public static bool IsFinalizing => Volatile.Read(ref finalizingCount) > 0;
     public static int PendingFinalizationCount => Volatile.Read(ref finalizingCount);
     public static bool IsCleaning => Volatile.Read(ref cleanupRunning) != 0;
-    public static double CurrentSeconds => source?.MediaTimeSeconds ?? 0;
+    public static double CurrentSeconds => (source?.MediaTimeSeconds ?? 0) - fullSegmentBaseSeconds;
     public static double DisplaySeconds => CurrentSeconds;
     public static bool HasAudioTap => source?.HasAudioTap ?? false;
     public static ulong AudioFramesCaptured => source?.Statistics.AudioFramesCaptured ?? 0;
@@ -79,20 +80,22 @@ public static class AutoRecorder {
     public static double FinalizationProgress {
         get {
             lock (FinalizationProgressLock) {
-                double totalWeight = ActiveFinalizations.Values.Sum(state => state.Weight);
-                return totalWeight <= 0d
-                    ? 0d
-                    : ActiveFinalizations.Values.Sum(state => state.Progress * state.Weight) / totalWeight;
+                // Only the currently-running (serialized) finalization drives the shown
+                // progress; queued ones have not started yet.
+                long id = Volatile.Read(ref currentFinalizationId);
+                return id != 0 && ActiveFinalizations.TryGetValue(id, out FinalizationProgressState? state)
+                    ? state.Progress
+                    : 0d;
             }
         }
     }
     public static string FinalizationDescription {
         get {
             lock (FinalizationProgressLock) {
-                return ActiveFinalizations.Values
-                    .OrderByDescending(state => state.UpdateSequence)
-                    .Select(state => state.Description)
-                    .FirstOrDefault() ?? "视频";
+                long id = Volatile.Read(ref currentFinalizationId);
+                return id != 0 && ActiveFinalizations.TryGetValue(id, out FinalizationProgressState? state)
+                    ? state.Description
+                    : "视频";
             }
         }
     }
@@ -224,6 +227,9 @@ public static class AutoRecorder {
         manualMode = true;
         fullRecordingStopped = false;
         recordingStartFailed = false;
+        // A fresh manual segment counts from zero even though it slices the same shared
+        // source the auto/death-replay recording is already writing to.
+        fullSegmentBaseSeconds = source?.MediaTimeSeconds ?? 0;
         _ = EnsureRecordingAuthorization();
     }
 
@@ -416,6 +422,9 @@ public static class AutoRecorder {
         pauseResumeAfterMediaSeconds = null;
         transitioningRoom = false;
         ResetDeathReplayState(waitForStablePlayer: false);
+        // Manual recording is scoped to a single run: it ends when the player moves to the
+        // next area, so auto recording (if enabled) takes over cleanly on the new level.
+        manualMode = false;
         fullRecordingEnabled = false;
         fullRecordingStopped = false;
         recordingStartFailed = false;
@@ -443,6 +452,7 @@ public static class AutoRecorder {
         string path = Path.Combine(tempRoot, $"full-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid():N}.mkv");
         source = NativeRoomRecording.Start(path);
         if (source is null) return;
+        fullSegmentBaseSeconds = source.MediaTimeSeconds;
         ActivePrefix.Clear();
         respawnAnchor = null;
         observedRespawnPoint = level.Session.RespawnPoint;
@@ -813,6 +823,7 @@ public static class AutoRecorder {
         EnqueueFinalization(async () => {
             try {
                 await stop.ConfigureAwait(false);
+                Volatile.Write(ref currentFinalizationId, finalizationId);
                 await FinishJobsCore(jobs, finalizationId, temporaryFiles).ConfigureAwait(false);
             } finally {
                 Interlocked.Decrement(ref finalizingCount);
@@ -826,6 +837,7 @@ public static class AutoRecorder {
         Interlocked.Increment(ref finalizingCount);
         EnqueueFinalization(async () => {
             try {
+                Volatile.Write(ref currentFinalizationId, finalizationId);
                 await FinishJobsCore(jobs, finalizationId).ConfigureAwait(false);
             } finally {
                 Interlocked.Decrement(ref finalizingCount);
@@ -882,13 +894,10 @@ public static class AutoRecorder {
 
     private static long BeginFinalization(IReadOnlyList<RecordingFinalizationJob> jobs) {
         long id = Interlocked.Increment(ref nextFinalizationId);
-        double weight = jobs.Sum(job => job.Weight);
         lock (FinalizationProgressLock) {
             ActiveFinalizations[id] = new FinalizationProgressState(
-                weight,
                 0d,
-                jobs[0].Description,
-                ++finalizationUpdateSequence
+                jobs[0].Description
             );
             foreach (RecordingFinalizationJob job in jobs) {
                 ActiveFinalizationOutputs[Path.GetFullPath(job.Output)] =
@@ -909,7 +918,6 @@ public static class AutoRecorder {
             if (!ActiveFinalizations.TryGetValue(id, out FinalizationProgressState? state)) return;
             state.Progress = Math.Clamp(progress, 0d, 1d);
             state.Description = description;
-            state.UpdateSequence = ++finalizationUpdateSequence;
             string path = Path.GetFullPath(output);
             if (ActiveFinalizationOutputs.TryGetValue(path, out FinalizationOutputProgressState? outputState)
                 && outputState.FinalizationId == id) {
@@ -921,6 +929,8 @@ public static class AutoRecorder {
 
     private static void EndFinalization(long id) {
         lock (FinalizationProgressLock) {
+            if (Volatile.Read(ref currentFinalizationId) == id)
+                Volatile.Write(ref currentFinalizationId, 0);
             ActiveFinalizations.Remove(id);
             foreach (string output in ActiveFinalizationOutputs
                          .Where(pair => pair.Value.FinalizationId == id)
@@ -990,6 +1000,7 @@ public static class AutoRecorder {
         pauseSuspended = false;
         pauseResumeAfterMediaSeconds = null;
         transitioningRoom = false;
+        fullSegmentBaseSeconds = 0;
         fullRecordingEnabled = false;
         completing = false;
     }
@@ -1079,15 +1090,11 @@ public static class AutoRecorder {
     }
 
     private sealed class FinalizationProgressState(
-        double weight,
         double progress,
-        string description,
-        long updateSequence
+        string description
     ) {
-        public double Weight { get; } = weight;
         public double Progress { get; set; } = progress;
         public string Description { get; set; } = description;
-        public long UpdateSequence { get; set; } = updateSequence;
     }
 
     private sealed class FinalizationOutputProgressState(
