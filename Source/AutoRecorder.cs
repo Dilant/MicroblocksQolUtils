@@ -139,7 +139,8 @@ public static class AutoRecorder {
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
         Player? player = level.Tracker.GetEntity<Player>();
         if (player is null) return;
-        bool fullWanted = manualMode
+        bool fullWanted = completing
+            || manualMode
             || (!fullRecordingStopped && settings.AutoRecorderEnabled && ShouldRecord(player, settings));
         bool deathWanted = settings.DeathReplayEnabled;
         if (!fullWanted && !deathWanted) {
@@ -404,8 +405,12 @@ public static class AutoRecorder {
         _ = nextScene;
         _ = shouldReloadPortraits;
         _ = shouldDissociateEntities;
-        if (source is not null || runKey.Length > 0)
+        if (source is not null || runKey.Length > 0) {
+            // A completed run finalizes the whole recording (gameplay + in-level completion/
+            // 尾声) as ONE file before the source is torn down.
+            if (completing) FinalizeCurrent(level);
             StopAndReset(deleteSource: true);
+        }
     }
 
     private static void BeginRun(Level level) {
@@ -580,17 +585,19 @@ public static class AutoRecorder {
     }
 
     private static void Complete(Level level) {
-        FinalizeCurrent(level);
+        _ = level;
+        // A completion does not end the run's recording yet: keep the timeline alive through
+        // the in-level completion/尾声 so it is captured as part of the same video, and
+        // finalize once the level actually ends (LevelEnd).
+        if (source is not null && fullRecordingEnabled && !fullRecordingStopped) completing = true;
     }
 
     private static void FinalizeCurrent(Level level) {
         NativeRoomRecording? recording = source;
-        if (completing
-            || recording is null
+        if (recording is null
             || !string.Equals(RunKey(level), runKey, StringComparison.Ordinal)) {
             return;
         }
-        completing = true;
         List<RecordingClip> clips = [.. ActivePrefix];
         if (branchActive) {
             RecordingClip? finalClip = CurrentClip(recording.MediaTimeSeconds);
