@@ -38,6 +38,7 @@ public static class AutoRecorder {
     private static bool deathReplayPauseSuspended;
     private static bool deathReplayFinalizeRequested;
     private static bool fullRecordingEnabled;
+    private static bool fullRecordingStopped;
     private static bool reconstructBgm;
     private static bool completing;
     private static bool manualMode;
@@ -48,7 +49,6 @@ public static class AutoRecorder {
     private static bool autoRecorderWasEnabled;
     private static bool deathReplayWasEnabled;
     private static int finalizingCount;
-    private static int sourceReads;
     private static int cleanupRunning;
     private static long nextFinalizationId;
     private static long finalizationUpdateSequence;
@@ -133,14 +133,17 @@ public static class AutoRecorder {
 
     public static void Update(Level level) {
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        if (!settings.AutoRecorderEnabled && !settings.DeathReplayEnabled && !manualMode) {
+        Player? player = level.Tracker.GetEntity<Player>();
+        if (player is null) return;
+        bool fullWanted = manualMode
+            || (!fullRecordingStopped && settings.AutoRecorderEnabled && ShouldRecord(player, settings));
+        bool deathWanted = settings.DeathReplayEnabled;
+        if (!fullWanted && !deathWanted) {
             if (source is not null || runKey.Length > 0)
                 StopAndReset(deleteSource: true);
             return;
         }
 
-        Player? player = level.Tracker.GetEntity<Player>();
-        if (player is null) return;
         string key = RunKey(level);
         bool newRun = !string.Equals(key, runKey, StringComparison.Ordinal);
         if (newRun) {
@@ -148,8 +151,7 @@ public static class AutoRecorder {
             BeginRun(level);
         }
 
-        fullRecordingEnabled = manualMode
-            || (settings.AutoRecorderEnabled && ShouldRecord(player, settings));
+        fullRecordingEnabled = fullWanted;
         if (newRun && (settings.AutoRecorderEnabled || settings.DeathReplayEnabled))
             _ = EnsureRecordingAuthorization();
         UpdateCapture(level, player, settings);
@@ -219,6 +221,7 @@ public static class AutoRecorder {
 
     public static void StartManual() {
         manualMode = true;
+        fullRecordingStopped = false;
         recordingStartFailed = false;
         _ = EnsureRecordingAuthorization();
     }
@@ -240,10 +243,13 @@ public static class AutoRecorder {
 
     public static void StopManual(Level? level, bool save) {
         manualMode = false;
-        // Stopping manual recording never destroys the shared source: it must live until no
-        // scheme uses it anymore. If the player saves, the current full segment is finalized
-        // in the background from the still-running source; if they discard, only the current
-        // full segment is dropped. Death replay (if enabled) keeps using the same source.
+        // Stopping the full recording (manual or auto) never destroys the shared source: it
+        // must live until no scheme uses it anymore. If the player saves, the current full
+        // segment is finalized in the background from the still-running source; if they discard,
+        // only the current full segment is dropped. Death replay (if enabled) keeps using the
+        // same source. fullRecordingStopped latches the stop so auto recording does not
+        // immediately re-arm; it resets on a new run, a manual start, or re-enabling auto.
+        fullRecordingStopped = true;
         if (save && level is not null) FinalizeCurrent(level);
         else DiscardFullTimeline();
     }
@@ -257,6 +263,7 @@ public static class AutoRecorder {
             return;
         }
         if (settings.AutoRecorderEnabled && !autoRecorderWasEnabled) {
+            fullRecordingStopped = false;
             recordingStartFailed = false;
             _ = EnsureRecordingAuthorization();
         }
@@ -409,6 +416,7 @@ public static class AutoRecorder {
         transitioningRoom = false;
         ResetDeathReplayState(waitForStablePlayer: false);
         fullRecordingEnabled = false;
+        fullRecordingStopped = false;
         recordingStartFailed = false;
         recordingStartAwaiting = false;
         reconstructBgm = ShouldReconstructBgm(level);
@@ -788,45 +796,49 @@ public static class AutoRecorder {
         IReadOnlyList<RecordingFinalizationJob> jobs
     ) {
         string[] temporaryFiles = [recording.Path, recording.AudioPath];
+        // Every finalization that reads the shared source runs through one serialized worker
+        // queue, so at most one reader touches the (possibly still-growing) source at a time.
+        // The run-end teardown is enqueued after any in-flight death-replay/full finalizations,
+        // guaranteeing the source's temporary files are only deleted once all readers drained.
         if (jobs.Count == 0) {
-            _ = Task.Run(async () => {
+            EnqueueFinalization(async () => {
                 await stop.ConfigureAwait(false);
-                // A still-running death replay finalization may be reading the shared source;
-                // wait for it to finish before deleting the source's temporary files.
-                while (Volatile.Read(ref sourceReads) > 0) {
-                    await Task.Delay(20).ConfigureAwait(false);
-                }
                 DeleteTemporaryFiles(temporaryFiles);
             });
             return;
         }
         long finalizationId = BeginFinalization(jobs);
         Interlocked.Increment(ref finalizingCount);
-        _ = FinishJobsCore(jobs, finalizationId, stop, temporaryFiles, awaitSourceDrained: true);
+        EnqueueFinalization(async () => {
+            try {
+                await stop.ConfigureAwait(false);
+                await FinishJobsCore(jobs, finalizationId, temporaryFiles).ConfigureAwait(false);
+            } finally {
+                Interlocked.Decrement(ref finalizingCount);
+            }
+        });
     }
 
     private static void FinalizeFromSource(IReadOnlyList<RecordingFinalizationJob> jobs) {
         if (jobs.Count == 0) return;
-        // This finalization reads the shared source while it is still being captured, so it
-        // registers itself as an active reader. The run-end teardown waits for all such readers
-        // to drain before deleting the source's temporary files.
-        Interlocked.Increment(ref sourceReads);
         long finalizationId = BeginFinalization(jobs);
         Interlocked.Increment(ref finalizingCount);
-        _ = FinishJobsCore(jobs, finalizationId)
-            .ContinueWith(_ => Interlocked.Decrement(ref sourceReads), TaskScheduler.Default);
+        EnqueueFinalization(async () => {
+            try {
+                await FinishJobsCore(jobs, finalizationId).ConfigureAwait(false);
+            } finally {
+                Interlocked.Decrement(ref finalizingCount);
+            }
+        });
     }
 
     private static async Task FinishJobsCore(
         IReadOnlyList<RecordingFinalizationJob> jobs,
         long finalizationId,
-        Task? stop = null,
-        IReadOnlyCollection<string>? temporaryFiles = null,
-        bool awaitSourceDrained = false
+        IReadOnlyCollection<string>? temporaryFiles = null
     ) {
         bool completed = true;
         try {
-            if (stop is not null) await stop.ConfigureAwait(false);
             double totalWeight = jobs.Sum(job => job.Weight);
             double completedWeight = 0d;
             foreach (RecordingFinalizationJob job in jobs) {
@@ -850,13 +862,6 @@ public static class AutoRecorder {
                 completedWeight += job.Weight;
             }
             if (temporaryFiles is not null) {
-                if (awaitSourceDrained) {
-                    // A still-running death replay finalization may be reading the shared source;
-                    // wait for it to finish before deleting the source's temporary files.
-                    while (Volatile.Read(ref sourceReads) > 0) {
-                        await Task.Delay(20).ConfigureAwait(false);
-                    }
-                }
                 if (completed) DeleteTemporaryFiles(temporaryFiles);
                 else {
                     Logger.Log(
@@ -871,7 +876,6 @@ public static class AutoRecorder {
             Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder");
         } finally {
             EndFinalization(finalizationId);
-            Interlocked.Decrement(ref finalizingCount);
         }
     }
 
@@ -922,6 +926,38 @@ public static class AutoRecorder {
                          .Select(pair => pair.Key)
                          .ToArray()) {
                 ActiveFinalizationOutputs.Remove(output);
+            }
+        }
+    }
+
+    private static readonly Queue<Func<Task>> FinalizationQueue = new();
+    private static readonly object FinalizationQueueLock = new();
+    private static bool finalizationWorkerRunning;
+
+    private static void EnqueueFinalization(Func<Task> task) {
+        bool startWorker;
+        lock (FinalizationQueueLock) {
+            FinalizationQueue.Enqueue(task);
+            startWorker = !finalizationWorkerRunning;
+            if (startWorker) finalizationWorkerRunning = true;
+        }
+        if (startWorker) _ = RunFinalizationWorker();
+    }
+
+    private static async Task RunFinalizationWorker() {
+        while (true) {
+            Func<Task>? task;
+            lock (FinalizationQueueLock) {
+                if (FinalizationQueue.Count == 0) {
+                    finalizationWorkerRunning = false;
+                    return;
+                }
+                task = FinalizationQueue.Dequeue();
+            }
+            try {
+                await task().ConfigureAwait(false);
+            } catch (Exception exception) {
+                Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/Finalize");
             }
         }
     }

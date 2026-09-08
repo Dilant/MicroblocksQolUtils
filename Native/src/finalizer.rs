@@ -211,15 +211,51 @@ pub fn finalize_with_progress(
     let audio_temporary = working_path(output_path, "audio", "m4a");
     let mixed_pcm = working_path(output_path, "mix", "f32");
     let mux_temporary = temporary_output_path(output_path);
-    for path in [
-        &video_temporary,
-        &audio_temporary,
-        &mixed_pcm,
-        &mux_temporary,
-    ] {
-        let _ = fs::remove_file(path);
-    }
 
+    let result = (|| {
+        for path in [
+            &video_temporary,
+            &audio_temporary,
+            &mixed_pcm,
+            &mux_temporary,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+        finalize_output(
+            plan,
+            &mut report_progress,
+            output_path,
+            &video_temporary,
+            &audio_temporary,
+            &mixed_pcm,
+            &mux_temporary,
+        )
+    })();
+    if result.is_err() {
+        // Never leave a half-finished finalization's scratch files behind in the output
+        // directory, even when the finalize errors or the process is interrupted.
+        for path in [
+            &video_temporary,
+            &audio_temporary,
+            &mixed_pcm,
+            &mux_temporary,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_output(
+    plan: &FinalizePlan,
+    report_progress: &mut impl FnMut(f32),
+    output_path: &Path,
+    video_temporary: &Path,
+    audio_temporary: &Path,
+    mixed_pcm: &Path,
+    mux_temporary: &Path,
+) -> Result<(), FinalizeError> {
     let source_path = Path::new(&plan.clips[0].source);
     let effective_clips = if plan.remove_freeze_frames {
         let freezes = detect_freeze_segments(source_path, plan.fps)?;
@@ -265,11 +301,11 @@ pub fn finalize_with_progress(
             &mut decoded,
             input_time_base,
             plan,
-            &video_temporary,
+            video_temporary,
             &mut selection,
             &mut output,
             total_duration,
-            &mut report_progress,
+            &mut *report_progress,
         )?;
         if selection.finished() {
             break;
@@ -282,11 +318,11 @@ pub fn finalize_with_progress(
             &mut decoded,
             input_time_base,
             plan,
-            &video_temporary,
+            video_temporary,
             &mut selection,
             &mut output,
             total_duration,
-            &mut report_progress,
+            &mut *report_progress,
         )?;
     }
 
@@ -301,31 +337,31 @@ pub fn finalize_with_progress(
     let has_audio = finalizer_audio::build_audio_track(
         &sidecar,
         &effective_clips,
-        &mixed_pcm,
-        &audio_temporary,
+        mixed_pcm,
+        audio_temporary,
         plan.reconstruct_bgm,
         bgm_map,
     )?;
     report_progress(0.96);
     if has_audio {
-        finalizer_audio::mux_video_and_audio(&video_temporary, &audio_temporary, &mux_temporary)?;
+        finalizer_audio::mux_video_and_audio(video_temporary, audio_temporary, mux_temporary)?;
     }
     report_progress(0.99);
     fs::remove_file(output_path).ok();
     let completed = if has_audio {
-        &mux_temporary
+        mux_temporary
     } else {
-        &video_temporary
+        video_temporary
     };
     fs::rename(completed, output_path).map_err(|source| FinalizeError::Replace {
         path: output_path.to_owned(),
         source,
     })?;
     for path in [
-        &video_temporary,
-        &audio_temporary,
-        &mixed_pcm,
-        &mux_temporary,
+        video_temporary,
+        audio_temporary,
+        mixed_pcm,
+        mux_temporary,
     ] {
         let _ = fs::remove_file(path);
     }
