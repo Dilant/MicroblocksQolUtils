@@ -1784,7 +1784,10 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             if (AutoRecorder.ManualMode) return "手动录制中";
             return "自动录制中";
         }
-        if (AutoRecorder.IsFinalizing) return "正在生成视频";
+        if (AutoRecorder.IsFinalizing) {
+            int pending = AutoRecorder.PendingFinalizationCount;
+            return pending > 1 ? $"正在生成视频（还剩 {pending - 1} 个）" : "正在生成视频";
+        }
         if (AutoRecorder.ManualMode) return "已开启，等待游戏画面";
         return "空闲";
     }

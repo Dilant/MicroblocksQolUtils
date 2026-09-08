@@ -62,7 +62,10 @@ internal static class RecordingHudRenderer {
 
     private static void RenderFinalizationProgress(QolSettings settings, float top) {
         float progress = (float)Math.Clamp(AutoRecorder.FinalizationProgress, 0d, 1d);
-        string text = $"生成{AutoRecorder.FinalizationDescription}  {progress:P0}";
+        int pending = AutoRecorder.PendingFinalizationCount;
+        string text = pending > 1
+            ? $"生成{AutoRecorder.FinalizationDescription}  {progress:P0}  ·  还剩 {pending - 1} 个"
+            : $"生成{AutoRecorder.FinalizationDescription}  {progress:P0}";
         const float scale = 0.34f;
         Vector2 measured = SystemTtfFont.Measure(text, scale, UiFontWeight.Bold);
         float width = Math.Max(230f, measured.X + 28f);

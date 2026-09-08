@@ -61,6 +61,7 @@ public static class AutoRecorder {
         source is not null && MicroblocksQolUtilsModule.Settings.DeathReplayEnabled;
     public static bool IsFullRecordingEnabled => fullRecordingEnabled;
     public static bool IsFinalizing => Volatile.Read(ref finalizingCount) > 0;
+    public static int PendingFinalizationCount => Volatile.Read(ref finalizingCount);
     public static bool IsCleaning => Volatile.Read(ref cleanupRunning) != 0;
     public static double CurrentSeconds => source?.MediaTimeSeconds ?? 0;
     public static double DisplaySeconds => CurrentSeconds;
