@@ -16,7 +16,7 @@ internal static class NativeRecordingFinalizer {
             progress?.Invoke(0d);
             Directory.CreateDirectory(Path.GetDirectoryName(output)!);
             QolSettings settings = MicroblocksQolUtilsModule.Settings;
-            await NativeCaptureBridge.FinalizeRecordingAsync(
+            await CaptureBackend.Current.FinalizeRecordingAsync(
                 clips,
                 output,
                 settings.RecordingEncoder,

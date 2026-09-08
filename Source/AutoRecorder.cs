@@ -232,9 +232,9 @@ public static class AutoRecorder {
     }
 
     private static Task<bool> EnsureRecordingAuthorization(bool force = false) {
-        if (!NativeCaptureBridge.AuthorizationSupported) return Task.FromResult(true);
+        if (!CaptureBackend.Current.AuthorizationSupported) return Task.FromResult(true);
         if (!force && recordingAuthorizationTask is { IsCompleted: false }) return recordingAuthorizationTask;
-        recordingAuthorizationTask = NativeCaptureBridge.AuthorizeRecordingAsync(force);
+        recordingAuthorizationTask = CaptureBackend.Current.AuthorizeRecordingAsync(force);
         return recordingAuthorizationTask;
     }
 

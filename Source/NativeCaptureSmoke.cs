@@ -26,7 +26,7 @@ internal static class NativeCaptureSmoke {
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(output)!);
             await Task.Delay(3_000, token).ConfigureAwait(false);
-            NativeCaptureSession capture = NativeCaptureBridge.StartRecording(
+            NativeCaptureSession capture = CaptureBackend.Current.StartRecording(
                 30,
                 output,
                 "libopenh264",
@@ -62,7 +62,7 @@ internal static class NativeCaptureSmoke {
                 );
             }
             string finalized = output + ".final.mp4";
-            await NativeCaptureBridge.FinalizeRecordingAsync(
+            await CaptureBackend.Current.FinalizeRecordingAsync(
                 [new RecordingClip(output, 0, Math.Max(0.1, statistics.MediaTimeSeconds), "", 0)],
                 finalized,
                 "libopenh264",

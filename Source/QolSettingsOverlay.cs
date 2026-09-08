@@ -937,7 +937,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             return;
         }
         AutoRecorder.StartManual();
-        if (NativeCaptureBridge.AuthorizationSupported)
+        if (CaptureBackend.Current.AuthorizationSupported)
             pendingRecorderAuthorization = AutoRecorder.AuthorizationTask;
         ShowRecordingNotice("已开启手动录制");
         Audio.Play("event:/ui/main/button_toggle_on");
@@ -2077,7 +2077,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
 
     private void RefreshRecordingFiles() {
         bool firstRefresh = !recordingLibraryInitialized;
-        if (NativeCaptureBridge.AuthorizationEventCount > 0) recordingAuthorized = true;
+        if (CaptureBackend.Current.AuthorizationEventCount > 0) recordingAuthorized = true;
         int previousCount = recordingFiles.Count;
         int recorderSettingCount = RecorderRows.Count;
         int selectedSetting = recorderSelectedItem >= 0 && recorderSelectedItem < recorderSettingCount
@@ -2208,7 +2208,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         : "完整录像";
 
     private static int RecorderAuthorizeButtonCount =>
-        NativeCaptureBridge.AuthorizationSupported ? 1 : 0;
+        CaptureBackend.Current.AuthorizationSupported ? 1 : 0;
 
     private static MaterialRect RecorderButtonRect(MaterialRect hero, int index) {
         const float gap = 10f;

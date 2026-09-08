@@ -8,7 +8,7 @@ public static class NativeCaptureCommands {
     [Command("qol_capture_probe_start", "Start the native platform capture probe")]
     public static void Start() {
         probe?.Dispose();
-        probe = NativeCaptureBridge.Start(
+        probe = CaptureBackend.Current.Start(
             MicroblocksQolUtilsModule.Settings.RecordingFrameRate
         );
         Engine.Commands.Log("Native scap capture probe started.");
