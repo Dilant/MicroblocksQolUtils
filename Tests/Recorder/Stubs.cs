@@ -97,9 +97,11 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public double TimelineTimeSeconds => MediaTimeSeconds;
         public double TimeAt(ulong timestamp) => MediaTimeSeconds;
         public double FrameTimeAt(ulong timestamp, bool roundUp) => MediaTimeSeconds;
-        public double EncodedFrameTimeAt(ulong timestamp) => MediaTimeSeconds;
-        public void RequestResumeFrame(ulong timestamp) { }
-        public ulong ResumeFrameTimestamp => 1;
+          public double? AcceptedFrameTime;
+          public double EncodedFrameTimeAt(ulong timestamp) => AcceptedFrameTime ?? MediaTimeSeconds;
+          public ulong RequestedFrame;
+          public void RequestResumeFrame(ulong timestamp) { RequestedFrame = timestamp; }
+          public ulong ResumeFrameTimestamp { get; set; } = 1;
         public (ulong AudioFramesCaptured, ulong AudioChunksDropped) Statistics => (0,0);
         public bool Stopped;
         public static NativeRoomRecording? Start(string path) {
@@ -109,10 +111,10 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public Task StopAsync(){Stopped=true;return Task.CompletedTask;}
     }
     public static class NativeRecordingFinalizer {
-        public record Job(IReadOnlyList<RecordingClip> Clips,string Output,string Description);
+          public record Job(IReadOnlyList<RecordingClip> Clips,string Output,string Description,bool PreferVideoCopy);
         public static List<Job> Jobs=[];
         public static Task<bool> FinishAsync(IReadOnlyList<RecordingClip> clips,string output,string description,bool bgm,bool freeze,Action<double> progress,bool preferVideoCopy=false) {
-            Jobs.Add(new(clips,output,description)); progress(1); return Task.FromResult(true);
+              Jobs.Add(new(clips,output,description,preferVideoCopy)); progress(1); return Task.FromResult(true);
         }
     }
 }

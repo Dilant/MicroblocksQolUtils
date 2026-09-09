@@ -551,6 +551,21 @@ public static class AutoRecorder {
         saveSuspendedDeath?.RequestResumeFrame(timestamp);
     }
 
+    internal static void StageInternalRecoveryResume() {
+        // RestoreTimeline only accepts snapshots from this recording. Keep its
+        // prefix closed while the restored scene is rendered, without waiting
+        // for QolHud.Update (which runs AFTER the player's next physics step).
+        if (current is not null && waitingForStablePlayer && resumeFromSavedState)
+            saveSuspendedFull = current;
+        if (MicroblocksQolUtilsModule.Settings.DeathReplayEnabled && deathReplayCurrent is null)
+            StartDeathReplayRecording();
+        if (deathReplayCurrent is { } death) {
+            saveSuspendedDeath = death;
+            deathReplayBranchActive = false;
+            deathReplayWaitingForStablePlayer = false;
+        }
+    }
+
     internal static bool TryResumeAfterInternalSave() {
         ulong full = saveSuspendedFull?.ResumeFrameTimestamp ?? 0;
         ulong death = saveSuspendedDeath?.ResumeFrameTimestamp ?? 0;
@@ -560,7 +575,8 @@ public static class AutoRecorder {
     }
 
     private static void ResumeAfterInternalSaveFrames(ulong timestamp, ulong deathTimestamp) {
-        if (saveSuspendedFull is { } full && ReferenceEquals(full, current) && !waitingForStablePlayer) {
+        if (saveSuspendedFull is { } full && ReferenceEquals(full, current)
+            && (!waitingForStablePlayer || resumeFromSavedState)) {
             StartBranchAtCurrentTime(seamlessFromPrevious: true);
             branchStartSeconds = full.EncodedFrameTimeAt(timestamp);
         }

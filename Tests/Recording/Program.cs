@@ -54,12 +54,15 @@ var originalSlot = SaveSlotsManager.Slot;
 var normalStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(1d / 60) };
 Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "idle gate blocked gameplay");
 Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate();
-Check(RecordingSavePause.Active && RecordingSavePause.ShowIndicator && RecordingPauseAudio.Paused,
-    "save did not pause before presenting its indicator");
+Check(RecordingSavePause.Active && !RecordingSavePause.ShowIndicator && RecordingPauseAudio.Paused,
+    "save did not freeze on the exact clean boundary before its indicator");
 RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(!SpeedrunToolAutoSave.HasState, "save ran before any indicator presentation");
 int suspends = AutoRecorder.Suspends, resumes = AutoRecorder.Resumes;
 RecordingSavePause.Presented(100);
+Check(AutoRecorder.Suspends == suspends + 1 && RecordingSavePause.ShowIndicator && !SpeedrunToolAutoSave.HasState,
+    "clean saved pose did not establish the boundary before the UI");
+RecordingSavePause.Presented(110);
 RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(AutoRecorder.Suspends == suspends + 1 && SpeedrunToolRecoverySlot.Completing
     && SaveSlotsManager.SlotName == SpeedrunToolRecoverySlot.Name, "pre-clone lost its private slot lease");
@@ -132,6 +135,42 @@ Check(level.Session.Time == 456 && level.Session.Deaths == 1 && SaveData.Instanc
     "normal death statistics were rewound");
 Check(AutoRecorder.Restored!.Clips.SequenceEqual(AutoRecorder.Timeline.Clips)
     && AutoRecorder.Restored.RespawnAnchorClips!.SequenceEqual(AutoRecorder.Timeline.RespawnAnchorClips!), "timeline/respawn clips not restored");
+
+// Reproduce the real Engine.Update -> synchronous SRT load -> catch-up updates
+// -> presentation/async GPU delivery ordering. No camera/player/scene step may
+// happen between the clone restore and the first accepted recovery frame.
+level = Reset(); level.Position = 123; level.CameraPosition = 72; level.SceneFrame = 901;
+SaveHere(level);
+for (int attempt = 0; attempt < 3; attempt++) {
+    level.Position = 999; level.CameraPosition = 888; level.SceneFrame = 1500;
+    body = Die(level); body.CallEnd();
+    AutoRecorder.ResumeReady = false;
+    RecordingDeathRecovery.AfterEngineUpdate();
+    Check(RecordingSavePause.Active && level.Position == 123 && level.CameraPosition == 72 && level.SceneFrame == 901,
+        "restored pose was not frozen immediately after internal load");
+    for (int frame = 0; frame < 12; frame++) {
+        for (int catchup = 0; catchup < 10; catchup++) {
+            var elapsed = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
+            if (RecordingSavePause.BeforeEngineUpdate(ref elapsed)) {
+                level.Position += 20; level.CameraPosition += 8; level.SceneFrame++;
+            }
+        }
+        RecordingSavePause.Presented((ulong)(1000 + frame));
+    }
+    Check(level.Position == 123 && level.CameraPosition == 72 && level.SceneFrame == 901 && RecordingSavePause.Active,
+        "load catch-up/slow GPU skipped the saved pose before it could be recorded");
+    AutoRecorder.ResumeReady = true;
+    RecordingSavePause.Presented(2000);
+    Check(!RecordingSavePause.Active, "accepted recovery frame did not release physics");
+    var resume = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
+    Check(RecordingSavePause.BeforeEngineUpdate(ref resume) && resume.ElapsedGameTime <= TimeSpan.FromSeconds(1d / 60),
+        "load wall-time leaked into the first resumed physics step");
+}
+
+level = Reset(); SaveHere(level); body = Die(level); body.CallEnd();
+RecordingDeathRecovery.AfterEngineUpdate();
+Engine.Scene = new Level(); RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "scene switch leaked the recovery gate");
 
 // Multiple manual SL branches followed by both clear-current and clear-all must
 // leave an independent, rebased recording recovery point.

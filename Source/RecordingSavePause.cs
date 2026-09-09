@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 // Render/presentation driven, not a timer: the save cannot start until the
 // indicator was presented, and gameplay cannot resume onto an indicator frame.
 internal static class RecordingSavePause {
-    private enum Phase { None, Indicator, Save, Cloning, Clean, ResumeFrame }
+    private enum Phase { None, Boundary, Indicator, Save, Cloning, Loading, Clean, ResumeFrame }
     private static Phase phase;
     private static Level? level;
     private static Action<RecoveryResult>? completed;
@@ -26,7 +26,9 @@ internal static class RecordingSavePause {
             if (time.ElapsedGameTime > lastStep) time = new GameTime(time.TotalGameTime, lastStep, time.IsRunningSlowly);
             resumeStep = false;
         }
-        if (time.ElapsedGameTime > TimeSpan.Zero) lastStep = time.ElapsedGameTime;
+        if (time.ElapsedGameTime > TimeSpan.Zero)
+            lastStep = time.ElapsedGameTime < TimeSpan.FromSeconds(1d / 60)
+                ? time.ElapsedGameTime : TimeSpan.FromSeconds(1d / 60);
         return true;
     }
 
@@ -35,8 +37,29 @@ internal static class RecordingSavePause {
         level = owner;
         completed = onComplete;
         beganAt = Environment.TickCount64;
-        phase = Phase.Indicator;
+        // Present the exact frozen state once before drawing any save UI. This
+        // is the end-exclusive timeline boundary AND the state cloned by SRT.
+        phase = Phase.Boundary;
         RecordingPauseAudio.Pause();
+    }
+
+    internal static bool BeginRecovery(Level owner) {
+        if (Active) return false;
+        level = owner;
+        beganAt = Environment.TickCount64;
+        phase = Phase.Loading;
+        RecordingPauseAudio.Pause();
+        return true;
+    }
+
+    internal static void CompleteRecovery() {
+        // SRT has restored entities, camera and scene clocks. Do not run even
+        // ONE gameplay update before that exact state reaches both encoders.
+        RecordingDeathAudio.StopRemainder();
+        AutoRecorder.StageInternalRecoveryResume();
+        phase = Phase.Clean;
+        cleanFrames = 0;
+        RecordingPauseAudio.Resume();
     }
 
     internal static void Update() {
@@ -67,10 +90,12 @@ internal static class RecordingSavePause {
     }
 
     internal static void Presented(ulong timestamp) {
-        if (phase == Phase.Indicator) {
-            // End-exclusive boundary at the FIRST UI frame, in the same clock
-            // used by video and PCM, even if GPU delivery is several frames late.
+        if (phase == Phase.Boundary) {
+            // Exclude this saved pose here; include it exactly once at resume.
+            // Earlier GPU deliveries cannot move the cut behind the state clone.
             AutoRecorder.SuspendForInternalSave(timestamp);
+            phase = Phase.Indicator;
+        } else if (phase == Phase.Indicator) {
             phase = Phase.Save;
         } else if (phase == Phase.Clean && ++cleanFrames >= 2) {
             // Request on the source clock, before this clean presentation enters

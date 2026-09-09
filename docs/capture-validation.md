@@ -253,6 +253,22 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 证据：`.work/instant-death-replay/.work/` 下 `rust-tests.log`、`policy-tests.log`、
 `managed-tests.log`、`integration.log`、`benchmark.log`、`benchmark.ps1` 和各输出 MP4。
 
+### 2026-09-10：内部读档恢复首帧冻结
+
+- 用户 `20260910-013227-513` 完整录像逐帧检查：约 3.83s、26.33s 的存档恢复接缝有角色/镜头跳变；
+  timeline 已全部标记 seamless，所以继续关闭 crossfade 不能修复缺失的游戏状态。
+- 原内部 load 在 Engine.Update 末尾同步完成，但下一次玩家物理更新先于 QolHud 重新开启录制分支。
+  现在 load 前进入冻结门，load 后保持冻结，直到两路 sink 接受各自恢复关键帧；首个物理步不使用读档积累的 wall time。
+  保存增加无 UI 的 boundary presentation，边界姿态留到恢复分支包含，指示器和后台克隆期间均不更新游戏。
+- `Tests/Recording` **122** assertions：三次恢复中每次模拟 120 个长 elapsed 补步和延迟采集，
+  检查位置、镜头、场景帧号不变，收到确认后才恢复；同时保留独立槽、清槽、无标记、死亡统计、失败回退和场景切换测试。
+- `Tests/Recorder` **105** checks：生产 AutoRecorder 双路确认、独立起点、重复恢复、只保留成功分支、
+  硬切和死亡回放 prefer-video-copy 标记。Recording.Policy、Capture、真实原始/Cache SRT hook 兼容测试通过。
+- Rust **53 passed / 2 ignored**（含真实 FFmpeg/D3D11）；实际 SDL/FMOD 双录制集成 **238** 视频 / **439** 音频 callback。
+  保存 gap 的 GOP 硬切复制约 **29.8ms**，1.5s 普通死亡回放约 **54.7ms**；均为小尺寸测试，不是用户 2560×1506 的性能保证。
+  生成 MP4 完整解码通过，Release 构建零警告/错误。证据在 `.work/recovery-frame-seams/.work/`。
+- 这些验证不能替代用户模组组合下重新录制的实机验收；旧 MP4 的缺失帧不会凭空恢复。
+
 ## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。

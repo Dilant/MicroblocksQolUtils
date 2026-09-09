@@ -50,9 +50,15 @@ internal static class RecordingDeathRecovery {
             // A normal death must not rewind time/death statistics, even if the
             // user's manual SL configuration has SaveTimeAndDeaths enabled.
             DeathStatistics statistics = DeathStatistics.Capture(level);
+            if (!RecordingSavePause.BeginRecovery(level)) return;
             result = SpeedrunToolAutoSave.TryLoad(level);
-            if (result == RecoveryResult.Busy) return;
-            if (result == RecoveryResult.Success) statistics.Restore(level);
+            if (result == RecoveryResult.Success) {
+                statistics.Restore(level);
+                RecordingSavePause.CompleteRecovery();
+            } else {
+                RecordingSavePause.Cancel();
+                if (result == RecoveryResult.Busy) return;
+            }
         }
         On.Celeste.PlayerDeadBody.orig_End? original = fallback;
         pendingBody = null;

@@ -47,7 +47,7 @@ namespace Celeste {
         public bool Completed, Transitioning, Paused, InCutscene, SkippingCutscene;
         public bool GoldenMarked;
         public bool TimerMarked => Session.GetFlag("SpeedrunTool_SavedSate");
-        public int Position, Reloads;
+        public int Position, CameraPosition, SceneFrame, Reloads;
         public void Reload() => Reloads++;
     }
     public class Tracker {
@@ -105,7 +105,10 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static void SuspendForInternalSave(ulong time) => Suspends++;
         public static void ResumeAfterInternalSave(ulong time) => Resumes++;
         public static void PrepareInternalSaveResume(ulong time) { }
-        public static bool TryResumeAfterInternalSave() { Resumes++; return true; }
+        public static bool ResumeReady = true;
+        public static int RecoveryStages;
+        public static void StageInternalRecoveryResume() => RecoveryStages++;
+        public static bool TryResumeAfterInternalSave() { if (!ResumeReady) return false; Resumes++; return true; }
         public static void CancelInternalSave() { }
         public static bool IsRecording = true, CanSaveTransitionTimeline = true;
         public static string CurrentPath = "run.mkv";
@@ -156,7 +159,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         public string? PreCloneObservedSlot;
         public Dictionary<Type, Dictionary<string, object>> Values = [];
         private Session? savedSession;
-        private int savedPosition;
+        private int savedPosition, savedCamera, savedFrame;
         private bool savedGolden;
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -168,6 +171,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             Values.Clear();
             Level level = (Level)Monocle.Engine.Scene!;
             savedSession = level.Session.Copy(); savedPosition = level.Position; savedGolden = level.GoldenMarked;
+            savedCamera = level.CameraPosition; savedFrame = level.SceneFrame;
             IsSaved = true;
             Utils.StateMarkUtils.ReColor(Values, level);
             SaveLoadAction.Save?.Invoke(Values, level);
@@ -184,6 +188,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             if (Throw) throw new InvalidOperationException("expected failure");
             Level level = (Level)Monocle.Engine.Scene!;
             level.Session = savedSession!.Copy(); level.Position = savedPosition; level.GoldenMarked = savedGolden;
+            level.CameraPosition = savedCamera; level.SceneFrame = savedFrame;
             level.Tracker.Player = new();
             Utils.StateMarkUtils.ReColor(Values, level);
             SaveLoadAction.Load?.Invoke(Values, level);

@@ -96,6 +96,44 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Check(clips.Count==2 && clips[1].SeamlessFromPrevious,"validated saved-state recovery still crossfades");
     Check(clips.Sum(c=>c.DurationSeconds)==5,"seamless recovery kept failed gameplay");
 }
+// Real orchestrator: an internal recovery opens from the accepted source frame,
+// not the later wall clock / first QolHud.Update. Full and death sinks may lag
+// independently; both must be ready before opening either branch.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(3);
+    AutoRecorder.SuspendForInternalSave(100);
+    var saved=AutoRecorder.CaptureTimeline(l)!;
+    Advance(1); AutoRecorder.ResumeAfterInternalSave(200); Advance(2);
+    On.Celeste.Player.Raise(p); AutoRecorder.AfterEngineUpdate();
+    var full=NativeRoomRecording.Started.First();
+    p.Dead=false; AutoRecorder.RestoreTimeline(l,saved);
+    AutoRecorder.StageInternalRecoveryResume();
+    var death=NativeRoomRecording.Started.Last();
+    Check(!ReferenceEquals(full,death) && !death.Stopped,"recovery did not create a fresh death sink while frozen");
+    full.ResumeFrameTimestamp=death.ResumeFrameTimestamp=0;
+    full.MediaTimeSeconds=10; death.MediaTimeSeconds=1;
+    AutoRecorder.PrepareInternalSaveResume(1000);
+    Check(full.RequestedFrame==1000 && death.RequestedFrame==1000,"recovery did not request a GOP boundary from both sinks");
+    full.ResumeFrameTimestamp=1001; full.AcceptedFrameTime=10;
+    Advance(0.5);
+    Check(!AutoRecorder.TryResumeAfterInternalSave(),"full sink released recovery before death sink accepted the frame");
+    Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"GPU wait entered the saved prefix");
+    death.ResumeFrameTimestamp=1002; death.AcceptedFrameTime=1.2;
+    Check(AutoRecorder.TryResumeAfterInternalSave(),"both accepted frames did not resume recovery");
+    Advance(2); On.Celeste.Player.Raise(p); AutoRecorder.AfterEngineUpdate();
+    var replay=NativeRecordingFinalizer.Jobs.Last(j=>j.Description=="死亡回放");
+    Check(replay.PreferVideoCopy,"recovery regressed death replay to mandatory full video transcode");
+    Check(replay.Clips.Count==1 && replay.Clips[0].StartSeconds==1.2 && replay.Clips[0].SeamlessFromPrevious,
+        "death replay did not start at its accepted clean keyframe");
+    p.Dead=false; AutoRecorder.RestoreTimeline(l,saved); AutoRecorder.StageInternalRecoveryResume();
+    full.AcceptedFrameTime=20; full.MediaTimeSeconds=20.3;
+    AutoRecorder.PrepareInternalSaveResume(2000);
+    Check(AutoRecorder.TryResumeAfterInternalSave(),"repeated recovery could not resume");
+    Advance(2); AutoRecorder.StopManual(l,true); AutoRecorder.AfterEngineUpdate();
+    var clips=NativeRecordingFinalizer.Jobs.Last(j=>j.Description!="死亡回放").Clips;
+    Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==20
+        && clips[1].SeamlessFromPrevious,"repeated recovery retained failed gameplay or used resume wall time/crossfade");
+}
 foreach(var mode in new[]{AutoRecordingMode.Off,AutoRecordingMode.Chapter}) {
     var(l,p,b)=Begin(mode);if(mode==AutoRecordingMode.Off)AutoRecorder.StartManual();Tick(l);Advance(5);
     On.Celeste.Player.Raise(p);Tick(l);p.Dead=false;Tick(l);Advance(2);AutoRecorder.StopManual(l,true);Tick(l);
