@@ -118,4 +118,17 @@ using(var reportJson=JsonDocument.Parse(JsonSerializer.Serialize(report,reportTy
     Check(r.GetProperty("SubmittedFps").GetDouble()==60 && r.GetProperty("EncoderInputFps").GetDouble()==38
         && r.GetProperty("UnderTarget").GetBoolean(),"capture report hid encoder loss behind nominal FPS");
 }
+// Check the production death-job factory, not a standalone forced fast-export call.
+settings.RecordingDirectory = Path.Combine(Path.GetTempPath(), "mqol-policy-output");
+var pendingType = typeof(AutoRecorder).GetNestedType("PendingDeathReplay", BindingFlags.NonPublic)!;
+var pending = (System.Collections.IList)typeof(AutoRecorder)
+    .GetField("PendingDeathReplays", PrivateStatic)!.GetValue(null)!;
+pending.Add(Activator.CreateInstance(pendingType,
+    new object[] { new[] { clip }, DateTime.Now, "test/area", "room", true, true })!);
+var jobs = ((System.Collections.IEnumerable)Call("TakeDeathReplayJobs")!).Cast<object>().ToArray();
+Check(jobs.Length == 1 && (bool)jobs[0].GetType().GetProperty("PreferVideoCopy")!.GetValue(jobs[0])!,
+    "death replay job did not request packet copy");
+Check((bool)jobs[0].GetType().GetProperty("RemoveFreezeFrames")!.GetValue(jobs[0])!,
+    "fast replay silently disabled freeze-frame editing");
+Check(pending.Count == 0, "death replay job was not consumed");
 Console.WriteLine("PASS production AutoRecorder room policy, both sink branches, restore/short rooms, explicit mix mode, death trim, snapshots and legacy metadata");

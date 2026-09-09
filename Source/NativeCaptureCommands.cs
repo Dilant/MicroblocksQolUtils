@@ -39,19 +39,21 @@ public static class NativeCaptureCommands {
     [Command("qol_record_start", "Start manual run recording")]
     public static void StartManualRecording() {
         AutoRecorder.StartManual();
-        Engine.Commands.Log("Manual recording armed; capture starts when gameplay resumes.");
+        Engine.Commands.Log(AutoRecorder.ManualMode
+            ? "Manual recording armed; capture starts when gameplay resumes."
+            : "A recording is already active; its origin is unchanged.");
     }
 
-    [Command("qol_record_save", "Stop and save the current manual recording")]
+    [Command("qol_record_save", "Stop and save the current recording")]
     public static void SaveManualRecording() {
         AutoRecorder.StopManual(Engine.Scene as Level, save: true);
-        Engine.Commands.Log("Manual recording stopped and queued for finalization.");
+        Engine.Commands.Log("Recording stopped and queued for finalization.");
     }
 
-    [Command("qol_record_discard", "Stop and discard the current manual recording")]
+    [Command("qol_record_discard", "Stop and discard the current recording")]
     public static void DiscardManualRecording() {
         AutoRecorder.StopManual(Engine.Scene as Level, save: false);
-        Engine.Commands.Log("Manual recording discarded.");
+        Engine.Commands.Log("Recording discarded.");
     }
 
     [Command("qol_record_status", "Show manual/automatic recording status")]

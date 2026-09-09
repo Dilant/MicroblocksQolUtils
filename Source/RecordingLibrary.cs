@@ -4,7 +4,8 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 internal enum RecordingLibraryKind {
     DeathReplay,
-    Full
+    Full,
+    Automatic
 }
 
 internal readonly record struct RecordingLibraryEntry(
@@ -120,7 +121,9 @@ internal static class RecordingLibrary {
     internal static RecordingLibraryKind KindOf(string root, string path) {
         return IsUnderDirectory(path, Path.Combine(root, "deaths"))
             ? RecordingLibraryKind.DeathReplay
-            : RecordingLibraryKind.Full;
+            : IsUnderDirectory(path, Path.Combine(root, "auto"))
+                ? RecordingLibraryKind.Automatic
+                : RecordingLibraryKind.Full;
     }
 
     private static bool IsUnderDirectory(string path, string directory) {

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><LangVersion>latest</LangVersion>
+    <CelesteRoot Condition="'$(CelesteRoot)' == ''">C:/SteamLibrary/steamapps/common/Celeste</CelesteRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Source/SpeedrunToolAutoSave.cs" Link="SpeedrunToolAutoSave.cs" />
+    <Compile Include="../../Source/SpeedrunToolRecoverySlot.cs" Link="SpeedrunToolRecoverySlot.cs" />
+    <Compile Include="../../Source/RecordingDeathRecovery.cs" Link="RecordingDeathRecovery.cs" />
+    <Compile Include="../../Source/RecordingTransitionAutoSave.cs" Link="RecordingTransitionAutoSave.cs" />
+    <Compile Include="../../Source/SpeedrunToolBridge.cs" Link="SpeedrunToolBridge.cs" />
+    <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs" />
+    <Reference Include="Mono.Cecil"><HintPath>$(CelesteRoot)/Mono.Cecil.dll</HintPath></Reference>
+    <Reference Include="MonoMod.RuntimeDetour"><HintPath>$(CelesteRoot)/MonoMod.RuntimeDetour.dll</HintPath></Reference>
+    <Reference Include="MonoMod.Utils"><HintPath>$(CelesteRoot)/MonoMod.Utils.dll</HintPath></Reference>
+    <Reference Include="MonoMod.Core"><HintPath>$(CelesteRoot)/MonoMod.Core.dll</HintPath></Reference>
+    <Reference Include="MonoMod.ILHelpers"><HintPath>$(CelesteRoot)/MonoMod.ILHelpers.dll</HintPath></Reference>
+    <Reference Include="MonoMod.Backports"><HintPath>$(CelesteRoot)/MonoMod.Backports.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

@@ -9,7 +9,8 @@ internal static class NativeRecordingFinalizer {
         string description,
         bool reconstructBgm,
         bool removeFreezeFrames,
-        Action<double>? progress = null
+        Action<double>? progress = null,
+        bool preferVideoCopy = false
     ) {
         try {
             if (clips.Count == 0 || clips.Any(clip => !File.Exists(clip.Source))) return false;
@@ -25,7 +26,8 @@ internal static class NativeRecordingFinalizer {
                 reconstructBgm,
                 removeFreezeFrames,
                 settings.BgmEventMapFile,
-                value => progress?.Invoke(value * 0.99d)
+                preferVideoCopy: preferVideoCopy,
+                progress: value => progress?.Invoke(value * 0.99d)
             ).ConfigureAwait(false);
             await File.WriteAllTextAsync(
                 output + ".timeline.json",

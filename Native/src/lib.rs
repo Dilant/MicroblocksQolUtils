@@ -27,6 +27,8 @@ mod encoder;
 mod finalizer;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_audio;
+#[cfg(feature = "ffmpeg")]
+mod finalizer_copy;
 
 const ABI_VERSION: u32 = 8;
 const OK: i32 = 0;

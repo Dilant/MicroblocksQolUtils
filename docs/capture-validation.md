@@ -37,7 +37,7 @@
 两条轨尾部相差 3 帧来自顺序停止时第二条仍运行，不能把 120 秒墙钟直接当作每条视频的首帧原点。
 启动后缓存排空；两路峰值分别 56/111 帧，RAM 排队各 15,421,504 bytes，spool 排队 318,067,200 / 636,134,400 bytes。
 正常结束后测试目录无 `mqol-frames-*.tmp` 残留。
-最终构建又做了 20 秒双路滚动复验：1185/1188 帧，各级视频/音频丢失、source pool/PCM 丢失及 callback 错误均为 0。
+主线整合前的构建又做了 20 秒双路滚动复验：1185/1188 帧，各级视频/音频丢失、source pool/PCM 丢失及 callback 错误均为 0。
 构建包与安装到 `C:\SteamLibrary\steamapps\common\Celeste\Mods\MicroblocksQolUtils.zip` 的文件 SHA256 一致：
 `BF7B5F80A7CC48A7D9EA7F08BFFD755FE19126BE143554532BF73E7E55DF27D5`。
 这是完整采集管线测试，不冒充用户真实游戏重新通关的测试；其他 GPU、慢磁盘、长期过载仍需实际测量。
@@ -45,6 +45,16 @@
 证据：`.work/frame-cadence/.work/fna-final.log`、`fna-final/report.txt`、两个 MKV 的 `.cadence.json`、
 `export-final/cadence-final.mp4.cadence.json`、`export-frame.png`。
 早期失败的 native、GL 吞吐 prototype 及压缩实验日志保留在同目录；GL prototype 渲染自身达不到 120 FPS，未用来宣称游戏 OpenGL 后端吞吐失败。
+
+### 与期间新增主线提交整合
+
+保留并合并主线 `9f44e03` 中的自动录制策略、独立恢复存档、快速死亡回放和界面变更，未以旧工作树覆盖这些功能。
+合并后的 Rust FFmpeg 回归 **52 passed / 2 hardware ignored**；Capture、Recording.Policy 均通过，Recorder **94** 项、Recording recovery **89** 项通过；真实已安装 SpeedrunTool 的私有 slot/静默 hooks 互操作验证通过，未生成游戏存档。
+重新跑 SDL/GL＋FMOD＋快速回放集成和 2560×1506 双路滚动 20 秒（1186/1188 帧，全部丢弃/异常计数 0）；
+最新 finalizer 对两分钟原始录像再次输出 **7186 帧 / 60 FPS / 编号重复与倒序 0**。
+另在实际录像所在 **C 盘** 的 `C:\Users\17153\Videos\Celeste\.work\mqol-cadence-verification-20260909` 重跑双录制，source pool/PCM、native/订阅的视频和音频丢失均为 0。
+最终安装包与构建包 SHA256 一致：`F0EDB1626CB9997A9F323727125A61740D79A48E6FA2FC206868EF0A2BE18194`。
+合并回归证据在 `.work/frame-cadence/.work/merged-*.log`、`merged-export/`、`c-volume-verify.log`。
 
 ### 回归与复现
 
@@ -214,7 +224,36 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 真实游戏 smoke：仅为该次启动设置 `MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT` 到 `.work/*.mkv`。
 等 Overworld/Level 加载后开始，写 `.passed` 或 `.failed`；不要把这个环境变量永久写入 Steam/系统。
 
-## 未证明的部分
+## 补充验证
+
+### 2026-09-09：死亡回放复用已编码画面
+
+- Rust **49/49**，包含真实 D3D11 测试及 FFmpeg 集成。新增连续范围判定、非关键帧裁切、
+  跨 GOP seek、0 秒起点、20ms 短片、room metadata 边界和无音频输出；
+  对输出的可见 H.264 包逐字节比较原始 MKV，并解码验证画面、帧数与音画时间（误差不超过一帧）。
+  原不连续范围/crossfade 测试改为请求快速路径，验证其安全回退到精确转码。
+- managed Capture / Recording.Policy 回归通过；实际 AutoRecorder 死亡任务工厂会传递快速路径标记，
+  同时保留用户的冻结帧编辑设置。Release 构建零 C# 警告、零错误。
+- 实际 SDL OpenGL + FMOD 双录制集成：238 像素 / 421 音频 callback、像素错误 0、
+  两个 sink 视频队列均丢弃 0。额外通过 managed/native bridge 保存非关键帧起点、
+  普通→敏感房 metadata 的 1.5 秒快速回放，用时 **56.2ms**（小尺寸测试画面，非 720p 性能数据）。
+  生成的全部 MP4 均通过 FFmpeg 完整解码。
+- 同机 Release synthetic benchmark：12 秒 1280×720@60 H.264 源，保留从 1.25s 开始的 10s，
+  8 Mbps、stereo 48kHz 音频，两条路径同用 libopenh264/AAC：
+
+  | 最终化路径 | 耗时 | 视频 / 音频时长 |
+  | --- | ---: | --- |
+  | 原完整转码 | 3203.6ms | 10.000s / 10.005s |
+  | 复用视频包 | 603.5ms | 9.999s / 10.005s |
+
+  两种输出的音视频起点均为 0，完整解码无错误。这是一次合成素材对比，
+  **不包含死亡时尚未排空的实时编码队列**，不代表用户全部模组/地图下的点击到播放耗时。
+  长回放音频编码、磁盘或录制积压仍可能增加等待，复杂剪辑/冻结帧编辑仍需转码。
+
+证据：`.work/instant-death-replay/.work/` 下 `rust-tests.log`、`policy-tests.log`、
+`managed-tests.log`、`integration.log`、`benchmark.log`、`benchmark.ps1` 和各输出 MP4。
+
+## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。
 Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。
