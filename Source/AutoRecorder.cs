@@ -57,6 +57,8 @@ public static class AutoRecorder {
 
     public static bool ManualMode => manualMode;
     public static bool IsRecording => current is not null;
+    internal static bool CanSaveTransitionTimeline => current is not null && branchActive
+        && !waitingForStablePlayer && !pauseSuspended && !transitioningRoom;
     public static bool IsDeathReplayRecording => deathReplayCurrent is not null;
     public static bool IsFullRecordingEnabled => fullRecordingEnabled;
     public static bool IsFinalizing => Volatile.Read(ref finalizingCount) > 0;
@@ -118,11 +120,13 @@ public static class AutoRecorder {
         On.Celeste.Level.RegisterAreaComplete += RegisterAreaComplete;
         Everest.Events.Level.OnEnd += LevelEnd;
         SpeedrunToolBridge.Load();
+        RecordingDeathRecovery.Load();
         CleanupRecordings();
     }
 
     public static void Unload() {
         manualMode = false;
+        RecordingDeathRecovery.Unload();
         SpeedrunToolBridge.Unload();
         Everest.Events.Level.OnEnd -= LevelEnd;
         On.Celeste.Level.RegisterAreaComplete -= RegisterAreaComplete;
@@ -155,11 +159,13 @@ public static class AutoRecorder {
     }
 
     public static void AfterEngineUpdate() {
-        if (!deathReplayFinalizeRequested) return;
-        deathReplayFinalizeRequested = false;
-        // Stopping detaches FMOD DSPs synchronously. Do it only after Scene/EntityList.Update
-        // has finished so death processing cannot re-enter or invalidate entity enumeration.
-        FinalizeDeathReplayCapture();
+        if (deathReplayFinalizeRequested) {
+            deathReplayFinalizeRequested = false;
+            // Finish the failed attempt before an internal load replaces its entities.
+            FinalizeDeathReplayCapture();
+        }
+        RecordingDeathRecovery.AfterEngineUpdate();
+        RecordingTransitionAutoSave.AfterEngineUpdate();
     }
 
     private static void UpdateFullRecording(Level level, Player player, QolSettings settings) {
@@ -192,8 +198,10 @@ public static class AutoRecorder {
         }
 
         Vector2? respawn = level.Session.RespawnPoint;
-        if (branchActive && RespawnPointChanged(observedRespawnPoint, respawn))
+        if (branchActive && RespawnPointChanged(observedRespawnPoint, respawn)) {
             respawnAnchor = new RecordingTimelineSnapshot(CaptureCurrentClips(recording));
+            RecordingTransitionAutoSave.Queue(level, level.Session.Level);
+        }
         observedRespawnPoint = respawn;
     }
 
@@ -308,6 +316,7 @@ public static class AutoRecorder {
     ) {
         PlayerDeadBody? body = orig(self, direction, evenIfInvincible, registerDeathInStats);
         if (body is null) return body;
+        RecordingTransitionAutoSave.Cancel();
 
         if (deathReplayCurrent is not null) {
             QueueDeathReplay(self, deathReplayCurrent);
@@ -337,7 +346,10 @@ public static class AutoRecorder {
         Vector2 direction
     ) {
         orig(self, next, direction);
-        if (current is not null) transitioningRoom = true;
+        if (current is not null) {
+            transitioningRoom = true;
+            RecordingTransitionAutoSave.Queue(self, next.Name);
+        }
     }
 
     private static void RegisterAreaComplete(On.Celeste.Level.orig_RegisterAreaComplete orig, Level self) {
@@ -389,6 +401,7 @@ public static class AutoRecorder {
         respawnAnchor = null;
         observedRespawnPoint = level.Session.RespawnPoint;
         StartBranchAtCurrentTime();
+        RecordingTransitionAutoSave.Queue(level, level.Session.Level);
     }
 
     private static void StartDeathReplayRecording() {
@@ -703,6 +716,7 @@ public static class AutoRecorder {
     }
 
     private static void DiscardCurrentRecording() {
+        RecordingTransitionAutoSave.Reset();
         NativeRoomRecording? recording = current;
         current = null;
         if (recording is not null) {
@@ -893,6 +907,7 @@ public static class AutoRecorder {
     }
 
     private static void ResetFullRecordingState() {
+        RecordingTransitionAutoSave.Reset();
         ActivePrefix.Clear();
         respawnAnchor = null;
         observedRespawnPoint = null;

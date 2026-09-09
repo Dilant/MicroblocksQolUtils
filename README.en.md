@@ -155,6 +155,18 @@ The Profiler page can start a 10-second in-process EventPipe stack sample:
   %LOCALAPPDATA%\MicroblocksQolUtils\profiles;
 - the lightweight frame-time HUD remains available without a full sample.
 
+The recording option **Auto-save on room transitions (video continuity)** is enabled by default.
+While full recording is active (including manual recording), it saves the game and recording
+timeline into a dedicated internal SpeedrunTool slot after each room transition. Normal same-room
+deaths load that slot automatically; golden chapter restarts and custom death actions are not
+intercepted. Recording start, respawn-point changes and manual loads also refresh the recovery point.
+The user's slots and selection are preserved, including after repeated SL and clearing one/all user slots.
+Internal SL adds no timer/golden-berry marks, popup or animation/freeze, preserves existing marks
+and normal death/time statistics, and does not require SRT's death-auto-load setting.
+Manual SL keeps its normal behavior. Stopping recording/disabling the feature releases the slot.
+Death-replay-only capture, disabled/missing/incompatible SRT, active TAS and TAS-owned selected
+slots are skipped safely.
+
 ## Console commands
 
 In addition to the watching commands above, recording and native capture expose:

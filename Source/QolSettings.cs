@@ -243,6 +243,9 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(false)]
     public bool AutoRecorderEnabled { get; set; }
 
+    [DefaultValue(true)]
+    public bool RecordingAutoSaveOnTransition { get; set; } = true;
+
     [SettingName("开始录制")]
     [DefaultButtonBinding(0, Keys.None)]
     public ButtonBinding StartRecordingBinding { get; set; } = new(0, Keys.None);

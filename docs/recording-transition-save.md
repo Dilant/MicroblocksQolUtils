@@ -1,0 +1,59 @@
+# 录制内部恢复槽
+
+录制设置中的“录制时切面自动保存（保证视频连续性）”默认开启，也能在 Everest 原生模组设置中关闭。
+仅完整录像实际录制中触发，包括手动录制；仅开启死亡回放、未开始录制或录制启动失败时不触发。
+
+## 独立槽与时间线
+
+- 使用独立命名的内部 SpeedrunTool 槽，不占用十个用户 UI 槽，不覆盖用户存档。
+  每次操作后恢复用户原来选中的槽；必须先等待内部异步 pre-clone 完成，避免后台线程读错槽。
+- 内部槽保留在 SRT 槽字典，参与场景和保存回调重初始化。清全部用户槽时暂时摘下内部槽，
+  然后重新放回；清当前用户槽自然不会碰到它。
+- 切面、录制开始、复活点变化时保存。用户手动读档后在稳定帧重建内部恢复点，
+  使其对应新的录像分支/房间；用户反复 SL 后清当前槽或全部用户槽，仍可继续恢复。
+- 深克隆绝不在 `QolHud.Update`、死亡 hook 或切面协程内部执行；统一在场景更新完成后处理。
+  暂停、过场、冻结、复活动画及 SRT 忙碌时等待；死亡/场景变化会取消未完成的存档请求。
+  停止录制、关闭功能或退出关卡后清理内部存档和其 FMOD 资源。
+
+## 死亡接管
+
+- `PlayerDeadBody.End` 的高优先级 hook 先于 SRT 自动读档运行，只拦截普通同房间复活。
+  验证相同 Level、章节、房间、复活点和录制文件；没有有效内部槽时走原流程。
+- 金草莓重开章节、自定义 `DeathAction`、PlayerSeeker、切面中、跨房间或旧录制的状态不接管。
+  `DeathAction == null` 或显式的 `level.Reload` 属于正常复活。
+- hook 只取消死亡协程并排队；帧末先结束死亡回放，再读内部槽并恢复录像时间线。
+  失败时只回退一次原死亡流程，不把玩家留在死锁状态；离开场景后不会调用旧场景的回调。
+- 内部恢复不依赖用户的 `AutoLoadStateAfterDeath` 设置。正常死亡的会话/总计/章节时间和死亡数
+  在恢复后保留，即使用户手动 SL 设置启用了 `SaveTimeAndDeaths`。
+
+## 无标记存读档
+
+内部操作使用普通 `SaveStateImpl(false, ...)` / `LoadStateImpl(false, ...)`，不假冒 TAS，
+也不修改 SpeedrunTool 全局设置。仅在本次内部操作中跳过新增计时器/金草莓标记及存读档动画/冻结，
+同步完成恢复，避免切回用户槽后旧 wipe 回调读取错误的 `StateManager.Instance`。
+已有手动 SL 标记不清除；用户手动存读档的原有标记和行为不变。
+
+缺失/禁用 SRT、TAS 运行中或选中 TAS 存档时跳过。反射签名或 IL 模式不匹配则撤销全部 hook，
+记录日志，不回退到覆盖用户槽或有标记的自动保存。
+
+## 自动化验证
+
+在 worktree 执行，TEMP/TMP 和探针输出都指定到 `.work`。需要 .NET 8 和本机 Celeste/Everest 引用：
+
+```powershell
+dotnet build Source/MicroblocksQolUtils.csproj -c Release
+dotnet run --project Tests/Recording -c Release
+dotnet run --project Tests/Recording.Interop -c Release -- C:/SteamLibrary/steamapps/common/Celeste .work/interop
+dotnet run --project Tests/Capture -c Release
+```
+
+`Recording` 使用假游戏/SRT 对象，但实际执行 MonoMod 运行时 hook 和 ModInterop 回调：
+覆盖专用槽隔离、异步 pre-clone 选槽一致性、多次 SL 后清槽、死亡接管、统计保留、时间线恢复、
+历史标记、各种延迟/失效条件、失败回退、SRT 后安装的死亡 hook 优先级、卸载与部分 hook 失败回滚。
+
+`Recording.Interop` 从本机 `SpeedrunTool.zip` 解出 DLL 到临时目录，检查生产设置默认值，
+并对**真实安装的 DLL** 安装/卸载内部槽及无标记存读档 hook，不启动游戏、不操作玩家存档。
+已验证本机 SpeedrunTool 3.27.21 的接口/IL 兼容。
+
+自动化测试不等于实际游戏内完整切面→死亡→手动 SL→清槽→死亡→导出视频验收。
+游戏内还应检查开启/关闭开关、金草莓重开章节不受影响，并试听导出视频的衔接。

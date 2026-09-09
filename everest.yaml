@@ -4,4 +4,7 @@
   Dependencies:
     - Name: EverestCore
       Version: 1.6418.0
+  OptionalDependencies:
+    - Name: SpeedrunTool
+      Version: 3.0.0
 
