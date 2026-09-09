@@ -95,6 +95,12 @@ See [capture architecture and testing](docs/capture-architecture.md).
 - Full recordings and death replays use independent encoding/editing sessions sharing one pixel/FMOD source. Death
   replays retain the latest 30 seconds by default, configurable from 10 to 60
   seconds, save after death, and resume automatically after respawn.
+- Continuous H.264 death replays reuse the live encoder's packets rather than encoding video twice;
+  adjacent room/music metadata splits keep this fast path. MP4 edit lists hide decoder preroll at
+  non-keyframe cuts while retaining SFX, reconstructed BGM and room-specific music policy.
+  Pause cuts, freeze-frame editing and incompatible streams fall back to the exact editor.
+  Capture queue draining, audio encoding and file finalization still take time; this is not a
+  zero-latency guarantee under every workload.
 - Continuous capture keeps only successful segments. Deaths, room transitions,
   pauses, SpeedrunTool loads, and custom respawn-point changes affect the final
   edit list without putting failed gameplay into the final video.

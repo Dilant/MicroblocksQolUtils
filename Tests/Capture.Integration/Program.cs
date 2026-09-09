@@ -111,6 +111,16 @@ NativeCaptureBridge.FinalizeRecordingAsync([
     new RecordingClip(Path.Combine(output,"first.mkv"),0.5,0.3,"",0,true,true,"cassette"),
     new RecordingClip(Path.Combine(output,"first.mkv"),1.0,0.3,"",0,true,false,"normal")],
     Path.Combine(output,"room-bgm.mp4"),encoder,1000,30,true,false,"").GetAwaiter().GetResult();
+// Non-keyframe cut through the public managed/native bridge. An unavailable
+// encoder preference exercises the copy path, including real FMOD SFX,
+// independent BGM and the music journal. Rust tests assert packet identity.
+var replayTimer = System.Diagnostics.Stopwatch.StartNew();
+NativeCaptureBridge.FinalizeRecordingAsync([
+    new RecordingClip(Path.Combine(output,"second.mkv"),0.25,0.75,"",0,true,false,"normal"),
+    new RecordingClip(Path.Combine(output,"second.mkv"),1.0,0.75,"",0,true,true,"cassette")],
+    Path.Combine(output,"fast-death.mp4"),"mqol_test_no_such_encoder",1000,60,true,false,"",
+    preferVideoCopy:true).GetAwaiter().GetResult();
+Console.WriteLine($"Fast death replay finalization (1.5s): {replayTimer.Elapsed.TotalMilliseconds:F1} ms");
 // Unhook and hook again while context remains alive (mod reload).
 CaptureSource.Unload(); CaptureSource.Load();
 using(var probe=NativeCaptureBridge.Start(60)) {

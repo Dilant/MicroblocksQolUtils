@@ -87,6 +87,20 @@ public static class NativeCaptureBridge {
         bool removeFreezeFrames,
         string bgmEventMapFile,
         Action<double>? progress = null
+    ) => FinalizeRecordingAsync(clips, outputPath, encoder, bitrateKbps, fps,
+        reconstructBgm, removeFreezeFrames, bgmEventMapFile, false, progress);
+
+    public static Task FinalizeRecordingAsync(
+        IReadOnlyList<RecordingClip> clips,
+        string outputPath,
+        string encoder,
+        int bitrateKbps,
+        int fps,
+        bool reconstructBgm,
+        bool removeFreezeFrames,
+        string bgmEventMapFile,
+        bool preferVideoCopy,
+        Action<double>? progress = null
     ) {
         EnsureAvailable();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(new {
@@ -105,6 +119,7 @@ public static class NativeCaptureBridge {
             fps,
             reconstruct_bgm = reconstructBgm,
             remove_freeze_frames = removeFreezeFrames,
+            prefer_video_copy = preferVideoCopy,
             bgm_event_map_file = string.IsNullOrWhiteSpace(bgmEventMapFile)
                 ? ""
                 : Path.GetFullPath(Environment.ExpandEnvironmentVariables(bgmEventMapFile))

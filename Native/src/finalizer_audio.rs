@@ -1214,8 +1214,14 @@ pub fn mux_video_and_audio(
         unsafe { (*stream.parameters().as_mut_ptr()).codec_tag = 0 };
         output_audio_index = stream.index();
     }
+    // Preserve video decoder preroll and AAC priming across the final remux.
+    // Shifting negative video timestamps would reintroduce pre-trim gameplay
+    // and put audio ahead of the requested death replay range.
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("avoid_negative_ts", "disabled");
+    options.set("use_editlist", "1");
     output
-        .write_header()
+        .write_header_with(options)
         .map_err(AudioFinalizeError::ConfigureMux)?;
     let output_video_time_base = output
         .stream(output_video_index)

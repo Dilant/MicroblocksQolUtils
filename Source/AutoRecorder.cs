@@ -755,7 +755,7 @@ public static class AutoRecorder {
             string fileName = $"{death.OccurredAt:yyyyMMdd-HHmmss-fff}-{room}-death-{unique}.mp4";
             string output = Path.Combine(DeathReplayRoot, area, fileName);
             return new RecordingFinalizationJob(death.Clips, output, "死亡回放", death.ReconstructBgm,
-                death.RemoveFreezeFrames);
+                death.RemoveFreezeFrames, PreferVideoCopy: true);
         }).ToList();
         PendingDeathReplays.Clear();
         return jobs;
@@ -802,7 +802,8 @@ public static class AutoRecorder {
                         (capturedCompletedWeight + job.Weight * progress) / totalWeight,
                         progress,
                         job.Description
-                    )
+                    ),
+                    preferVideoCopy: job.PreferVideoCopy
                 ).ConfigureAwait(false)) {
                     completed = false;
                 }
@@ -987,7 +988,8 @@ public static class AutoRecorder {
         string Output,
         string Description,
         bool ReconstructBgm,
-        bool RemoveFreezeFrames
+        bool RemoveFreezeFrames,
+        bool PreferVideoCopy = false
     ) {
         public double Weight => Math.Max(0.1d, Clips.Sum(clip => clip.DurationSeconds));
     }

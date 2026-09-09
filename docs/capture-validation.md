@@ -143,7 +143,36 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 真实游戏 smoke：仅为该次启动设置 `MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT` 到 `.work/*.mkv`。
 等 Overworld/Level 加载后开始，写 `.passed` 或 `.failed`；不要把这个环境变量永久写入 Steam/系统。
 
-## 未证明的部分
+## 补充验证
+
+### 2026-09-09：死亡回放复用已编码画面
+
+- Rust **49/49**，包含真实 D3D11 测试及 FFmpeg 集成。新增连续范围判定、非关键帧裁切、
+  跨 GOP seek、0 秒起点、20ms 短片、room metadata 边界和无音频输出；
+  对输出的可见 H.264 包逐字节比较原始 MKV，并解码验证画面、帧数与音画时间（误差不超过一帧）。
+  原不连续范围/crossfade 测试改为请求快速路径，验证其安全回退到精确转码。
+- managed Capture / Recording.Policy 回归通过；实际 AutoRecorder 死亡任务工厂会传递快速路径标记，
+  同时保留用户的冻结帧编辑设置。Release 构建零 C# 警告、零错误。
+- 实际 SDL OpenGL + FMOD 双录制集成：238 像素 / 421 音频 callback、像素错误 0、
+  两个 sink 视频队列均丢弃 0。额外通过 managed/native bridge 保存非关键帧起点、
+  普通→敏感房 metadata 的 1.5 秒快速回放，用时 **56.2ms**（小尺寸测试画面，非 720p 性能数据）。
+  生成的全部 MP4 均通过 FFmpeg 完整解码。
+- 同机 Release synthetic benchmark：12 秒 1280×720@60 H.264 源，保留从 1.25s 开始的 10s，
+  8 Mbps、stereo 48kHz 音频，两条路径同用 libopenh264/AAC：
+
+  | 最终化路径 | 耗时 | 视频 / 音频时长 |
+  | --- | ---: | --- |
+  | 原完整转码 | 3203.6ms | 10.000s / 10.005s |
+  | 复用视频包 | 603.5ms | 9.999s / 10.005s |
+
+  两种输出的音视频起点均为 0，完整解码无错误。这是一次合成素材对比，
+  **不包含死亡时尚未排空的实时编码队列**，不代表用户全部模组/地图下的点击到播放耗时。
+  长回放音频编码、磁盘或录制积压仍可能增加等待，复杂剪辑/冻结帧编辑仍需转码。
+
+证据：`.work/instant-death-replay/.work/` 下 `rust-tests.log`、`policy-tests.log`、
+`managed-tests.log`、`integration.log`、`benchmark.log`、`benchmark.ps1` 和各输出 MP4。
+
+## 平台与功能限制
 
 第一轮 ABI 6 在添加本轮 Zstd 之前通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。本轮仅在 Windows 构建运行，未重跑三端交叉检查；Zstd C 库由 Cargo 构建，三平台 CI 构建矩阵保留。
 Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。
