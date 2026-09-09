@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 6;
+    private const uint ExpectedAbiVersion = 7;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -87,6 +87,20 @@ public static class NativeCaptureBridge {
         bool removeFreezeFrames,
         string bgmEventMapFile,
         Action<double>? progress = null
+    ) => FinalizeRecordingAsync(clips, outputPath, encoder, bitrateKbps, fps,
+        reconstructBgm, removeFreezeFrames, bgmEventMapFile, false, progress);
+
+    public static Task FinalizeRecordingAsync(
+        IReadOnlyList<RecordingClip> clips,
+        string outputPath,
+        string encoder,
+        int bitrateKbps,
+        int fps,
+        bool reconstructBgm,
+        bool removeFreezeFrames,
+        string bgmEventMapFile,
+        bool preferVideoCopy,
+        Action<double>? progress = null
     ) {
         EnsureAvailable();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(new {
@@ -96,7 +110,8 @@ public static class NativeCaptureBridge {
                 duration_seconds = clip.DurationSeconds,
                 music_event = clip.MusicEvent,
                 music_timeline_milliseconds = clip.MusicTimelineMilliseconds,
-                seamless_from_previous = clip.SeamlessFromPrevious
+                seamless_from_previous = clip.SeamlessFromPrevious,
+                bgm_follows_video = clip.BgmFollowsVideo
             }),
             output_path = Path.GetFullPath(outputPath),
             encoder,
@@ -104,6 +119,7 @@ public static class NativeCaptureBridge {
             fps,
             reconstruct_bgm = reconstructBgm,
             remove_freeze_frames = removeFreezeFrames,
+            prefer_video_copy = preferVideoCopy,
             bgm_event_map_file = string.IsNullOrWhiteSpace(bgmEventMapFile)
                 ? ""
                 : Path.GetFullPath(Environment.ExpandEnvironmentVariables(bgmEventMapFile))

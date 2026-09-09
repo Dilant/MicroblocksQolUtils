@@ -109,6 +109,7 @@ struct PostMixSegment {
     captured_source_start_frames: u64,
     mapped_source_start_seconds: f64,
     music_event: String,
+    bgm_follows_video: bool,
 }
 
 impl AudioClipLayout {
@@ -417,11 +418,17 @@ fn post_mix_segments(
         }
         let actual_captured_start = seconds_to_frames(clip.start_seconds, sample_rate)?;
         let actual_mapped_start = clip.music_timeline_milliseconds.max(0) as f64 / 1_000.0;
-        let continues_across_edit = index > 0
+        let continues_across_edit = !clip.bgm_follows_video
+            && index > 0
+            && !result.is_empty()
             && clips[index - 1].music_event == clip.music_event
-            && clip.start_seconds
+            && (clip.start_seconds
                 - (clips[index - 1].start_seconds + clips[index - 1].duration_seconds)
-                > CUT_GAP_SECONDS;
+                > CUT_GAP_SECONDS
+                // A room/metadata split after an edit must not reset an already shifted
+                // cursor. A contiguous, real timeline jump still starts a new take.
+                || (clip.music_timeline_milliseconds - clips[index - 1].music_timeline_milliseconds
+                    - (clips[index - 1].duration_seconds * 1000.0).round() as i64).abs() <= 2);
         let (captured_source_start_frames, mapped_source_start_seconds) = if continues_across_edit {
             let previous = result
                 .last()
@@ -446,6 +453,7 @@ fn post_mix_segments(
             captured_source_start_frames,
             mapped_source_start_seconds,
             music_event: clip.music_event.clone(),
+            bgm_follows_video: clip.bgm_follows_video,
         });
     }
     Ok(result)
@@ -533,7 +541,7 @@ fn journal_segments(
                         + (actual - nanos_to_frames(e.time_nanos, rate)) as f64 / rate as f64
                 })
                 .unwrap_or(0.0);
-            if previous_run == Some(run) {
+            if !clip.bgm_follows_video && previous_run == Some(run) {
                 if let Some(previous) = result.last() {
                     let delta = output_start - previous.output_start_frames;
                     source_start = previous.captured_source_start_frames + delta;
@@ -547,6 +555,7 @@ fn journal_segments(
                 captured_source_start_frames: source_start,
                 mapped_source_start_seconds: mapped_start,
                 music_event: main.map(|e| e.event.clone()).unwrap_or_default(),
+                bgm_follows_video: clip.bgm_follows_video,
             });
             previous_run = Some(run);
         }
@@ -605,7 +614,7 @@ fn mix_captured_bgm_chunk(
     let chunk_start = nanos_to_frames(chunk.media_time_nanos, spec.sample_rate);
     let chunk_end = chunk_start.saturating_add(chunk_frames as u64);
     for segment in segments {
-        if event_map.contains_key(&segment.music_event) {
+        if !segment.bgm_follows_video && event_map.contains_key(&segment.music_event) {
             continue;
         }
         let source_end = segment
@@ -651,6 +660,10 @@ fn mix_bgm_tracks(
         .map_err(|source| io_error(mixed_pcm, source))?;
     let segments = journal_segments(sidecar, clips, spec.sample_rate)?;
     for segment in segments {
+        // Static replacement tracks cannot reproduce this room's live FMOD phase/parameters.
+        if segment.bgm_follows_video {
+            continue;
+        }
         if let Some(path) = event_map.get(&segment.music_event) {
             mix_bgm_segment(
                 &mut mixed,
@@ -1201,8 +1214,14 @@ pub fn mux_video_and_audio(
         unsafe { (*stream.parameters().as_mut_ptr()).codec_tag = 0 };
         output_audio_index = stream.index();
     }
+    // Preserve video decoder preroll and AAC priming across the final remux.
+    // Shifting negative video timestamps would reintroduce pre-trim gameplay
+    // and put audio ahead of the requested death replay range.
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("avoid_negative_ts", "disabled");
+    options.set("use_editlist", "1");
     output
-        .write_header()
+        .write_header_with(options)
         .map_err(AudioFinalizeError::ConfigureMux)?;
     let output_video_time_base = output
         .stream(output_video_index)
@@ -1349,6 +1368,7 @@ mod tests {
             music_event: "wrong-per-clip-metadata".into(),
             music_timeline_milliseconds: 99999,
             seamless_from_previous: true,
+            bgm_follows_video: false,
         }
     }
 
@@ -1452,6 +1472,157 @@ mod tests {
     }
 
     #[test]
+    fn only_sensitive_room_segments_follow_video_in_journal_and_legacy_planners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.mkv.bgmchunks");
+        // Metadata ranges shorter than one PCM sample need no segment/previous cursor.
+        assert_eq!(
+            post_mix_segments(&[clip(0.0, 0.000001), clip(0.000001, 1.0)], 8000)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut clips = vec![
+            clip(0.0, 1.0),
+            clip(2.0, 1.0),
+            clip(4.0, 1.0),
+            clip(6.0, 1.0),
+            clip(8.0, 1.0),
+            clip(10.0, 1.0),
+            clip(11.0, 1.0),
+        ];
+        for c in &mut clips {
+            c.music_event = "music/a".into();
+            c.music_timeline_milliseconds = (c.start_seconds * 1000.0) as i64;
+        }
+        clips[2].bgm_follows_video = true;
+        clips[3].bgm_follows_video = true;
+        // Ordinary edits before AND after the sensitive room remain continuous. The
+        // last clip is a contiguous metadata/room split, not another edit.
+        let expected = [0, 8000, 32000, 48000, 56000, 64000, 72000];
+        for with_journal in [false, true] {
+            if with_journal {
+                journal(&path, &[]);
+            }
+            let result = journal_segments(&path, &clips, 8000).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|s| s.captured_source_start_frames)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|s| s.bgm_follows_video)
+                    .collect::<Vec<_>>(),
+                [false, false, true, true, false, false, false]
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_room_policy_renders_exact_samples_through_production_audio_dispatch() {
+        ffmpeg::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sfx = dir.path().join("run.mkv.sfxchunks");
+        let bgm = sfx.with_extension("bgmchunks");
+        let mixed = dir.path().join("mixed.f32");
+        journal(&bgm, &[]);
+        for (path, bus) in [(&sfx, 1), (&bgm, 3)] {
+            let mut writer = BufWriter::new(File::create(path).unwrap());
+            writer.write_all(SIDECAR_MAGIC).unwrap();
+            for second in 0..12 {
+                let samples = (0..8000)
+                    .flat_map(|i| {
+                        let frame = (second * 8000 + i) as f32;
+                        [if bus == 3 {
+                            frame / 200000.0
+                        } else {
+                            frame / 2000000.0
+                        }; 2]
+                    })
+                    .collect();
+                write_audio_chunk(
+                    &mut writer,
+                    &AudioChunk {
+                        media_time_nanos: second * 1_000_000_000,
+                        sample_rate: 8000,
+                        channels: 2,
+                        bus_id: bus,
+                        samples,
+                    },
+                )
+                .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let mut clips = vec![
+            clip(0.0, 1.0),
+            clip(2.0, 1.0),
+            clip(4.0, 1.0),
+            clip(6.0, 1.0),
+            clip(8.0, 1.0),
+            clip(10.0, 1.0),
+            clip(11.0, 1.0),
+        ];
+        clips[2].bgm_follows_video = true;
+        clips[3].bgm_follows_video = true;
+        let sources = [0, 16000, 32000, 48000, 64000, 80000, 88000];
+        for reconstruct in [true, false] {
+            assert!(
+                build_audio_track(
+                    &sfx,
+                    &clips,
+                    &mixed,
+                    &dir.path().join("out.m4a"),
+                    reconstruct,
+                    None
+                )
+                .unwrap()
+            );
+            let bytes = fs::read(&mixed).unwrap();
+            assert_eq!(bytes.len(), 7 * 8000 * 8);
+            let music_sources = if reconstruct {
+                [0, 8000, 32000, 48000, 56000, 64000, 72000]
+            } else {
+                sources
+            };
+            for index in 0..7 {
+                for offset in [0, 1, 4000, 7999] {
+                    let frame = index * 8000 + offset;
+                    let actual =
+                        f32::from_le_bytes(bytes[frame * 8..frame * 8 + 4].try_into().unwrap());
+                    let expected = (sources[index] + offset) as f32 / 2000000.0
+                        + (music_sources[index] + offset) as f32 / 200000.0;
+                    assert!(
+                        (actual - expected).abs() < 1e-6,
+                        "reconstruct={reconstruct}, clip={index}, offset={offset}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+        // Even an external mapping must not substitute the sensitive room's PCM.
+        let sensitive = &clips[2..4];
+        let spec = AudioSpec {
+            sample_rate: 8000,
+            channels: 2,
+            total_frames: 16000,
+        };
+        let mapping =
+            HashMap::from([("music/a".into(), dir.path().join("must-not-be-opened.wav"))]);
+        create_empty_mix(&mixed, spec).unwrap();
+        mix_captured_bgm(&bgm, &mixed, sensitive, &mapping, spec).unwrap();
+        mix_bgm_tracks(&bgm, &mixed, sensitive, &mapping, spec).unwrap();
+        let bytes = fs::read(&mixed).unwrap();
+        for (frame, source) in [(0, 32000), (7999, 39999), (8000, 48000), (15999, 55999)] {
+            let actual = f32::from_le_bytes(bytes[frame * 8..frame * 8 + 4].try_into().unwrap());
+            assert!((actual - source as f32 / 200000.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn post_mix_bgm_stays_continuous_across_an_edit_cut() {
         let clips = [
             FinalizeClip {
@@ -1461,6 +1632,7 @@ mod tests {
                 music_event: "event:/music/test".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "run.mkv".to_owned(),
@@ -1469,6 +1641,7 @@ mod tests {
                 music_event: "event:/music/test".to_owned(),
                 music_timeline_milliseconds: 3_000,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let segments = post_mix_segments(&clips, 1_000).unwrap();
@@ -1490,6 +1663,7 @@ mod tests {
                 music_event: "event:/music/a".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "run.mkv".to_owned(),
@@ -1498,6 +1672,7 @@ mod tests {
                 music_event: "event:/music/b".to_owned(),
                 music_timeline_milliseconds: 500,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let segments = post_mix_segments(&clips, 1_000).unwrap();
@@ -1515,6 +1690,7 @@ mod tests {
                 music_event: "event:/music/test".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "run.mkv".to_owned(),
@@ -1523,6 +1699,7 @@ mod tests {
                 music_event: "event:/music/test".to_owned(),
                 music_timeline_milliseconds: 750,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let segments = post_mix_segments(&clips, 1_000).unwrap();
@@ -1561,6 +1738,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             }],
             &mixed,
             false,
@@ -1607,6 +1785,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -1615,6 +1794,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let spec = render_mix(&sidecar, &clips, &mixed, false)
@@ -1641,6 +1821,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -1649,6 +1830,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: true,
+                bgm_follows_video: false,
             },
         ];
         let layout = audio_timeline_layout(&clips, 8_000).unwrap();
@@ -1690,6 +1872,7 @@ mod tests {
                 music_event: "event:/music/test".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             }],
             &mixed,
             true,
@@ -1750,6 +1933,7 @@ mod tests {
             music_event: "event:/test".to_owned(),
             music_timeline_milliseconds: 600,
             seamless_from_previous: false,
+            bgm_follows_video: false,
         }];
         assert!(
             build_audio_track(

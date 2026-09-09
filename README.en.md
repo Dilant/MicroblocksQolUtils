@@ -95,6 +95,12 @@ See [capture architecture and testing](docs/capture-architecture.md).
 - Full recordings and death replays use independent encoding/editing sessions sharing one pixel/FMOD source. Death
   replays retain the latest 30 seconds by default, configurable from 10 to 60
   seconds, save after death, and resume automatically after respawn.
+- Continuous H.264 death replays reuse the live encoder's packets rather than encoding video twice;
+  adjacent room/music metadata splits keep this fast path. MP4 edit lists hide decoder preroll at
+  non-keyframe cuts while retaining SFX, reconstructed BGM and room-specific music policy.
+  Pause cuts, freeze-frame editing and incompatible streams fall back to the exact editor.
+  Capture queue draining, audio encoding and file finalization still take time; this is not a
+  zero-latency guarantee under every workload.
 - Continuous capture keeps only successful segments. Deaths, room transitions,
   pauses, SpeedrunTool loads, and custom respawn-point changes affect the final
   edit list without putting failed gameplay into the final video.
@@ -148,6 +154,18 @@ The Profiler page can start a 10-second in-process EventPipe stack sample:
 - CSV and .nettrace reports are written to
   %LOCALAPPDATA%\MicroblocksQolUtils\profiles;
 - the lightweight frame-time HUD remains available without a full sample.
+
+The recording option **Auto-save on room transitions (video continuity)** is enabled by default.
+While full recording is active (including manual recording), it saves the game and recording
+timeline into a dedicated internal SpeedrunTool slot after each room transition. Normal same-room
+deaths load that slot automatically; golden chapter restarts and custom death actions are not
+intercepted. Recording start, respawn-point changes and manual loads also refresh the recovery point.
+The user's slots and selection are preserved, including after repeated SL and clearing one/all user slots.
+Internal SL adds no timer/golden-berry marks, popup or animation/freeze, preserves existing marks
+and normal death/time statistics, and does not require SRT's death-auto-load setting.
+Manual SL keeps its normal behavior. Stopping recording/disabling the feature releases the slot.
+Death-replay-only capture, disabled/missing/incompatible SRT, active TAS and TAS-owned selected
+slots are skipped safely.
 
 ## Console commands
 
@@ -237,3 +255,9 @@ release.
 - Source/CaptureSource.cs and CaptureSubscription.cs own shared acquisition and isolated subscriptions.
 - Source/SdlFrameSource.cs and Native/src/sdl_readback.rs implement SDL hooks and PBO readback.
 - Tests/Capture and Capture.Integration exercise subscriptions, clocks, and real SDL/FMOD encoding.
+
+### Automatic recording rules
+
+Automatic recording has Off / Full chapter / Golden challenge modes. Golden challenges can stop at berry collection or chapter completion. On death, choose discard, continue (retain the failed attempt and record until chapter completion), or save. These policies are fixed when the recording starts. Stopping never arms manual recording or immediately restarts the automatic session. A new golden pickup re-arms golden mode; full-chapter mode waits for the next chapter or an explicit off/on.
+
+Recording settings use six tabs: Automatic, Death replay, Quality/audio, Storage, Controls, and Library. The library separates manual (`full/<area>`), automatic (`auto/<area>`), and death (`deaths/<area>`) recordings with independent retention limits. Existing files stay in their original location and remain in the manual/legacy category.

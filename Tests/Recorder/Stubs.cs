@@ -23,7 +23,7 @@ namespace Celeste {
     public class Follower { public Entity Entity = null!; public Leader? Leader; }
     public class Strawberry : Entity { public bool Golden; public Follower Follower = new(); }
     public class PlayerDeadBody { }
-    public class LevelData { }
+    public class LevelData { public string Name="next"; }
     public class TextMenu { }
     public class ScreenWipe { }
     public class HiresSnow { }
@@ -81,8 +81,10 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public BgmRecordingMode BgmMode;
     }
     public static class MicroblocksQolUtilsModule { public static QolSettings Settings = new(); }
+    public static class RecordingDeathRecovery { public static void Load(){} public static void Unload(){} public static void AfterEngineUpdate(){} }
+    public static class RecordingTransitionAutoSave { public static void Queue(Level l,string room){} public static void Cancel(){} public static void Reset(){} public static void AfterEngineUpdate(){} }
     public static class SpeedrunToolBridge { public static void Load(){} public static void Unload(){} }
-    public static class RhythmMapDetector { public static bool IsRhythmSensitive(object map) => false; }
+    public static class RhythmMapDetector { public static bool IsRhythmSensitive(object map, string room) => false; }
     public class MaterialModOptions { }
     public static class QolSettingsOverlay { public static object? ActivePage => null; }
     public readonly record struct MusicPosition(string Event,int TimelineMilliseconds) { public static MusicPosition Read()=>new("",0); }
@@ -102,7 +104,7 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public static class NativeRecordingFinalizer {
         public record Job(IReadOnlyList<RecordingClip> Clips,string Output,string Description);
         public static List<Job> Jobs=[];
-        public static Task<bool> FinishAsync(IReadOnlyList<RecordingClip> clips,string output,string description,bool bgm,bool freeze,Action<double> progress) {
+        public static Task<bool> FinishAsync(IReadOnlyList<RecordingClip> clips,string output,string description,bool bgm,bool freeze,Action<double> progress,bool preferVideoCopy=false) {
             Jobs.Add(new(clips,output,description)); progress(1); return Task.FromResult(true);
         }
     }

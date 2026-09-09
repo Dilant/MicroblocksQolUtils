@@ -33,6 +33,8 @@ foreach(bool save in new[]{false,true}) {
     Check(AutoRecorder.IsDeathReplayRecording,"auto stop must not stop death replay");
     Check(NativeRecordingFinalizer.Jobs.Count==(save?1:0),"save/discard behavior");
     if(save) Check(RecordingLibrary.KindOf(root,NativeRecordingFinalizer.Jobs[0].Output)==RecordingLibraryKind.Automatic,"auto output directory");
+    Pickup(p,b);Tick(l);
+    Check(!AutoRecorder.IsRecording,"pickup must not re-arm a stopped chapter recording");
     AutoRecorder.StartManual();Tick(l);Advance(2);AutoRecorder.StopManual(l,true);Tick(l);
     Check(RecordingLibrary.KindOf(root,NativeRecordingFinalizer.Jobs.Last().Output)==RecordingLibraryKind.Full,"explicit manual goes to full");
     Check(!AutoRecorder.ManualMode && !AutoRecorder.IsRecording,"manual stop must not fall back to auto");
@@ -71,6 +73,7 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Check(AutoRecorder.IsRecording==(death==GoldenRecordingDeath.Continue),"continue survives golden LevelExit without pickup");
     if(death==GoldenRecordingDeath.Continue) {
         Check(AutoRecorder.ContinuingAfterGoldenDeath,"continued run status");
+        Check(!AutoRecorder.CanSaveTransitionTimeline,"uncut failed golden run must not arm recovery rewinds");
         On.Celeste.Player.Raise(respawned);Tick(resumed);respawned.Dead=false;Advance(2);Tick(resumed);
         On.Celeste.Level.Complete(resumed); Tick(resumed);
         var job=NativeRecordingFinalizer.Jobs.Single(j=>j.Description=="自动录像");

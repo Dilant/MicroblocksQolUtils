@@ -38,10 +38,13 @@ public static class SpeedrunToolBridge {
             null
         );
         SpeedrunToolImports.IgnoreSaveState?.Invoke(typeof(QolHud), false);
+        SpeedrunToolAutoSave.Load(registration.GetType().Assembly);
         Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "SpeedrunTool recording timeline integration enabled");
     }
 
     public static void Unload() {
+        RecordingTransitionAutoSave.Reset();
+        SpeedrunToolAutoSave.Unload();
         if (registration is not null) SpeedrunToolImports.Unregister?.Invoke(registration);
         registration = null;
     }
@@ -57,10 +60,15 @@ public static class SpeedrunToolBridge {
     }
 
     private static void Load(Dictionary<Type, Dictionary<string, object>> values, Level level) {
+        if (!SpeedrunToolAutoSave.LoadingSilently) RecordingTransitionAutoSave.Reset();
         if (values.TryGetValue(typeof(AutoRecorder), out Dictionary<string, object>? own)
             && own.TryGetValue(TimelineKey, out object? value)
             && value is RecordingTimelineSnapshot snapshot) {
             AutoRecorder.RestoreTimeline(level, snapshot);
         }
+        // Rebase recovery on the loaded branch/room, not on a later room from the
+        // abandoned timeline. Clearing the user's slot afterwards is then harmless.
+        if (!SpeedrunToolAutoSave.LoadingSilently)
+            RecordingTransitionAutoSave.Queue(level, level.Session.Level);
     }
 }

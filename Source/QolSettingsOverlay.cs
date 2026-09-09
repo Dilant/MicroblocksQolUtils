@@ -1347,12 +1347,12 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 targets.Add(new MaterialInteractionTarget($"settings.recorder.section.{section}",
                     RecorderSectionTabRect(layout, section), Focused: recorderSettingsSection == section));
             if (IsRecorderLibrary) {
-            targets.Add(new MaterialInteractionTarget("settings.recorder.library.deaths",
-                RecorderLibraryTabRect(layout, 0), Focused: recordingLibraryKind == RecordingLibraryKind.DeathReplay));
-            targets.Add(new MaterialInteractionTarget("settings.recorder.library.full",
-                RecorderLibraryTabRect(layout, 1), Focused: recordingLibraryKind == RecordingLibraryKind.Full));
-            targets.Add(new MaterialInteractionTarget("settings.recorder.library.auto",
-                RecorderLibraryTabRect(layout, 2), Focused: recordingLibraryKind == RecordingLibraryKind.Automatic));
+                targets.Add(new MaterialInteractionTarget("settings.recorder.library.deaths",
+                    RecorderLibraryTabRect(layout, 0), Focused: recordingLibraryKind == RecordingLibraryKind.DeathReplay));
+                targets.Add(new MaterialInteractionTarget("settings.recorder.library.full",
+                    RecorderLibraryTabRect(layout, 1), Focused: recordingLibraryKind == RecordingLibraryKind.Full));
+                targets.Add(new MaterialInteractionTarget("settings.recorder.library.auto",
+                    RecorderLibraryTabRect(layout, 2), Focused: recordingLibraryKind == RecordingLibraryKind.Automatic));
             }
 
             for (int index = 0; index < CurrentRows.Count; index++) {
@@ -1617,6 +1617,8 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             Range("死亡回放时长", () => settings.DeathReplayBufferSeconds, value => settings.DeathReplayBufferSeconds = value,
                 10, 60, 5, value => $"最近 {value} 秒"));
         Group(RecorderSettingsSection.Quality,
+            Toggle("切面自动存档（保持视频连续）", () => settings.RecordingAutoSaveOnTransition,
+                value => settings.RecordingAutoSaveOnTransition = value),
             EnumRow("BGM 拼接", () => settings.BgmMode, value => settings.BgmMode = value),
             Toggle("录制 UI 音效", () => settings.RecordingIncludeUiSfx, value => settings.RecordingIncludeUiSfx = value),
             Toggle("剪辑冻结帧", () => settings.RecordingRemoveFreezeFrames, value => settings.RecordingRemoveFreezeFrames = value, highlightWhenOn: true),

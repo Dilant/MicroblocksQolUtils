@@ -103,6 +103,30 @@ UI smoke 现在有自己的 `MICROBLOCKS_QOL_MATERIAL_UI_SMOKE` 开关，不再�
 
 ## 复现测试
 
+### 2026-09-09：BGM 例外缩小到对应 room（ABI 7）
+
+用户导出的第一章视频 sidecar 中 `reconstructBgm=false`，设置却为 `SfxOnlyWithPostMix`；
+日志显示整张地图被判为 rhythm-sensitive。原因是地图内任意磁带房会关闭全章重构，
+不是这次导出缺少 PCM 块。现在模式仍按用户设置，例外保存为每个片段的 `BgmFollowsVideo` / `RoomName`。
+
+本轮验证：
+- Rust **47/47**：包含真实 D3D11 staging / DXGI hook 测试、FFmpeg 编码/解码及新增房间策略测试。
+  7 段音频采样测试覆盖普通→敏感→普通、敏感房内多次剪切、离开后的连续 metadata 切分；
+  经生产 `build_audio_track` 同时验证 SFX 裁切、BGM 游标、显式现场混音模式，逐样本误差 < `1e-6`。
+  敏感段不被静态外部音乐替换；JSON/去冻结帧切分保留策略。
+- `Tests/Recording.Policy` 使用实际编译的 AutoRecorder 和 Celeste 类型（不是复制策略）：
+  同地图普通房不受 cassette/音乐同步 trigger 房影响，两条 sink 分支切分、恢复快照、极短房间、
+  死亡回放裁尾及旧 timeline 默认值均通过。时钟由无 native handle 的测试对象固定，不改用户存档。
+- 原有 managed Capture 回归通过。
+- 实际 SDL OpenGL + FMOD 集成：**238** 像素 callback、**419** 非静音 PCM callback，像素/顺序错误 **0**。
+  两个 sink 编码队列分别消耗 **63/178** 帧、丢弃均 **0**；慢订阅者是故意制造的负向测试。
+  新 `room-bgm.mp4` 与普通混音/连续 BGM 输出均可被 FFmpeg 完整解码，房间策略视频 0.900s、AAC 0.917s。
+  集成测试末尾的 unsupported-renderer 日志是非 GL 窗口拒绝测试的预期结果。
+
+证据在 `.work/bgm-continuity/.work/`：`rust-tests.log`、`room-policy.log`、`managed-tests.log`、
+`integration.log`、`integration/room-bgm.mp4`。未把此轮自动化验证称为用户实际通关后的听感确认。
+旧用户 MP4 对应原始 MKV/独立音轨已被成功导出清理；本修复不会凭空修复已混合的旧文件，需重新录制。
+
 设置本机 `CELESTE_ROOT`、`FFMPEG_DIR`、`LIBCLANG_PATH`、Rust/.NET PATH，TEMP/TMP 指到 `.work`：
 
 ```powershell
@@ -110,6 +134,7 @@ $env:MQOL_TEST_FFMPEG = '1'
 $env:MQOL_TEST_D3D11 = '1'
 cargo test -p microblocks-qol-native --features ffmpeg --lib -- --test-threads=1
 dotnet run --project Tests/Capture/Capture.csproj -c Release
+dotnet run --project Tests/Recording.Policy/Recording.Policy.csproj -c Release
 # 集成测试另外设置 MQOL_NATIVE_PATH 到 release DLL，MQOL_TEST_OUTPUT 到 .work 目录
 # 并确保 SDL/FMOD/FFmpeg DLL 可加载。
 dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Release
@@ -118,7 +143,36 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 真实游戏 smoke：仅为该次启动设置 `MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT` 到 `.work/*.mkv`。
 等 Overworld/Level 加载后开始，写 `.passed` 或 `.failed`；不要把这个环境变量永久写入 Steam/系统。
 
-## 未证明的部分
+## 补充验证
+
+### 2026-09-09：死亡回放复用已编码画面
+
+- Rust **49/49**，包含真实 D3D11 测试及 FFmpeg 集成。新增连续范围判定、非关键帧裁切、
+  跨 GOP seek、0 秒起点、20ms 短片、room metadata 边界和无音频输出；
+  对输出的可见 H.264 包逐字节比较原始 MKV，并解码验证画面、帧数与音画时间（误差不超过一帧）。
+  原不连续范围/crossfade 测试改为请求快速路径，验证其安全回退到精确转码。
+- managed Capture / Recording.Policy 回归通过；实际 AutoRecorder 死亡任务工厂会传递快速路径标记，
+  同时保留用户的冻结帧编辑设置。Release 构建零 C# 警告、零错误。
+- 实际 SDL OpenGL + FMOD 双录制集成：238 像素 / 421 音频 callback、像素错误 0、
+  两个 sink 视频队列均丢弃 0。额外通过 managed/native bridge 保存非关键帧起点、
+  普通→敏感房 metadata 的 1.5 秒快速回放，用时 **56.2ms**（小尺寸测试画面，非 720p 性能数据）。
+  生成的全部 MP4 均通过 FFmpeg 完整解码。
+- 同机 Release synthetic benchmark：12 秒 1280×720@60 H.264 源，保留从 1.25s 开始的 10s，
+  8 Mbps、stereo 48kHz 音频，两条路径同用 libopenh264/AAC：
+
+  | 最终化路径 | 耗时 | 视频 / 音频时长 |
+  | --- | ---: | --- |
+  | 原完整转码 | 3203.6ms | 10.000s / 10.005s |
+  | 复用视频包 | 603.5ms | 9.999s / 10.005s |
+
+  两种输出的音视频起点均为 0，完整解码无错误。这是一次合成素材对比，
+  **不包含死亡时尚未排空的实时编码队列**，不代表用户全部模组/地图下的点击到播放耗时。
+  长回放音频编码、磁盘或录制积压仍可能增加等待，复杂剪辑/冻结帧编辑仍需转码。
+
+证据：`.work/instant-death-replay/.work/` 下 `rust-tests.log`、`policy-tests.log`、
+`managed-tests.log`、`integration.log`、`benchmark.log`、`benchmark.ps1` 和各输出 MP4。
+
+## 平台与功能限制
 
 第一轮 ABI 6 在添加本轮 Zstd 之前通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。本轮仅在 Windows 构建运行，未重跑三端交叉检查；Zstd C 库由 Cargo 构建，三平台 CI 构建矩阵保留。
 Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。

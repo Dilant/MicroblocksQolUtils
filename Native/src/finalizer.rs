@@ -25,6 +25,8 @@ pub struct FinalizePlan {
     pub fps: u32,
     pub reconstruct_bgm: bool,
     pub remove_freeze_frames: bool,
+    /// Death replays can reuse the live encoder's packets instead of encoding twice.
+    pub prefer_video_copy: bool,
     pub bgm_event_map_file: String,
 }
 
@@ -38,6 +40,7 @@ impl Default for FinalizePlan {
             fps: 60,
             reconstruct_bgm: false,
             remove_freeze_frames: false,
+            prefer_video_copy: false,
             bgm_event_map_file: String::new(),
         }
     }
@@ -54,6 +57,9 @@ pub struct FinalizeClip {
     pub music_timeline_milliseconds: i64,
     #[serde(default)]
     pub seamless_from_previous: bool,
+    /// This room needs the original music/video phase, not a continuous post-edit cursor.
+    #[serde(default)]
+    pub bgm_follows_video: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,69 +236,29 @@ pub fn finalize_with_progress(
     if effective_clips.is_empty() {
         return Err(FinalizeError::NoFrames);
     }
-    let mut input = format::input(source_path).map_err(|source| FinalizeError::OpenInput {
-        path: source_path.to_owned(),
-        source,
-    })?;
-    let video = input
-        .streams()
-        .best(media::Type::Video)
-        .ok_or_else(|| FinalizeError::MissingVideo(source_path.to_owned()))?;
-    let stream_index = video.index();
-    let input_time_base = video.time_base();
-    let mut decoder = codec::context::Context::from_parameters(video.parameters())
-        .and_then(|context| context.decoder().video())
-        .map_err(FinalizeError::Decoder)?;
-    drop(video);
-
-    let mut selection = TimelineSelection::new(&effective_clips);
-    let total_duration = timeline_layout(&effective_clips)
-        .last()
-        .zip(effective_clips.last())
-        .map(|(layout, clip)| layout.output_start_seconds + clip.duration_seconds)
-        .unwrap_or(1.0);
-    let mut output = None;
-    let mut decoded = frame::Video::empty();
-    for (stream, packet) in input.packets() {
-        if stream.index() != stream_index {
-            continue;
+    let copied = if plan.prefer_video_copy && !plan.remove_freeze_frames {
+        match crate::finalizer_copy::copy_video(&effective_clips, &video_temporary) {
+            Ok(copied) => copied,
+            Err(error) => {
+                eprintln!(
+                    "[mqol] Death replay packet copy unavailable; using exact transcode: {error}"
+                );
+                false
+            }
         }
-        decoder
-            .send_packet(&packet)
-            .map_err(FinalizeError::SendPacket)?;
-        drain_decoder(
-            &mut decoder,
-            &mut decoded,
-            input_time_base,
+    } else {
+        false
+    };
+    if copied {
+        eprintln!("[mqol] Death replay reused captured video without re-encoding");
+    } else {
+        transcode_video(
             plan,
+            &effective_clips,
             &video_temporary,
-            &mut selection,
-            &mut output,
-            total_duration,
-            &mut report_progress,
-        )?;
-        if selection.finished() {
-            break;
-        }
-    }
-    if !selection.finished() {
-        decoder.send_eof().map_err(FinalizeError::FlushDecoder)?;
-        drain_decoder(
-            &mut decoder,
-            &mut decoded,
-            input_time_base,
-            plan,
-            &video_temporary,
-            &mut selection,
-            &mut output,
-            total_duration,
             &mut report_progress,
         )?;
     }
-
-    let mut output = output.ok_or(FinalizeError::NoFrames)?;
-    output.finish()?;
-    drop(output);
     report_progress(0.85);
 
     let sidecar = PathBuf::from(format!("{}.sfxchunks", source_path.display()));
@@ -330,6 +296,78 @@ pub fn finalize_with_progress(
         let _ = fs::remove_file(path);
     }
     report_progress(1.0);
+    Ok(())
+}
+
+fn transcode_video(
+    plan: &FinalizePlan,
+    effective_clips: &[FinalizeClip],
+    video_temporary: &Path,
+    report_progress: &mut impl FnMut(f32),
+) -> Result<(), FinalizeError> {
+    let source_path = Path::new(&plan.clips[0].source);
+    let mut input = format::input(source_path).map_err(|source| FinalizeError::OpenInput {
+        path: source_path.to_owned(),
+        source,
+    })?;
+    let video = input
+        .streams()
+        .best(media::Type::Video)
+        .ok_or_else(|| FinalizeError::MissingVideo(source_path.to_owned()))?;
+    let stream_index = video.index();
+    let input_time_base = video.time_base();
+    let mut decoder = codec::context::Context::from_parameters(video.parameters())
+        .and_then(|context| context.decoder().video())
+        .map_err(FinalizeError::Decoder)?;
+    drop(video);
+
+    let mut selection = TimelineSelection::new(effective_clips);
+    let total_duration = timeline_layout(effective_clips)
+        .last()
+        .zip(effective_clips.last())
+        .map(|(layout, clip)| layout.output_start_seconds + clip.duration_seconds)
+        .unwrap_or(1.0);
+    let mut output = None;
+    let mut decoded = frame::Video::empty();
+    for (stream, packet) in input.packets() {
+        if stream.index() != stream_index {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .map_err(FinalizeError::SendPacket)?;
+        drain_decoder(
+            &mut decoder,
+            &mut decoded,
+            input_time_base,
+            plan,
+            video_temporary,
+            &mut selection,
+            &mut output,
+            total_duration,
+            report_progress,
+        )?;
+        if selection.finished() {
+            break;
+        }
+    }
+    if !selection.finished() {
+        decoder.send_eof().map_err(FinalizeError::FlushDecoder)?;
+        drain_decoder(
+            &mut decoder,
+            &mut decoded,
+            input_time_base,
+            plan,
+            video_temporary,
+            &mut selection,
+            &mut output,
+            total_duration,
+            report_progress,
+        )?;
+    }
+
+    let mut output = output.ok_or(FinalizeError::NoFrames)?;
+    output.finish()?;
     Ok(())
 }
 
@@ -442,12 +480,18 @@ fn remove_freeze_segments(clips: &[FinalizeClip], freezes: &[FreezeSegment]) -> 
             if start > cursor {
                 let duration = start - cursor;
                 result.push(FinalizeClip {
+                    bgm_follows_video: clip.bgm_follows_video,
                     source: clip.source.clone(),
                     start_seconds: cursor,
                     duration_seconds: duration,
                     music_event: clip.music_event.clone(),
                     music_timeline_milliseconds: clip.music_timeline_milliseconds
-                        + (retained * 1_000.0).round() as i64,
+                        + (if clip.bgm_follows_video {
+                            cursor - clip.start_seconds
+                        } else {
+                            retained
+                        } * 1_000.0)
+                            .round() as i64,
                     seamless_from_previous: if first_piece {
                         clip.seamless_from_previous
                     } else {
@@ -462,12 +506,18 @@ fn remove_freeze_segments(clips: &[FinalizeClip], freezes: &[FreezeSegment]) -> 
         if cursor < clip_end {
             let duration = clip_end - cursor;
             result.push(FinalizeClip {
+                bgm_follows_video: clip.bgm_follows_video,
                 source: clip.source.clone(),
                 start_seconds: cursor,
                 duration_seconds: duration,
                 music_event: clip.music_event.clone(),
                 music_timeline_milliseconds: clip.music_timeline_milliseconds
-                    + (retained * 1_000.0).round() as i64,
+                    + (if clip.bgm_follows_video {
+                        cursor - clip.start_seconds
+                    } else {
+                        retained
+                    } * 1_000.0)
+                        .round() as i64,
                 seamless_from_previous: if first_piece {
                     clip.seamless_from_previous
                 } else {
@@ -876,6 +926,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -884,6 +935,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let mut selection = TimelineSelection::new(&clips);
@@ -927,6 +979,7 @@ mod tests {
                 music_event: "event:/music/a".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -935,6 +988,7 @@ mod tests {
                 music_event: "event:/music/a".to_owned(),
                 music_timeline_milliseconds: 1_000,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let layout = timeline_layout(&clips);
@@ -952,6 +1006,7 @@ mod tests {
             music_event: "event:/music/a".to_owned(),
             music_timeline_milliseconds: 100,
             seamless_from_previous: false,
+            bgm_follows_video: false,
         }];
         let edited = remove_freeze_segments(
             &clips,
@@ -971,6 +1026,35 @@ mod tests {
     }
 
     #[test]
+    fn room_music_policy_survives_json_and_freeze_splits() {
+        let clip: FinalizeClip = serde_json::from_str(
+            r#"{
+            "source":"run.mkv","start_seconds":0,"duration_seconds":3,
+            "music_timeline_milliseconds":100,"bgm_follows_video":true
+        }"#,
+        )
+        .unwrap();
+        let edited = remove_freeze_segments(
+            &[clip],
+            &[FreezeSegment {
+                start_seconds: 1.0,
+                end_seconds: 2.0,
+            }],
+        );
+        assert_eq!(edited.len(), 2);
+        assert!(edited.iter().all(|clip| clip.bgm_follows_video));
+        assert_eq!(edited[1].music_timeline_milliseconds, 2100);
+        assert!(edited[1].seamless_from_previous);
+        let legacy: FinalizeClip = serde_json::from_str(
+            r#"{
+            "source":"run.mkv","start_seconds":0,"duration_seconds":1
+        }"#,
+        )
+        .unwrap();
+        assert!(!legacy.bgm_follows_video);
+    }
+
+    #[test]
     fn seamless_clip_uses_a_frame_exact_cut_without_fading() {
         let clips = vec![
             FinalizeClip {
@@ -980,6 +1064,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -988,6 +1073,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: true,
+                bgm_follows_video: false,
             },
         ];
         let layout = timeline_layout(&clips);
@@ -1033,6 +1119,7 @@ mod tests {
                     music_event: String::new(),
                     music_timeline_milliseconds: 0,
                     seamless_from_previous: false,
+                    bgm_follows_video: false,
                 },
                 FinalizeClip {
                     source: source.to_string_lossy().into_owned(),
@@ -1041,10 +1128,13 @@ mod tests {
                     music_event: String::new(),
                     music_timeline_milliseconds: 0,
                     seamless_from_previous: false,
+                    bgm_follows_video: false,
                 },
             ],
             output_path: output.to_string_lossy().into_owned(),
             encoder: "libopenh264".to_owned(),
+            // The discontinuous replay must fall back to the existing exact edit.
+            prefer_video_copy: true,
             bitrate_kbps: 1_000,
             fps: 30,
             ..FinalizePlan::default()
@@ -1107,6 +1197,171 @@ mod tests {
             encoder.encode(&frame).unwrap();
         }
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn death_replay_copies_non_keyframe_trim_and_preserves_encoded_packets() {
+        if std::env::var_os("MQOL_TEST_FFMPEG").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("continuous.mkv");
+        write_continuous_source(&source);
+        write_continuous_audio(&source);
+        let reference = decoded_samples(&source);
+        let reference_packets = encoded_samples(&source);
+        // Both within a GOP and after a seek to the next GOP. Also cover a cut
+        // at zero, a sub-frame replay, metadata splits and the no-audio path.
+        for (index, start, duration, audio) in [
+            (0, 0.25, 0.5, true),
+            (1, 2.25, 0.5, true),
+            (2, 0.0, 0.5, true),
+            (3, 0.26, 0.02, true),
+            (5, 1.99, 0.5, true),
+            (4, 0.25, 0.5, false),
+        ] {
+            if !audio {
+                fs::remove_file(format!("{}.sfxchunks", source.display())).unwrap();
+            }
+            let output = directory.path().join(format!("copied-{index}.mp4"));
+            let clip = FinalizeClip {
+                source: source.to_string_lossy().into_owned(),
+                start_seconds: start,
+                duration_seconds: duration / 2.,
+                music_event: String::new(),
+                music_timeline_milliseconds: 0,
+                seamless_from_previous: false,
+                bgm_follows_video: false,
+            };
+            let mut second = clip.clone();
+            second.start_seconds += duration / 2.;
+            second.seamless_from_previous = true;
+            second.bgm_follows_video = true;
+            let mut progress = Vec::new();
+            finalize_with_progress(
+                &FinalizePlan {
+                    clips: vec![clip, second],
+                    output_path: output.to_string_lossy().into_owned(),
+                    // Packet identity below proves reuse even though the encoder
+                    // selector could fall back from an unavailable preference.
+                    encoder: "mqol_test_no_such_encoder".into(),
+                    prefer_video_copy: true,
+                    reconstruct_bgm: true,
+                    fps: 30,
+                    ..FinalizePlan::default()
+                },
+                |p| progress.push(p),
+            )
+            .unwrap();
+            assert_eq!(progress.last(), Some(&1.));
+            assert!(progress.windows(2).all(|p| p[0] <= p[1]));
+            let actual = decoded_samples(&output);
+            let actual_packets: Vec<_> = encoded_samples(&output)
+                .into_iter()
+                .filter(|(t, _)| *t >= 0.)
+                .map(|(_, bytes)| bytes)
+                .collect();
+            let expected_packets: Vec<_> = reference_packets
+                .iter()
+                .filter(|(t, _)| *t >= start && *t < start + duration)
+                .map(|(_, bytes)| bytes.clone())
+                .collect();
+            assert_eq!(
+                actual_packets, expected_packets,
+                "compressed packets changed, case {index}"
+            );
+            let expected: Vec<_> = reference
+                .iter()
+                .filter(|(t, _)| *t >= start && *t < start + duration)
+                .collect();
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "visible frame count case {index}: {actual:?}"
+            );
+            for ((actual_time, actual_pixel), (source_time, expected_pixel)) in
+                actual.iter().zip(expected)
+            {
+                assert_eq!(
+                    actual_pixel, expected_pixel,
+                    "preroll leaked or video was re-encoded, case {index}"
+                );
+                // MP4's edit list rounds its initial visible sample to zero;
+                // source time remains within one capture frame of the audio.
+                assert!(
+                    (actual_time - (source_time - start)).abs() < 1. / 30. + 0.001,
+                    "wrong trim timestamp case {index}: {actual_time} vs {source_time}"
+                );
+            }
+            let input = format::input(&output).unwrap();
+            let video = input.streams().best(media::Type::Video).unwrap();
+            let video_duration = video.duration() as f64 * f64::from(video.time_base());
+            assert!(
+                (video_duration - duration).abs() < 0.04,
+                "video duration {video_duration}"
+            );
+            let audio_stream = input.streams().best(media::Type::Audio);
+            assert_eq!(audio_stream.is_some(), audio);
+            if let Some(audio) = audio_stream {
+                let audio_duration = audio.duration() as f64 * f64::from(audio.time_base());
+                assert!(audio.start_time().abs() as f64 * f64::from(audio.time_base()) < 0.002);
+                assert!(
+                    (audio_duration - duration).abs() < 0.04,
+                    "audio duration {audio_duration}"
+                );
+            }
+        }
+    }
+
+    fn decoded_samples(path: &Path) -> Vec<(f64, [u8; 3])> {
+        let mut input = format::input(path).unwrap();
+        let video = input.streams().best(media::Type::Video).unwrap();
+        let index = video.index();
+        let time_base = f64::from(video.time_base());
+        let mut decoder = codec::context::Context::from_parameters(video.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        drop(video);
+        let mut result = Vec::new();
+        let mut decoded = frame::Video::empty();
+        let mut drain = |decoder: &mut ffmpeg::decoder::Video| {
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                result.push((
+                    decoded.timestamp().unwrap() as f64 * time_base,
+                    [decoded.data(0)[0], decoded.data(1)[0], decoded.data(2)[0]],
+                ));
+            }
+        };
+        for (stream, packet) in input.packets() {
+            if stream.index() != index {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            drain(&mut decoder);
+        }
+        decoder.send_eof().unwrap();
+        drain(&mut decoder);
+        result
+    }
+
+    fn encoded_samples(path: &Path) -> Vec<(f64, Vec<u8>)> {
+        let mut input = format::input(path).unwrap();
+        let video = input.streams().best(media::Type::Video).unwrap();
+        let index = video.index();
+        let time_base = f64::from(video.time_base());
+        drop(video);
+        input
+            .packets()
+            .filter(|(stream, _)| stream.index() == index)
+            .map(|(_, packet)| {
+                (
+                    packet.pts().unwrap() as f64 * time_base,
+                    packet.data().unwrap().to_vec(),
+                )
+            })
+            .collect()
     }
 
     fn write_continuous_audio(video_path: &Path) {

@@ -21,7 +21,8 @@ internal sealed class RecordingSessionState {
     private GoldenRecordingDeath goldenDeath;
 
     public void Observe(AutoRecordingMode mode, bool carryingGolden) {
-        if (mode != observedMode || (carryingGolden && !observedGolden)) Suppressed = false;
+        if (mode != observedMode || (mode == AutoRecordingMode.Golden && carryingGolden && !observedGolden))
+            Suppressed = false;
         observedMode = mode;
         observedGolden = carryingGolden;
     }

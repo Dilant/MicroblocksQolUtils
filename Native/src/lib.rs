@@ -27,8 +27,10 @@ mod encoder;
 mod finalizer;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_audio;
+#[cfg(feature = "ffmpeg")]
+mod finalizer_copy;
 
-const ABI_VERSION: u32 = 6;
+const ABI_VERSION: u32 = 7;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
