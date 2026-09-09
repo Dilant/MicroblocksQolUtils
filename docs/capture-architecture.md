@@ -11,6 +11,7 @@ SDL/FNA 呈现：按真实后端路由，不更改游戏 renderer
 
 FMOD: gameplay_sfx / ui_sfx / music 各一个 pass-through DSP
         ↓ 原始 interleaved float PCM、声道/采样率、bus、DSP clock
+        ↓ 每 bus 一个预分配 SPSC ring（64 块）；mixer 不拿 worker 的锁
         ↓ 唯一 source worker
 
 MusicCapture: 主/alt 音乐状态快照 + managed command hooks
@@ -19,7 +20,7 @@ MusicCapture: 主/alt 音乐状态快照 + managed command hooks
 
                         CaptureSource（单一来源）
                                   ↓
-             CaptureSubscription（各自队列、各自串行 callback worker）
+            CaptureSubscription（各自队列、各自串行 callback worker）
                    /              |              \
              全程录制          死亡回放          第三方消费者
           NativeCaptureSession：独立编码、原点、PCM 文件及事件日志
@@ -55,12 +56,24 @@ await registration.Completion; // 在 callback 外等待正在执行的 callback
 ```
 
 三个 callback 可以独立省略，但不能全空。最多 16 个注册。每个注册独立排队：
-3 帧、32 PCM 块、256 音乐事件。callback 内不能直接操纵 game/GL/D3D/FMOD 对象，
+3 帧、256 PCM 块、256 音乐事件。callback 内不能直接操纵 game/GL/D3D/FMOD 对象，
 也不能同步等待自身 Completion。慢消费者、抛异常的消费者不影响其他 callback。
 数组在发布后不复用，可保留；只读契约不允许通过 unsafe/MemoryMarshal 修改共享数据。
 
+性能敏感的逐帧处理（内置录制器也使用它）可改用 `CaptureSource.SubscribeBorrowed(...)`。
+参数及取消方式相同，但像素仅在同步 callback 执行期间有效；要保留/交给异步代码必须先
+`CaptureFrame owned = frame.Snapshot()`。PCM/音乐事件仍为 owned，不受此限制。
+借用路径采用引用计数共享缓冲：入队持有，丢弃/取消/回调结束归还，绝不在正在执行 callback 时复用。
+单一 source pool 最多 32 个 buffer、总 payload 128 MiB，含正在借出的 buffer；池满计入 `CaptureSource.DroppedFrames`。
+原 `Subscribe` 的 owned 契约不变，仅在存在 owned 像素消费者时每帧额外复制一次并共享给它们；
+高帧率大图的 owned 模式仍有相应分配/GC 成本，低频截图宜借用后按需 Snapshot。
+
 `DroppedFrames`、`DroppedAudioChunks`、`DroppedMusicEvents`、`CallbackErrors` 是消费者统计；
-`CaptureSource.DroppedAudioChunks` 是源端 PCM 溢出/争用统计。
+`CaptureSource.DroppedAudioChunks` 是源端 PCM 溢出/非法块/同 bus 异常重入统计。
+源端每个 bus 预分配 65 个 16,384-float slot（可用 64 个），共约 12.2 MiB；
+worker 完成 owned copy 后才归还 slot。普通读写竞争不再丢音频。
+订阅者入队只持短 bookkeeping 锁，callback 在锁外执行；视频、音乐事件、PCM 轮询公平派发。
+不能在同一个串行订阅里放任意耗时 callback 又要求它无损；可把慢视频分析单独注册。
 `VideoBackend`、`VideoError`、`MusicError` 提供真实后端和失败信息。
 音乐事件溢出/异常会使日志标记 incomplete，重构 BGM 时拒绝把残缺日志当成功。
 
@@ -99,13 +112,32 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 需要保留游戏实际动态音乐时使用采集到的 BGM，不配置静态替换映射。
 剪辑不能凭空生成未采到的音乐，PCM 丢块仍按时间戳表现为缺口。
 
+## 录制启动和过载
+
+- 每个 sink 的硬件编码器在首帧确定分辨率后创建。初始化选择/耗时写入日志。
+- 不再用 3 帧覆盖队列丢掉冷启动期间的画面。正常时保留少量 raw BGRA；队列积压时，
+  sink worker 做可逆空间差分 + Zstd level 1 无损压缩，encoder worker 按 FIFO 解压消费。
+- 每 sink 排队 payload 最多 **192 MiB**，数量最多 `queue_capacity + 5 * fps`；任一达到就拒绝新帧并计数。
+  不是无限 RAM，也不是承诺能缓存任意内容的 5 秒。上限不含正在处理的帧、压缩 scratch、codec/GPU 内存。
+  用完即释放；稳态不做这次压缩。日志报告峰值帧数/字节与 overflow。
+- 音频 sink 入队发生在 callback worker，不是 mixer，已移除两层旧的 try-lock 丢块逻辑。
+  音频磁盘写入在独立线程、锁外进行；native 和订阅缓冲各容纳 256 块，覆盖 source 三个
+  64-slot ring 恢复后的突发批次。native 每 sink 最多 16 MiB PCM buffer 容量，不是无限增长。
+- FPS 统一使用最近 tick 量化，避免 60-Hz 来源的微小抖动被向下取整误判成重复帧。
+  最大量化误差半个目标帧；原始采集时间戳、音频原点和 PCM 时钟不改写。
+- encoder 重用输入 AVFrame，并在覆盖 converted frame 前 make-writable，防止异步 codec 仍引用旧像素。
+- `NativeCaptureSession.DeliveryStatistics` 报告进入 native 之前的订阅丢帧/PCM/音乐事件/异常；
+  `Statistics` 报告 native 队列损失。不能仅看后者就宣称端到端无损。
+- 持续编码/磁盘速度低于输入速度时，任何有限缓冲最终都会满。后续可用相同配置共享编码、
+  更低分辨率/帧率或不同 encoder 减负；当前仍是单一采集、多 sink 独立编码，不伪称已经共享码流。
+
 ## GPU / 平台边界
 
 - **不是三端都必然使用 OpenGL**。SDL 管窗口，不统一各 renderer 的呈现/读回 API。
 - Windows：实现 OpenGL 和 D3D11。D3D11 是 SDL/FNA 路径实际调用的 DXGI Present，
   不能用 SDL_GL_SwapWindow 冒充支持。只接受 SDR RGBA8/BGRA8 swapchain。
 - Linux/macOS：保留 SDL OpenGL 3.2+ PBO/fence 路径；这次没有 Linux/macOS 真机运行验证。
-- Vulkan、Metal、SDL_GPU 尚未实现，必须增加各自 GPU readback 后端；不能标为已支持。
+- Vulkan、Metal、SDL_GPU 尚未实现。要支持实际使用这些 renderer 的版本/配置，才需要增加对应 GPU readback 后端；不能标为已支持。
 - Android：代码路径预留 GLES3，但 SDL/JNI 生命周期、ARM hook、打包及真机均未验证。
 
 GL 在 swap **之前**提交 readpixels，后续帧用 timeout=0 的 fence 检查；保存/恢复所有修改的 GL pack/read 状态。
@@ -120,3 +152,23 @@ DXGI hook 延迟到首个像素消费者出现后的 game update，避免 mod lo
 
 安装器不选择 renderer；只迁移删除旧安装器加的那段带专用注释的 `--graphics OpenGL`，
 原配置先备份到 `.work`，用户自行写的参数不删除。
+
+### 本机 Everest 对应的默认后端（2026-09-09 核查）
+
+本机 `FNA3D.dll` 的 Git blob SHA 为 `46c82820493b98ce5e5354f4ddb06fd51bc4bf60`，
+匹配 Everest 6487 使用的 Everest-libs `591f7c12fcb4e8fda9ef5ef1b331b5ed40d3fb1f` 中的 Windows x64 文件。
+同一制品树包含 Linux/macOS 的 FNA3D。追溯二进制提交到 libs 源码 `9136b4e0545853f30ff8c80a6272abafcf96df6f`，
+FNA `a5920865ab28dcd9d27fca22e03f2658e804b07b`，最终 FNA3D `2a6f8586c8d032da18f707eb340bfbef26d1ff8b`。
+
+该 revision 编译 OpenGL、Vulkan；D3D11 仅 Windows/显式 DXVK-native 构建启用。
+默认探测顺序 **D3D11 → OpenGL → Vulkan**，`FNA3D_FORCE_DRIVER` 可以覆盖。
+因此这版默认 Windows D3D11，Linux/macOS OpenGL；macOS 的可选 Vulkan 经包里的 MoltenVK 使用 Metal，
+不是本版默认 native Metal renderer。这里是制品/源码核验，Linux/macOS 尚未真机验证。
+不同 FNA 更新、启动器覆盖、vanilla/Android 移植版本必须重新检测，不能按操作系统硬编码。
+
+可复核的一手来源：
+- [Everest 6487 对应源码树](https://github.com/EverestAPI/Everest/tree/d72e94f4b9e62b91cbdea674587ed39d53de9550)
+- [Everest-libs 二进制制品](https://github.com/EverestAPI/Everest-libs/tree/591f7c12fcb4e8fda9ef5ef1b331b5ed40d3fb1f)
+- [三平台构建参数及 MoltenVK 打包](https://github.com/EverestAPI/Everest-libs/blob/9136b4e0545853f30ff8c80a6272abafcf96df6f/.github/workflows/build-libs.yml)
+- [FNA3D 实际 revision 的后端选择](https://github.com/FNA-XNA/FNA3D/blob/2a6f8586c8d032da18f707eb340bfbef26d1ff8b/src/FNA3D.c)
+- [该 revision 的编译开关](https://github.com/FNA-XNA/FNA3D/blob/2a6f8586c8d032da18f707eb340bfbef26d1ff8b/CMakeLists.txt)

@@ -62,6 +62,7 @@ pub struct VideoFileEncoder {
     output: format::context::Output,
     encoder: encoder::video::Encoder,
     scaler: software::scaling::Context,
+    input: frame::Video,
     converted: frame::Video,
     output_width: u32,
     output_height: u32,
@@ -100,6 +101,7 @@ impl VideoFileEncoder {
         let output_height = even_dimension(first.height);
         let mut failures = Vec::new();
         for name in encoder_candidates(&config.encoder) {
+            let started = std::time::Instant::now();
             match Self::try_create(
                 path,
                 name,
@@ -110,8 +112,24 @@ impl VideoFileEncoder {
                 config.fps,
                 config.bitrate_kbps,
             ) {
-                Ok(encoder) => return Ok(encoder),
-                Err(error) => failures.push(format!("{name}: {error}")),
+                Ok(encoder) => {
+                    eprintln!(
+                        "[mqol-encoder] {}: selected {name}, open={}ms, {}x{}@{}",
+                        path.display(),
+                        started.elapsed().as_millis(),
+                        output_width,
+                        output_height,
+                        config.fps
+                    );
+                    return Ok(encoder);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[mqol-encoder] {name}: failed after {}ms: {error}",
+                        started.elapsed().as_millis()
+                    );
+                    failures.push(format!("{name}: {error}"));
+                }
             }
         }
         Err(EncoderError::NoEncoder(failures.join("; ")))
@@ -201,6 +219,7 @@ impl VideoFileEncoder {
             output,
             encoder: opened,
             scaler,
+            input: frame::Video::new(ffmpeg::format::Pixel::BGRA, input_width, input_height),
             converted: frame::Video::new(pixel_format, output_width, output_height),
             output_width,
             output_height,
@@ -227,14 +246,15 @@ impl VideoFileEncoder {
         let origin = *self
             .origin_unix_nanos
             .get_or_insert(captured.captured_at_unix_nanos);
-        let elapsed = captured.captured_at_unix_nanos.saturating_sub(origin) as u128;
-        let timestamp =
-            ((elapsed * self.fps as u128) / 1_000_000_000_u128).min(i64::MAX as u128) as i64;
+        let timestamp = crate::video_tick(captured.captured_at_unix_nanos, origin, self.fps)
+            .min(i64::MAX as u128) as i64;
         if timestamp <= self.last_pts {
             return Ok(());
         }
 
         if captured.width != self.input_width || captured.height != self.input_height {
+            self.input =
+                frame::Video::new(ffmpeg::format::Pixel::BGRA, captured.width, captured.height);
             self.input_width = captured.width;
             self.input_height = captured.height;
             self.scaler.cached(
@@ -248,11 +268,15 @@ impl VideoFileEncoder {
             );
         }
 
-        let mut input =
-            frame::Video::new(ffmpeg::format::Pixel::BGRA, captured.width, captured.height);
-        copy_bgra(captured, &mut input)?;
+        copy_bgra(captured, &mut self.input)?;
+        // An asynchronous encoder may still reference the previous converted
+        // frame. Never overwrite its storage while the codec owns a reference.
+        let writable = unsafe { ffmpeg::ffi::av_frame_make_writable(self.converted.as_mut_ptr()) };
+        if writable < 0 {
+            return Err(EncoderError::Convert(ffmpeg::Error::from(writable)));
+        }
         self.scaler
-            .run(&input, &mut self.converted)
+            .run(&self.input, &mut self.converted)
             .map_err(EncoderError::Convert)?;
 
         self.last_pts = timestamp;

@@ -1,8 +1,11 @@
 namespace Celeste.Mod.MicroblocksQolUtils;
 
-/// <summary>Owned, immutable top-down BGRA8 pixels. Safe to retain after the callback.</summary>
+/// <summary>Top-down BGRA8 pixels. Subscribe delivers owned data; SubscribeBorrowed
+/// lends pixels only until callback return. Snapshot makes an owned retained copy.</summary>
 public sealed record CaptureFrame(ReadOnlyMemory<byte> Pixels, int Width, int Height, ulong TimestampNanos, ulong Sequence) {
     public int Stride => checked(Width * 4);
+    internal FrameLease? Lease { get; init; }
+    public CaptureFrame Snapshot() => new(Pixels.ToArray(), Width, Height, TimestampNanos, Sequence);
 }
 /// <summary>Owned interleaved float PCM and FMOD bus/DSP metadata; timestamp uses the video source clock.</summary>
 public sealed record CaptureAudio(ReadOnlyMemory<float> Samples, int SampleRate, int Channels,
@@ -23,7 +26,8 @@ public sealed record CaptureMusic(ulong TimestampNanos, ulong Sequence, string K
 public sealed class CaptureSubscription : IDisposable {
     private readonly object gate = new();
     private readonly Queue<CaptureFrame> frames = new(3);
-    private readonly Queue<CaptureAudio> audio = new(32);
+    internal const int AudioCapacity = 256;
+    private readonly Queue<CaptureAudio> audio = new(AudioCapacity);
     private readonly Queue<CaptureMusic> musicEvents = new(256);
     private readonly SemaphoreSlim ready = new(0, 1);
     private readonly Action<CaptureFrame>? pixels;
@@ -36,6 +40,7 @@ public sealed class CaptureSubscription : IDisposable {
     internal bool WantsPixels => pixels is not null;
     internal bool WantsAudio => fmod is not null;
     internal bool WantsMusic => music is not null;
+    internal bool BorrowsPixels { get; }
     public long DroppedFrames => Interlocked.Read(ref droppedFrames);
     public long DroppedAudioChunks => Interlocked.Read(ref droppedAudio);
     public long CallbackErrors => Interlocked.Read(ref callbackErrors);
@@ -43,7 +48,8 @@ public sealed class CaptureSubscription : IDisposable {
     public long DroppedMusicEvents => Interlocked.Read(ref droppedMusic);
     public Task Completion { get; }
 
-    internal CaptureSubscription(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureSubscription> unregister, ulong subscribedAt = 0, Action<CaptureMusic>? music = null) {
+    internal CaptureSubscription(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureSubscription> unregister, ulong subscribedAt = 0, Action<CaptureMusic>? music = null, bool borrowsPixels = false) {
+        BorrowsPixels = borrowsPixels;
         this.subscribedAt = subscribedAt;
         this.pixels = pixels; this.fmod = fmod; this.unregister = unregister;
         this.music = music;
@@ -60,42 +66,49 @@ public sealed class CaptureSubscription : IDisposable {
     }
     internal void Offer(CaptureFrame value) {
         if (value.TimestampNanos < subscribedAt || pixels is null || Volatile.Read(ref disposed) != 0) return;
-        if (!Monitor.TryEnter(gate)) { Interlocked.Increment(ref droppedFrames); return; }
-        try {
+        lock (gate) {
             if (disposed != 0) return;
-            if (frames.Count == 3) { frames.Dequeue(); Interlocked.Increment(ref droppedFrames); }
+            value.Lease?.Retain();
+            if (frames.Count == 3) { frames.Dequeue().Lease?.Release(); Interlocked.Increment(ref droppedFrames); }
             frames.Enqueue(value); Signal();
-        } finally { Monitor.Exit(gate); }
+        }
     }
     internal void Offer(CaptureAudio value) {
         if (value.TimestampNanos < subscribedAt || fmod is null || Volatile.Read(ref disposed) != 0) return;
-        if (!Monitor.TryEnter(gate)) { Interlocked.Increment(ref droppedAudio); return; }
-        try {
+        lock (gate) {
             if (disposed != 0) return;
-            if (audio.Count == 32) { audio.Dequeue(); Interlocked.Increment(ref droppedAudio); }
+            if (audio.Count == AudioCapacity) { audio.Dequeue(); Interlocked.Increment(ref droppedAudio); }
             audio.Enqueue(value); Signal();
-        } finally { Monitor.Exit(gate); }
+        }
     }
     private void Signal() { if (ready.CurrentCount == 0) { try { ready.Release(); } catch (SemaphoreFullException) { } } }
     private async Task DispatchAsync() {
+        int turn = 0;
         while (true) {
             await ready.WaitAsync().ConfigureAwait(false);
             while (true) {
                 CaptureFrame? frame = null; CaptureAudio? chunk = null; CaptureMusic? change = null;
                 lock (gate) {
                     if (disposed == 1) return;
-                    // Deliver video first to establish recording origin before pending audio.
-                    if (frames.Count != 0) frame = frames.Dequeue();
-                    else if (musicEvents.Count != 0) change = musicEvents.Dequeue();
-                    else if (audio.Count != 0) chunk = audio.Dequeue();
-                    else if (disposed == 2) return;
-                    else break;
+                    // Round-robin: first video establishes origin, but continuous
+                    // video must not starve music/PCM (nor vice versa).
+                    for (int i = 0; i < 3; i++) {
+                        int lane = turn; turn = (turn + 1) % 3;
+                        if (lane == 0 && frames.Count != 0) { frame = frames.Dequeue(); break; }
+                        if (lane == 1 && musicEvents.Count != 0) { change = musicEvents.Dequeue(); break; }
+                        if (lane == 2 && audio.Count != 0) { chunk = audio.Dequeue(); break; }
+                    }
+                    if (frame is null && change is null && chunk is null) {
+                        if (disposed == 2) return;
+                        break;
+                    }
                 }
                 try { if (frame is not null) pixels!(frame); else if (change is not null) music!(change); else fmod!(chunk!); }
                 catch (Exception e) {
                     if (Interlocked.Increment(ref callbackErrors) == 1)
                         Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Capture", $"Subscriber callback failed: {e.Message}");
                 }
+                finally { frame?.Lease?.Release(); }
             }
         }
     }
@@ -111,7 +124,8 @@ public sealed class CaptureSubscription : IDisposable {
         if (previous == 0) unregister(this);
         lock (gate) {
             Interlocked.Add(ref droppedMusic, musicEvents.Count);
-            frames.Clear(); audio.Clear(); musicEvents.Clear(); Signal();
+            while (frames.TryDequeue(out var frame)) frame.Lease?.Release();
+            audio.Clear(); musicEvents.Clear(); Signal();
         }
     }
 }

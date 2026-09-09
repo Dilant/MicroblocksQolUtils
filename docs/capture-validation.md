@@ -1,5 +1,70 @@
 # Capture validation — 2026-09-09 follow-up
 
+## 第二轮：吞吐/丢块修复（同日，codex/capture-throughput）
+
+下面较早记录中的“高负载丢帧”不是可接受的正常结论。加上长时间与分阶段统计后，发现：
+
+1. 旧版 QSV 创建耗时约 1.4–1.5 秒，第二个 sink 前面的 NVENC 失败探测另外等待约 0.6–0.8 秒。
+   3 帧队列把这段启动视频丢了，而后续编码通常能跟上。
+2. native registry/audio queue、managed subscription 仍有旧的 try-lock 丢 PCM；这些调用已经是 worker，不应因瞬时锁竞争丢数据。
+3. 向下取整 FPS bucket 会把同频来源的细小时间抖动误判成重复帧。
+4. 每帧分配几 MiB owned 托管数组会使全量模组场景频繁停顿。即使 native 视频队列零丢弃，
+   上游帧率与订阅 PCM 仍可能损失；恢复后的 PCM 突发又超过小缓冲。
+
+已修复：有界空间差分/Zstd 冷启动缓冲；worker 锁不再抢锁失败就丢音频；mixer 三个
+预分配 ring；公平派发；最近 tick；借用式引用计数像素池（旧 owned API 保持兼容）；
+扩大但仍有界的 PCM 突发缓冲；AVFrame 重用及异步 codec 写前 make-writable。
+
+### 实测对照
+
+同机 1280×720、两个真实编码器（30 fps + 60 fps）：
+
+| 测试 | 第一 sink 接收/编码/丢视频 | 第二 sink 接收/编码/丢视频 | native 音频丢块 |
+|---|---|---|---|
+| 修复前、隔离环境约 21 秒 | 616 / 575 / 41 | 1141 / 1026 / 115 | 9 / 13 |
+| 最终池化路径、162 模组约 31 秒 | 926 / 926 / 0 | 1862 / 1862 / 0 | 0 / 0 |
+
+最终测试还要求两个 sink 的订阅层像素/PCM/音乐事件/异常全部为 0，source PCM drops=0，
+健康 observer 的帧/PCM drops=0，目标帧率达到时间线预期的 98% 以上；全部通过，
+不是把丢帧计数隐藏在前一级。故意 200ms 的慢观察器仍独立丢帧，未拖住录制器。
+本次 31 秒 Gen2 GC=0，累计 GC pause 20.5ms（进程报告值）。
+burst 峰值：第一 sink 48 帧 / 63,817,229 bytes；第二 sink 136 帧 / 166,997,144 bytes，
+均在 192 MiB 上限内，初始化之后队列排空。没有为了通过测试无限增加 RAM。
+
+最终安装包又进行了同样的 31 秒全量复验（`installed-verify.*`）：再次 926/926、1862/1862，
+所有上述丢弃统计为 0；健康观察器收到 3824 帧，呈现 sequence 缺口 **0**，source pool drops **0**。
+Gen2 GC=0，pause=18.1ms；这次启动更慢，第二 encoder 探测/创建共约 2.59 秒，
+burst 峰值 155 帧 / 189,262,934 bytes，仍在上限内并完整排空。
+安装文件为 `C:\SteamLibrary\steamapps\common\Celeste\Mods\MicroblocksQolUtils.zip`，SHA256：
+`7FBABE4B294B0D78086B7E6E4629902E4878CE7F9DD355C7A83AB91A4D8DF844`。
+
+失败的中间测试也保留：仅修 native 锁/视频 burst、未池化的全量运行仍有订阅音频丢弃 259/378 块，
+native 音频丢弃 25/26 块，未通过严格检查；这促成了最后的托管池化/突发缓冲修复。
+
+最终 MP4 已解码目视确认正常画面：H.264 1280×720 / AAC stereo 48kHz，
+视频 30.833333s、音频 30.826000s。原始 MKV、独立 SFX/BGM PCM、music journal 均保留。
+本次是全量模组的菜单动态场景，不等同于所有复杂地图、所有 GPU/磁盘/分辨率或无限时长验证。
+
+证据在 `G:\MicroblocksQolUtils\.work\capture-throughput\.work\`：
+`baseline.mkv.passed`、`full-final.mkv.failed`、`full-pooled.mkv.passed`、
+`full-pooled-console.txt`、`full-pooled-decoded.png`、`final-rust-tests.txt`。
+
+额外回归：Rust + FFmpeg/D3D11 44 tests 通过；C# 增加 PCM ring 并发、队列公平性、
+借用池上限/取消/正在执行的 callback 生命周期/Snapshot 保真；真实 SDL+FMOD 集成
+238 帧、419 个非静音 PCM callback，像素、BGM 事件与剪辑连续性、resize/reload 均通过。
+
+长时间严格 smoke（只对该次游戏进程设置，不写入 Steam/系统环境）：
+```powershell
+$env:MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT = '<absolute .work path>.mkv'
+$env:MICROBLOCKS_QOL_CAPTURE_SMOKE_SECONDS = '30'
+$env:MICROBLOCKS_QOL_CAPTURE_SMOKE_REQUIRE_LOSSLESS = '1'
+```
+
+平台默认值已经按本机 FNA3D 二进制追溯到确切源码 revision；来源及结论见
+`capture-architecture.md`。Linux/macOS 默认 OpenGL 不等于已经在这两端运行测试。
+
+## 第一轮历史记录（5bc4f08，以下丢帧结论已由上面的定位修正）
+
 ## 实测结论
 
 测试机器：Windows / Intel Graphics，Celeste 1.4.0.0 + Everest 6487-ultra，原生默认 D3D11。
@@ -55,7 +120,7 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 
 ## 未证明的部分
 
-最新版 native 已通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。
+第一轮 ABI 6 在添加本轮 Zstd 之前通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。本轮仅在 Windows 构建运行，未重跑三端交叉检查；Zstd C 库由 Cargo 构建，三平台 CI 构建矩阵保留。
 Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。
 游戏之外直接 native FMOD 命令的一帧内中间状态可能不能被 managed observer 看见。
 静态 BGM 映射不能重放动态 FMOD 音乐；新独立 PCM/事件路径应作为保真来源。

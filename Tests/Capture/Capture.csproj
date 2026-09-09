@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><LangVersion>latest</LangVersion></PropertyGroup>
-  <ItemGroup><Compile Include="../../Source/CaptureSubscription.cs" Link="CaptureSubscription.cs"/><Compile Include="../../Source/FmodCaptureClock.cs" Link="FmodCaptureClock.cs"/><Compile Include="../../Source/MusicJournal.cs" Link="MusicJournal.cs"/></ItemGroup>
+  <ItemGroup><Compile Include="../../Source/CaptureSubscription.cs" Link="CaptureSubscription.cs"/><Compile Include="../../Source/CaptureFramePool.cs" Link="CaptureFramePool.cs"/><Compile Include="../../Source/FmodCaptureClock.cs" Link="FmodCaptureClock.cs"/><Compile Include="../../Source/FmodPcmQueue.cs" Link="FmodPcmQueue.cs"/><Compile Include="../../Source/MusicJournal.cs" Link="MusicJournal.cs"/></ItemGroup>
 </Project>

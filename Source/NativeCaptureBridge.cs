@@ -272,12 +272,14 @@ public sealed class NativeCaptureSession : IDisposable {
         this.handle = handle;
         musicJournal = outputPath is null ? null : new MusicJournal(outputPath + ".music.jsonl");
         try {
-            subscription = CaptureSource.Subscribe(PushFrame, outputPath is not null ? chunk => {
+            subscription = CaptureSource.SubscribeBorrowed(PushFrame, outputPath is not null ? chunk => {
                 if (includeUiSfx || chunk.BusId != 2) PushAudio(chunk);
             } : null, musicJournal is null ? null : musicJournal.Accept);
         } catch { musicJournal?.Dispose(); throw; }
     }
     public CaptureStatistics Statistics { get { lock (gate) return handle == 0 ? default : NativeCaptureBridge.GetStats(handle); } }
+    public CaptureDeliveryStatistics DeliveryStatistics => new(subscription.DroppedFrames,
+        subscription.DroppedAudioChunks, subscription.DroppedMusicEvents, subscription.CallbackErrors);
     public bool HasAudioTap => CaptureSource.AudioAvailable;
     public void Stop() {
         // Concurrent Stop/Dispose callers must all wait for the drain, not destroy a
@@ -333,6 +335,9 @@ public sealed class NativeCaptureSession : IDisposable {
         }
     }
 }
+
+public readonly record struct CaptureDeliveryStatistics(long DroppedFrames, long DroppedAudioChunks,
+    long DroppedMusicEvents, long CallbackErrors);
 
 public readonly record struct CaptureStatistics(
     bool Running,

@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Runtime.InteropServices;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
@@ -14,26 +13,36 @@ public static class CaptureSource {
     private static long retryAudioAt;
     private static bool loaded;
     private static string? workerError;
-    private static readonly object audioGate = new();
-    private static readonly Queue<PendingAudio> pendingAudio = new(32);
+    private static FmodPcmQueue[] audioRings = [];
+    private static CaptureFramePool framePool = new();
+    private static long sourceFrameDrops;
     private static long sourceAudioDrops;
-    private sealed record PendingAudio(float[] Buffer, int Count, int Rate, int Channels, int Bus, ulong Clock, ulong Timestamp);
     public static int SubscriberCount => Volatile.Read(ref subscriptions).Length;
     public static bool AudioAvailable => Volatile.Read(ref tap) is not null;
     public static string? VideoError => Volatile.Read(ref workerError) ?? SdlFrameSource.Failure;
     public static string? MusicError => MusicCapture.Failure;
     public static string VideoBackend => SdlFrameSource.Backend;
     public static long DroppedAudioChunks => Interlocked.Read(ref sourceAudioDrops);
+    public static long DroppedFrames => Interlocked.Read(ref sourceFrameDrops);
     internal static bool WantsPixels => Volatile.Read(ref subscriptions).Any(s => s.WantsPixels);
 
     /// <summary>Register any combination of pixel and FMOD callbacks. Dispose the returned registration to unsubscribe.</summary>
     public static CaptureSubscription Subscribe(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
+        return SubscribeCore(pixels, fmod, music, false);
+    }
+    /// <summary>Allocation-light pixels valid ONLY during the synchronous callback.
+    /// Use frame.Snapshot() to retain or pass pixels to asynchronous work. PCM/music remain owned.
+    /// Callbacks still run on isolated workers, not the renderer/mixer.</summary>
+    public static CaptureSubscription SubscribeBorrowed(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
+        return SubscribeCore(pixels, fmod, music, true);
+    }
+    private static CaptureSubscription SubscribeCore(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureMusic>? music, bool borrowed) {
         if (pixels is null && fmod is null && music is null) throw new ArgumentException("At least one callback is required");
         lock (gate) {
             if (!loaded) throw new InvalidOperationException("Capture source has not been loaded");
             if (pixels is not null && VideoError is { } error) throw new NotSupportedException(error);
             if (subscriptions.Length >= 16) throw new InvalidOperationException("At most 16 capture subscribers are supported");
-            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music);
+            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music, borrowed);
             foreach (var snapshot in musicSnapshots) subscription.Offer(snapshot with { Kind = "snapshot" });
             Volatile.Write(ref subscriptions, [.. subscriptions, subscription]);
             return subscription;
@@ -47,6 +56,8 @@ public static class CaptureSource {
             if (loaded) return;
             if (!NativeCaptureBridge.Available) return;
             workerError = null;
+            audioRings = [new(), new(), new()];
+            framePool = new();
             musicSnapshots = [];
             SdlFrameSource.Load();
             MusicCapture.Load();
@@ -74,15 +85,12 @@ public static class CaptureSource {
                 foreach (var subscription in subscriptions) subscription.Offer(change);
         }
     }
-    // FMOD real-time producer: nonblocking, pooled copy only, no user code or native encoder calls.
+    // FMOD real-time producer: preallocated bus-local ring, no worker locks or allocations.
     internal static unsafe void PublishAudio(float* input, int count, int rate, int channels, int bus, ulong dspClock, ulong timestamp) {
-        if (count <= 0 || count > 16_384 || !Monitor.TryEnter(audioGate)) { Interlocked.Increment(ref sourceAudioDrops); return; }
-        try {
-            if (pendingAudio.Count == 32) { Interlocked.Increment(ref sourceAudioDrops); return; }
-            float[] buffer = ArrayPool<float>.Shared.Rent(count);
-            new ReadOnlySpan<float>(input, count).CopyTo(buffer);
-            pendingAudio.Enqueue(new(buffer, count, rate, channels, bus, dspClock, timestamp));
-        } finally { Monitor.Exit(audioGate); }
+        var rings = audioRings;
+        if (input == null || count <= 0 || count > FmodPcmQueue.MaxSamples || bus < 1 || bus > rings.Length
+            || !rings[bus - 1].TryWrite(new ReadOnlySpan<float>(input, count), rate, channels, dspClock, timestamp))
+            Interlocked.Increment(ref sourceAudioDrops);
     }
     private static async Task PumpAsync(CancellationToken token) {
         try {
@@ -95,22 +103,26 @@ public static class CaptureSource {
                     if (result == 0) break;
                     work = true;
                     try {
-                        byte[] pixels = new byte[checked((int)native.Length)];
-                        Marshal.Copy(native.Pixels, pixels, 0, pixels.Length);
-                        CaptureFrame frame = new(pixels, (int)native.Width, (int)native.Height, native.Timestamp, native.Sequence);
-                        foreach (var subscription in Volatile.Read(ref subscriptions)) subscription.Offer(frame);
+                        int length = checked((int)native.Length);
+                        FrameLease? lease = framePool.Rent(length);
+                        if (lease is null) { Interlocked.Increment(ref sourceFrameDrops); continue; }
+                        try {
+                            Marshal.Copy(native.Pixels, lease.Buffer, 0, length);
+                            CaptureFrame borrowed = new(lease.Buffer.AsMemory(0, length), (int)native.Width,
+                                (int)native.Height, native.Timestamp, native.Sequence) { Lease = lease };
+                            CaptureFrame? owned = null;
+                            foreach (var subscription in Volatile.Read(ref subscriptions)) {
+                                if (!subscription.WantsPixels) continue;
+                                subscription.Offer(subscription.BorrowsPixels ? borrowed : owned ??= borrowed.Snapshot());
+                            }
+                        } finally { lease.Release(); }
                     } finally { SdlFrameSource.Free(native.Pixels, native.Length); }
                 }
-                for (int i = 0; i < 32; i++) {
-                    PendingAudio pending;
-                    lock (audioGate) { if (!pendingAudio.TryDequeue(out pending!)) break; }
-                    work = true;
-                    try {
-                        // One immutable payload shared by all subscribers. No copies on the mixer thread per subscriber.
-                        CaptureAudio chunk = new(pending.Buffer.AsMemory(0, pending.Count).ToArray(), pending.Rate,
-                            pending.Channels, pending.Bus, pending.Bus switch {1 => "bus:/gameplay_sfx", 2 => "bus:/ui_sfx", _ => "bus:/music"}, pending.Clock, pending.Timestamp);
-                        foreach (var subscription in Volatile.Read(ref subscriptions)) subscription.Offer(chunk);
-                    } finally { ArrayPool<float>.Shared.Return(pending.Buffer); }
+                for (int bus = 1; bus <= audioRings.Length; bus++) {
+                    for (int i = 0; i < FmodPcmQueue.Capacity && audioRings[bus - 1].TryRead(bus, out var chunk); i++) {
+                        work = true;
+                        foreach (var subscription in Volatile.Read(ref subscriptions)) subscription.Offer(chunk!);
+                    }
                 }
                 await Task.Delay(work ? 1 : 4, token).ConfigureAwait(false);
             }
@@ -130,6 +142,6 @@ public static class CaptureSource {
         cancellation?.Cancel();
         worker?.GetAwaiter().GetResult();
         cancellation?.Dispose(); cancellation = null; worker = null;
-        lock (audioGate) { while (pendingAudio.TryDequeue(out var item)) ArrayPool<float>.Shared.Return(item.Buffer); }
+        audioRings = [];
     }
 }

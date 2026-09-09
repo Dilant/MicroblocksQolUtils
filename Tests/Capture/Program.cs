@@ -15,7 +15,7 @@ using var slow = new CaptureSubscription(_ => {
 }, _ => {}, _ => Interlocked.Increment(ref removed));
 slow.Offer(Frame(1)); await Timeout(entered.Task);
 var watch = Stopwatch.StartNew();
-for (ulong i = 2; i < 100; i++) { slow.Offer(Frame(i)); slow.Offer(Audio(i)); }
+for (ulong i = 2; i < 400; i++) { slow.Offer(Frame(i)); slow.Offer(Audio(i)); }
 Check(watch.ElapsedMilliseconds < 500, "slow callback blocked producer");
 Check(slow.DroppedFrames > 0 && slow.DroppedAudioChunks > 0, "queues were not bounded");
 slow.Dispose(); slow.Dispose();
@@ -77,7 +77,70 @@ using(var invalid=new MusicJournal(Path.Combine(journalDirectory,"invalid.music.
     bool refused=false;try {invalid.Finish(false);}catch(InvalidDataException){refused=true;}
     Check(refused,"incomplete journal wasn't rejected");
 }
-Console.WriteLine("PASS: queues, callback isolation, cancellation/drain, clocks, music overflow and per-sink journals");
+var fairEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var fairRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+List<string> order = [];
+using var fair = new CaptureSubscription(frame => {
+    order.Add("video");
+    if (frame.Sequence == 1) { fairEntered.SetResult(); fairRelease.Task.GetAwaiter().GetResult(); }
+}, _ => order.Add("audio"), _ => {}, music: _ => order.Add("music"));
+fair.Offer(Frame(1)); await Timeout(fairEntered.Task);
+fair.Offer(Frame(2)); fair.Offer(Frame(3)); fair.Offer(Audio(1)); fair.Offer(Music(1));
+fair.Complete(); fairRelease.SetResult(); await Timeout(fair.Completion);
+Check(order.Take(3).SequenceEqual(new[]{"video","music","audio"}), "video starved music/audio");
+
+var ring = new FmodPcmQueue();
+var framePool = new CaptureFramePool();
+var held = Enumerable.Range(0,32).Select(_=>framePool.Rent(4)!).ToArray();
+Check(framePool.Rent(4) is null,"borrowed pool was not bounded");
+held[0].Buffer[0]=42;
+var borrowedFrame = new CaptureFrame(held[0].Buffer,1,1,1,1) { Lease=held[0] };
+var snapshot = borrowedFrame.Snapshot();
+var borrowedEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var borrowedRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+using var borrowedSub = new CaptureSubscription(frame=>{
+    borrowedEntered.TrySetResult(); borrowedRelease.Task.GetAwaiter().GetResult();
+    Check(frame.Pixels.Span[0]==42,"in-flight borrowed pixels were recycled");
+},null,_=>{},borrowsPixels:true);
+borrowedSub.Offer(borrowedFrame); held[0].Release();
+await Timeout(borrowedEntered.Task);
+Check(framePool.Rent(4) is null,"callback did not retain its buffer lease");
+borrowedSub.Dispose();
+Check(framePool.Rent(4) is null,"Dispose released an in-flight lease early");
+borrowedRelease.SetResult(); await Timeout(borrowedSub.Completion);
+var recycled=framePool.Rent(4)!; recycled.Buffer[0]=99;
+Check(snapshot.Pixels.Span[0]==42,"owned snapshot changed after pool reuse");
+recycled.Release(); foreach(var lease in held.Skip(1)) lease.Release();
+// Cancelled pending leases must also return to the pool.
+var cancelLease=framePool.Rent(4)!;
+var cancelSub=new CaptureSubscription(_=>{},null,_=>{},borrowsPixels:true);
+cancelSub.Offer(new CaptureFrame(cancelLease.Buffer,1,1,2,2){Lease=cancelLease});
+cancelLease.Release(); cancelSub.Dispose(); await Timeout(cancelSub.Completion);
+
+for (ulong i = 0; i < FmodPcmQueue.Capacity; i++)
+    Check(ring.TryWrite(new[]{(float)i,-(float)i},48000,2,i,i),"ring filled too early");
+Check(!ring.TryWrite(new float[2],48000,2,0,0),"ring wasn't bounded");
+for (ulong i = 0; i < FmodPcmQueue.Capacity; i++) {
+    Check(ring.TryRead(3,out var chunk) && chunk!.DspClock==i && chunk.Samples.Span[0]==i,"PCM ring ordering/ownership");
+}
+// Exercise publication/slot reuse under real concurrent producer/consumer traffic.
+const int total = 20_000;
+var producer = Task.Run(() => {
+    float[] samples = new float[32];
+    for (int i=0;i<total;i++) {
+        Array.Fill(samples,(float)i);
+        while (!ring.TryWrite(samples,48000,2,(ulong)i,(ulong)i)) Thread.Yield();
+    }
+});
+var consumer = Task.Run(() => {
+    for (int i=0;i<total;i++) {
+        CaptureAudio? chunk;
+        while (!ring.TryRead(3,out chunk)) Thread.Yield();
+        Check(chunk!.DspClock==(ulong)i && chunk.Samples.Span.ToArray().All(x=>x==i),"PCM publication corrupted a slot");
+    }
+});
+await Timeout(Task.WhenAll(producer,consumer));
+Console.WriteLine("PASS: queues, fair delivery, bounded PCM rings/concurrency, callback isolation, cancellation/drain, clocks, music overflow and per-sink journals");
 
 namespace Celeste.Mod.MicroblocksQolUtils {
     internal enum LogLevel { Warn }

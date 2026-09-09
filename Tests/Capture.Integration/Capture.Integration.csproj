@@ -7,9 +7,10 @@
     <Reference Include="MonoMod.Utils"><HintPath>$(CelesteRoot)/MonoMod.Utils.dll</HintPath></Reference>
     <Content Include="$(CelesteRoot)/*.dll" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest"/>
     <Compile Include="../../Source/CaptureSource.cs" Link="CaptureSource.cs"/>
+    <Compile Include="../../Source/FmodPcmQueue.cs" Link="FmodPcmQueue.cs"/>
     <Compile Include="../../Source/MusicCapture.cs" Link="MusicCapture.cs"/>
     <Compile Include="../../Source/MusicJournal.cs" Link="MusicJournal.cs"/>
-    <Compile Include="../../Source/CaptureSubscription.cs" Link="CaptureSubscription.cs"/>
+    <Compile Include="../../Source/CaptureSubscription.cs" Link="CaptureSubscription.cs"/><Compile Include="../../Source/CaptureFramePool.cs" Link="CaptureFramePool.cs"/>
     <Compile Include="../../Source/FmodSfxTap.cs" Link="FmodSfxTap.cs"/>
     <Compile Include="../../Source/FmodCaptureClock.cs" Link="FmodCaptureClock.cs"/>
     <Compile Include="../../Source/SdlFrameSource.cs" Link="SdlFrameSource.cs"/>

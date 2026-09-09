@@ -73,6 +73,9 @@ Windows 下，关注的玩家换房间且 Celeste 不在前台时，会发送系
 后台线程转成 BGRA 并分发，不在游戏线程编码或调用消费者。尺寸变化会重建 PBO；
 没有订阅时停止读回。D3D11 对应 native DXGI Present shim、staging texture 与非阻塞 query/map。
 读回与编码解耦，消费者可以分别注册像素、FMOD PCM、音乐事件 callback。
+内置录制器使用借用式像素池，避免逐帧大数组分配；`Subscribe` 保持 owned 语义，
+低分配 `SubscribeBorrowed` 需要在回调内消费或调用 `Snapshot()` 保留像素。
+编码器冷启动采用有明确内存/帧数上限的无损 burst 缓冲，不再只保留最后三帧。
 详见 [采集架构及测试](docs/capture-architecture.md)。
 
 - 自动录制策略：每个房间都录制，或只录制携带金草莓的 run。

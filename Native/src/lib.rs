@@ -36,7 +36,7 @@ const ERR_ALREADY_RUNNING: i32 = -3;
 const ERR_PLATFORM: i32 = -5;
 const ERR_CAPTURE: i32 = -6;
 const ERR_PANIC: i32 = -127;
-const AUDIO_QUEUE_CAPACITY: usize = 32;
+const AUDIO_QUEUE_CAPACITY: usize = 256;
 const AUDIO_MAX_SAMPLES_PER_CHUNK: usize = 16_384;
 const AUDIO_BUS_COUNT: usize = 3;
 
@@ -129,13 +129,44 @@ struct CapturedFrame {
 
 #[derive(Debug)]
 struct QueueState {
-    frames: VecDeque<CapturedFrame>,
+    frames: VecDeque<QueuedFrame>,
+    bytes: usize,
+    peak_bytes: usize,
+    peak_frames: usize,
+    overflow_logged: bool,
     closed: bool,
+}
+
+#[derive(Debug)]
+struct QueuedFrame {
+    frame: CapturedFrame,
+    compressed: bool,
+}
+
+// Spatial byte predictor makes smooth BGRA gradients/dither compressible too,
+// not just identical adjacent pixels. Wrapping arithmetic is exactly reversible.
+fn predict_bgra(bytes: &mut [u8]) {
+    for i in (4..bytes.len()).rev() {
+        bytes[i] = bytes[i].wrapping_sub(bytes[i - 4]);
+    }
+}
+fn restore_bgra(bytes: &mut [u8]) {
+    for i in 4..bytes.len() {
+        bytes[i] = bytes[i].wrapping_add(bytes[i - 4]);
+    }
+}
+
+pub(crate) fn video_tick(timestamp: u64, origin: u64, fps: u32) -> u128 {
+    // Nearest tick, not floor: render timestamps jitter around nominal 60 Hz.
+    // Flooring can turn that jitter into duplicate buckets and discard ~1/4
+    // of a perfectly adequate 60-Hz source when the target is also 60 fps.
+    (u128::from(timestamp.saturating_sub(origin)) * u128::from(fps) + 500_000_000) / 1_000_000_000
 }
 
 #[derive(Debug)]
 struct LatestFrameQueue {
     capacity: usize,
+    burst_capacity: usize,
     state: Mutex<QueueState>,
     available: Condvar,
 }
@@ -236,9 +267,9 @@ impl AudioChunkQueue {
         if samples.len() > AUDIO_MAX_SAMPLES_PER_CHUNK {
             return false;
         }
-        let Ok(mut state) = self.state.try_lock() else {
-            return false;
-        };
+        // This is a sink worker, NOT the FMOD mixer. A short bookkeeping lock
+        // must not discard PCM. Disk writes are performed outside this lock.
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.closed {
             return false;
         }
@@ -299,18 +330,47 @@ impl AudioChunkQueue {
 }
 
 impl LatestFrameQueue {
+    const BURST_BYTES: usize = 192 * 1024 * 1024;
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            burst_capacity: 0,
             state: Mutex::new(QueueState {
                 frames: VecDeque::with_capacity(capacity),
+                bytes: 0,
+                peak_bytes: 0,
+                peak_frames: 0,
+                overflow_logged: false,
                 closed: false,
             }),
             available: Condvar::new(),
         }
     }
 
-    fn push_latest(&self, frame: CapturedFrame) -> bool {
+    fn recording(capacity: usize, fps: u32) -> Self {
+        Self {
+            burst_capacity: capacity + fps as usize * 5,
+            ..Self::new(capacity)
+        }
+    }
+
+    fn push_latest(&self, mut frame: CapturedFrame) -> bool {
+        // The usual three raw frames are sufficient at steady state, but hardware
+        // codec cold-start can take seconds. Retain a bounded lossless Zstd burst
+        // instead of throwing away the start of the recording. Compression runs
+        // on the sink worker; never under the queue lock or on the render thread.
+        let compressed = self.burst_capacity != 0 && {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.frames.len() >= self.capacity
+                || state.bytes + frame.bgra.capacity() > Self::BURST_BYTES
+        };
+        if compressed {
+            predict_bgra(&mut frame.bgra);
+            frame.bgra =
+                zstd::bulk::compress(&frame.bgra, 1).expect("in-memory Zstd compression failed");
+            frame.bgra.shrink_to_fit();
+        }
+        let queued = QueuedFrame { frame, compressed };
         let mut state = self
             .state
             .lock()
@@ -318,13 +378,33 @@ impl LatestFrameQueue {
         if state.closed {
             return true;
         }
-        let dropped = if state.frames.len() == self.capacity {
-            state.frames.pop_front();
+        if self.burst_capacity != 0
+            && (state.frames.len() >= self.burst_capacity
+                || state.bytes + queued.frame.bgra.capacity() > Self::BURST_BYTES)
+        {
+            if !state.overflow_logged {
+                eprintln!(
+                    "[mqol-encoder] burst capacity exceeded: queued={} bytes={} incoming={} compressed={}",
+                    state.frames.len(),
+                    state.bytes,
+                    queued.frame.bgra.len(),
+                    queued.compressed
+                );
+                state.overflow_logged = true;
+            }
+            return true; // Explicit overflow: preserve timestamps and count the loss.
+        }
+        let dropped = if self.burst_capacity == 0 && state.frames.len() == self.capacity {
+            let old = state.frames.pop_front().unwrap();
+            state.bytes -= old.frame.bgra.capacity();
             true
         } else {
             false
         };
-        state.frames.push_back(frame);
+        state.bytes += queued.frame.bgra.capacity();
+        state.frames.push_back(queued);
+        state.peak_bytes = state.peak_bytes.max(state.bytes);
+        state.peak_frames = state.peak_frames.max(state.frames.len());
         self.available.notify_one();
         dropped
     }
@@ -335,8 +415,18 @@ impl LatestFrameQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if let Some(frame) = state.frames.pop_front() {
-                return Some(frame);
+            if let Some(mut queued) = state.frames.pop_front() {
+                state.bytes -= queued.frame.bgra.capacity();
+                drop(state);
+                if queued.compressed {
+                    queued.frame.bgra = zstd::bulk::decompress(
+                        &queued.frame.bgra,
+                        queued.frame.width as usize * queued.frame.height as usize * 4,
+                    )
+                    .expect("internally generated Zstd frame must decode");
+                    restore_bgra(&mut queued.frame.bgra);
+                }
+                return Some(queued.frame);
             }
             if state.closed {
                 return None;
@@ -400,7 +490,11 @@ struct CaptureSession {
 impl CaptureSession {
     fn new(config: CaptureConfig) -> Self {
         Self {
-            queue: Arc::new(LatestFrameQueue::new(config.queue_capacity)),
+            queue: Arc::new(if config.output_path.is_some() {
+                LatestFrameQueue::recording(config.queue_capacity, config.fps)
+            } else {
+                LatestFrameQueue::new(config.queue_capacity)
+            }),
             audio_queue: Arc::new(AudioChunkQueue::new()),
             audio_clocks: [
                 AudioBusClock::new(),
@@ -509,9 +603,7 @@ impl CaptureSession {
         if origin == u64::MAX {
             return true;
         }
-        let bucket = |time: u64| {
-            u128::from(time.saturating_sub(origin)) * u128::from(self.config.fps) / 1_000_000_000
-        };
+        let bucket = |time: u64| video_tick(time, origin, self.config.fps);
         bucket(timestamp) > bucket(self.last_video_nanos.load(Ordering::Acquire))
     }
 
@@ -605,6 +697,20 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
     #[cfg(feature = "ffmpeg")]
     if let Some(mut encoder) = encoder {
         encoder.finish().map_err(|error| error.to_string())?;
+    }
+    if let Some(path) = &session.config.output_path {
+        let state = session
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        eprintln!(
+            "[mqol-encoder] {path}: burst peak={} frames / {} bytes; consumed={} dropped={}",
+            state.peak_frames,
+            state.peak_bytes,
+            session.stats.frames_consumed.load(Ordering::Relaxed),
+            session.stats.frames_dropped.load(Ordering::Relaxed)
+        );
     }
     Ok(())
 }
@@ -886,11 +992,9 @@ pub unsafe extern "C" fn mqol_capture_push_audio(
             set_last_error("invalid audio chunk");
             return Err(ERR_INVALID_ARGUMENT);
         }
-        // FMOD calls this function on its real-time mixer thread. If session bookkeeping is
-        // momentarily contended by stop/destroy, drop this chunk rather than block audio.
-        let Ok(guard) = sessions().try_lock() else {
-            return Ok(OK);
-        };
+        // Called by an isolated subscription worker, never by the mixer. The old
+        // try_lock silently lost audio whenever another sink queried its stats.
+        let guard = sessions().lock().unwrap_or_else(|p| p.into_inner());
         let session = guard.get(&handle).cloned().ok_or(ERR_NOT_FOUND)?;
         drop(guard);
         if session.config.output_path.is_none() || !session.running.load(Ordering::Acquire) {
@@ -1198,6 +1302,43 @@ mod tests {
     }
 
     #[test]
+    fn recording_burst_is_lossless_ordered_and_bounded() {
+        let mut queue = LatestFrameQueue::recording(1, 1);
+        // One raw slot plus five compressed burst slots.
+        for i in 0..6u64 {
+            let mut value = frame(i as u8);
+            value.captured_at_unix_nanos = i;
+            assert!(!queue.push_latest(value));
+        }
+        assert!(queue.push_latest(frame(7)));
+        assert_eq!(queue.depth(), 6);
+        for i in 0..6u64 {
+            let value = queue.pop().unwrap();
+            assert_eq!(value.captured_at_unix_nanos, i);
+            assert_eq!(value.bgra, frame(i as u8).bgra);
+        }
+        assert_eq!(queue.state.lock().unwrap().bytes, 0);
+        // A byte limit applies independently of the compressed-frame count.
+        queue.state.get_mut().unwrap().bytes = LatestFrameQueue::BURST_BYTES;
+        assert!(queue.push_latest(frame(8)));
+        assert_eq!(queue.depth(), 0);
+        queue.close();
+    }
+
+    #[test]
+    fn audio_bookkeeping_contention_does_not_discard_pcm() {
+        let queue = Arc::new(AudioChunkQueue::new());
+        let guard = queue.state.lock().unwrap();
+        let other = Arc::clone(&queue);
+        let worker = thread::spawn(move || other.try_push(0, 48000, 2, 1, &[0.25, -0.25]));
+        thread::sleep(std::time::Duration::from_millis(30));
+        drop(guard);
+        assert!(worker.join().unwrap());
+        assert_eq!(queue.pop().unwrap().samples, [0.25, -0.25]);
+        queue.close();
+    }
+
+    #[test]
     fn audio_bus_clock_advances_and_resynchronizes_after_a_video_clock_jump() {
         let clock = AudioBusClock::new();
         assert_eq!(clock.reserve(480, 48_000, 2_000_000_000), 2_000_000_000);
@@ -1269,8 +1410,39 @@ mod tests {
                 input.captured_at_unix_nanos = 1_000_000_000 + n * 1_000_000_000 / 144;
                 session.push_frame(input);
             }
-            assert_eq!(session.stats().frames_captured, u64::from(fps));
+            // Nearest-tick quantization may admit the next boundary up to half
+            // a target frame early; it must not accumulate clock error.
+            assert!(
+                (u64::from(fps)..=u64::from(fps) + 1).contains(&session.stats().frames_captured)
+            );
         }
+    }
+
+    #[test]
+    fn matching_source_fps_keeps_frames_despite_submillisecond_jitter() {
+        let session = CaptureSession::new(CaptureConfig {
+            fps: 60,
+            ..Default::default()
+        });
+        session.running.store(true, Ordering::Release);
+        for n in 0..1200u64 {
+            let mut input = frame(1);
+            let jitter = if n % 2 == 0 { 100_000 } else { 0 };
+            input.captured_at_unix_nanos = 1_000_000_000 + n * 1_000_000_000 / 60 + jitter;
+            session.push_frame(input);
+        }
+        assert_eq!(session.stats().frames_captured, 1200);
+    }
+
+    #[test]
+    fn bgra_predictor_roundtrips_arbitrary_bytes() {
+        let mut bytes: Vec<u8> = (0..65537).map(|n| ((n * 31) ^ (n >> 3)) as u8).collect();
+        let original = bytes.clone();
+        predict_bgra(&mut bytes);
+        let compressed = zstd::bulk::compress(&bytes, 1).unwrap();
+        let mut decoded = zstd::bulk::decompress(&compressed, bytes.len()).unwrap();
+        restore_bgra(&mut decoded);
+        assert_eq!(decoded, original);
     }
 
     #[test]
