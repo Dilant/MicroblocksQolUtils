@@ -269,6 +269,20 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   生成 MP4 完整解码通过，Release 构建零警告/错误。证据在 `.work/recovery-frame-seams/.work/`。
 - 这些验证不能替代用户模组组合下重新录制的实机验收；旧 MP4 的缺失帧不会凭空恢复。
 
+### 2026-09-10：MotionSmoothing 高清背景恢复首帧
+
+- 用户 `20260910-014544-654` 视频约 4.25s 接缝：恢复帧背景镜头偏移，随后回到正常位置。
+  本机 MotionSmoothing 1.6.5 使用 Hires 镜头、高清背景/前景、动态渲染。
+- 检查真实 relinked DLL：SRT load 后 SmoothAllObjects 注册相机状态，但其 SmoothedRealPosition
+  在 UpdateHistory 之前仍是零；Hires 渲染直接读该值。现在内部恢复后提前初始化插值历史并禁止旧时间戳外推，
+  不执行任何额外的 Scene/Engine/Player 更新。另给 UpdateAtDraw 加暂停门，防止背景、雪和粒子在保存期间继续运行。
+- 新 `Tests/Recording.MotionSmoothing` 直接加载实际 Cache DLL（不启动游戏、不改设置）：**20 checks**。
+  三次模拟恢复，验证初始零坐标确实可重现、初始化后的镜头/实体显示坐标等于恢复位置且不移动实体；
+  180 次绘制更新等待期间背景/粒子零更新，正常绘制、恢复、重复注册、卸载和不兼容程序集回退通过。
+- Recording **122**、Recorder **105**、Recording.Policy、Capture、真实 Cache SRT hooks 回归通过；
+  Release 零警告/错误。证据在 `.work/background-recovery-seam/.work/`。
+  本轮不修改 native 编码/剪辑路径，硬切与死亡回放快速路径保持原样。仍需重新录制做用户组合下的画面验收。
+
 ## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。

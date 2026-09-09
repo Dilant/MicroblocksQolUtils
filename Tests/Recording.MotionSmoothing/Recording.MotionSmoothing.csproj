@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><LangVersion>latest</LangVersion>
+    <CelesteRoot Condition="'$(CelesteRoot)' == ''">C:/SteamLibrary/steamapps/common/Celeste</CelesteRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Source/RecordingMotionSmoothing.cs" Link="RecordingMotionSmoothing.cs" />
+    <Reference Include="Celeste"><HintPath>$(CelesteRoot)/Celeste.dll</HintPath></Reference>
+    <Reference Include="FNA"><HintPath>$(CelesteRoot)/FNA.dll</HintPath></Reference>
+    <Reference Include="Mono.Cecil"><HintPath>$(CelesteRoot)/Mono.Cecil.dll</HintPath></Reference>
+    <Reference Include="MonoMod.RuntimeDetour"><HintPath>$(CelesteRoot)/MonoMod.RuntimeDetour.dll</HintPath></Reference>
+    <Reference Include="MonoMod.Utils"><HintPath>$(CelesteRoot)/MonoMod.Utils.dll</HintPath></Reference>
+    <Content Include="$(CelesteRoot)/*.dll" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

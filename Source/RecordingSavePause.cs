@@ -34,6 +34,7 @@ internal static class RecordingSavePause {
 
     internal static void Begin(Level owner, Action<RecoveryResult> onComplete) {
         if (Active) return;
+        RecordingMotionSmoothing.Prepare();
         level = owner;
         completed = onComplete;
         beganAt = Environment.TickCount64;
@@ -45,6 +46,7 @@ internal static class RecordingSavePause {
 
     internal static bool BeginRecovery(Level owner) {
         if (Active) return false;
+        RecordingMotionSmoothing.Prepare();
         level = owner;
         beganAt = Environment.TickCount64;
         phase = Phase.Loading;
@@ -55,6 +57,7 @@ internal static class RecordingSavePause {
     internal static void CompleteRecovery() {
         // SRT has restored entities, camera and scene clocks. Do not run even
         // ONE gameplay update before that exact state reaches both encoders.
+        RecordingMotionSmoothing.PrimeRestoredState();
         RecordingDeathAudio.StopRemainder();
         AutoRecorder.StageInternalRecoveryResume();
         phase = Phase.Clean;

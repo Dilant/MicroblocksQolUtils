@@ -95,6 +95,10 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public class QolSettings { public bool Enabled = true, RecordingAutoSaveOnTransition = true; }
     public static class MicroblocksQolUtilsModule { public static QolSettings Settings = new(); }
     public static class InstantDeaths { public static void Reset() { } }
+    public static class RecordingMotionSmoothing {
+        public static void Prepare() { }
+        public static void PrimeRestoredState() { }
+    }
     public static class RecordingPauseAudio {
         public static bool Paused;
         public static void Pause() => Paused = true;

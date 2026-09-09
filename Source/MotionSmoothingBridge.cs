@@ -27,6 +27,7 @@ internal static class MotionSmoothingBridge {
     }
 
     public static void Unload() {
+        RecordingMotionSmoothing.Unload();
         module = null;
         settingsProperty = null;
         enabledProperty = null;
