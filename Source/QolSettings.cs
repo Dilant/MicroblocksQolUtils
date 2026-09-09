@@ -240,6 +240,7 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(34)]
     public int FrameSpikeThresholdMs { get; set; } = 34;
 
+    [SettingIgnore]
     [DefaultValue(false)]
     public bool AutoRecorderEnabled { get; set; }
 
@@ -257,8 +258,36 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(true)]
     public bool ShowRecordingDuration { get; set; } = true;
 
+    [SettingIgnore]
     [DefaultValue(RecordingPolicy.EveryRoom)]
     public RecordingPolicy RecordingPolicy { get; set; } = RecordingPolicy.EveryRoom;
+
+    // Keep the legacy serialized fields as the source of truth, so existing settings
+    // retain their mode without a one-shot migration or conflicting saved properties.
+    [YamlDotNet.Serialization.YamlIgnore]
+    [SettingName("自动录制")]
+    public AutoRecordingMode AutomaticRecording {
+        get => !AutoRecorderEnabled ? AutoRecordingMode.Off
+            : RecordingPolicy == RecordingPolicy.GoldenRunsOnly ? AutoRecordingMode.Golden : AutoRecordingMode.Chapter;
+        set {
+            AutoRecorderEnabled = value != AutoRecordingMode.Off;
+            if (value != AutoRecordingMode.Off)
+                RecordingPolicy = value == AutoRecordingMode.Golden ? RecordingPolicy.GoldenRunsOnly : RecordingPolicy.EveryRoom;
+        }
+    }
+
+    [SettingName("金草莓成功时录到")]
+    [DefaultValue(GoldenRecordingEnd.BerryCollected)]
+    public GoldenRecordingEnd GoldenRecordingEnd { get; set; } = GoldenRecordingEnd.BerryCollected;
+
+    [SettingName("金草莓死亡后")]
+    [DefaultValue(GoldenRecordingDeath.Discard)]
+    public GoldenRecordingDeath GoldenRecordingDeath { get; set; } = GoldenRecordingDeath.Discard;
+
+    [SettingName("最多保留自动录像")]
+    [DefaultValue(100)]
+    [SettingRange(0, 500)]
+    public int AutoRecordingRetentionCount { get; set; } = 100;
 
     [DefaultValue(BgmRecordingMode.SfxOnlyWithPostMix)]
     public BgmRecordingMode BgmMode { get; set; } = BgmRecordingMode.SfxOnlyWithPostMix;

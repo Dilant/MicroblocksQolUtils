@@ -46,12 +46,17 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     private int dropdownFirstVisible;
     private CloseDestination closeDestination;
     private readonly List<RecordingLibraryEntry> recordingFiles = [];
+    private enum RecorderSettingsSection { Automatic, DeathReplay, Quality, Storage, Controls, Library }
+    private RecorderSettingsSection recorderSettingsSection;
+    private List<SettingRow>? visibleRecorderRows;
+    private RecorderSettingsSection? visibleRecorderSection;
+    private AutoRecordingMode visibleAutoMode;
+    private int autoRecordingCount;
     private RecordingLibraryKind recordingLibraryKind = RecordingLibraryKind.Full;
     private int fullRecordingCount;
     private int deathReplayCount;
     private int recorderSelectedItem;
     private float recordingRefreshTimer;
-    private bool recordingLibraryInitialized;
     private RecordingLibraryEntry? pendingRecordingDelete;
     private string recordingNotice = "";
     private float recordingNoticeTimer;
@@ -97,7 +102,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         editError = Calc.Approach(editError, 0f, Engine.RawDeltaTime * 4f);
         recordingNoticeTimer = Math.Max(0f, recordingNoticeTimer - Engine.RawDeltaTime);
         recordingRefreshTimer -= Engine.RawDeltaTime;
-        if (IsRecorderTab && recordingRefreshTimer <= 0f) RefreshRecordingFiles();
+        if (IsRecorderTab && IsRecorderLibrary && recordingRefreshTimer <= 0f) RefreshRecordingFiles();
 
         if (bindingConfig is not null) return;
 
@@ -252,7 +257,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         RenderContentHeading("录制中心", "videocam", layout, palette, alpha);
         string summary = recordingNoticeTimer > 0f
             ? recordingNotice
-            : recordingFiles.Count > 0
+            : IsRecorderLibrary && recordingFiles.Count > 0
                 ? $"{RecordingLibraryTitle} {recordingFiles.Count} 个  ·  {FormatBytes(recordingFiles.Sum(file => file.SizeBytes))}"
                 : "";
         if (summary.Length > 0) {
@@ -262,19 +267,27 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 alpha, scaleOverride: 0.28f);
         }
 
-        rowViewport.Render(layout.Rows, () => {
-            RenderRecorderHero(RecorderHeroRect(layout), palette, alpha);
-            RenderRecorderSettings(layout, palette, alpha);
-            RenderRecordingLibrary(layout, palette, alpha);
+        RenderRecorderHero(RecorderHeroRect(layout), palette, alpha);
+        foreach (RecorderSettingsSection section in Enum.GetValues<RecorderSettingsSection>()) {
+            MaterialRect tab = RecorderSectionTabRect(layout, section);
+            RenderRecordingLibraryTab(tab, FormatEnum(section), recorderSettingsSection == section,
+                palette, alpha, $"settings.recorder.section.{section}");
+            if (recorderSelectedItem < 0 && recorderSettingsSection == section)
+                MaterialUi.RoundedOutline(tab.X, tab.Y, tab.Width, tab.Height, 18f, 2f, palette.OnSurface * alpha);
+        }
+        MaterialRect viewport = RecorderViewport(layout);
+        rowViewport.Render(viewport, () => {
+            if (IsRecorderLibrary) RenderRecordingLibrary(layout, palette, alpha);
+            else RenderRecorderSettings(layout, palette, alpha);
         });
 
         float maximum = MaxRowScroll(layout);
         if (maximum <= 0f) return;
-        float ratio = layout.Rows.Height / (layout.Rows.Height + maximum);
-        float thumbHeight = Math.Max(52f, layout.Rows.Height * ratio);
-        float travel = layout.Rows.Height - thumbHeight;
-        float y = layout.Rows.Y + rowScroll.Offset / maximum * travel;
-        MaterialUi.RoundedRect(layout.Rows.Right + 8f, layout.Rows.Y, 5f, layout.Rows.Height, 2.5f,
+        float ratio = viewport.Height / (viewport.Height + maximum);
+        float thumbHeight = Math.Max(52f, viewport.Height * ratio);
+        float travel = viewport.Height - thumbHeight;
+        float y = viewport.Y + rowScroll.Offset / maximum * travel;
+        MaterialUi.RoundedRect(layout.Rows.Right + 8f, viewport.Y, 5f, viewport.Height, 2.5f,
             palette.Outline * (0.18f * ease));
         MaterialUi.RoundedRect(layout.Rows.Right + 8f, y, 5f, thumbHeight, 2.5f,
             palette.Primary * (0.68f * ease));
@@ -296,8 +309,9 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             MaterialTextRole.Display, active ? palette.Primary : palette.OnSurfaceVariant,
             alpha, scaleOverride: 0.52f);
         string? detail = AutoRecorder.IsRecording
-            ? $"当前片段：{ShortPath(AutoRecorder.CurrentPath)}"
-            : null;
+            ? AutoRecorder.ContinuingAfterGoldenDeath ? "已死亡 · 保留全过程，继续到通关"
+                : $"保存至：{(AutoRecorder.ManualMode ? "full" : "auto")}/<区域>"
+            : AutoRecorder.AutoRecordingSuppressed ? "本次已停止 · 不会自动重开" : null;
         if (detail is not null) {
             MaterialUiKit.Text(Trim(detail, 48), new Vector2(hero.X + 190f, hero.Y + 75f), Vector2.Zero,
                 MaterialTextRole.Caption, palette.OnSurfaceVariant, alpha, scaleOverride: 0.26f);
@@ -306,7 +320,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         RenderRecorderButton(RecorderButtonRect(hero, 0), "打开文件夹", true, palette, alpha,
             "settings.recorder.folder");
         RenderRecorderButton(RecorderButtonRect(hero, 1),
-            active ? "停止并保存" : "开始录制", true, palette, alpha,
+            active ? "停止并保存" : "开始手动录制", true, palette, alpha,
             "settings.recorder.toggle", primary: true);
         RenderRecorderButton(RecorderButtonRect(hero, 2), "丢弃", active, palette, alpha,
             "settings.recorder.discard", danger: active);
@@ -352,12 +366,15 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         );
         RenderRecordingLibraryTab(
             RecorderLibraryTabRect(layout, 1),
-            $"完整录像  {fullRecordingCount}",
+            $"手动录像  {fullRecordingCount}",
             recordingLibraryKind == RecordingLibraryKind.Full,
             palette,
             alpha,
             "settings.recorder.library.full"
         );
+        RenderRecordingLibraryTab(RecorderLibraryTabRect(layout, 2), $"自动录像  {autoRecordingCount}",
+            recordingLibraryKind == RecordingLibraryKind.Automatic, palette, alpha,
+            "settings.recorder.library.auto");
 
         if (recordingFiles.Count == 0) {
             MaterialRect empty = RecorderEmptyRect(layout);
@@ -367,16 +384,14 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 MaterialUi.RoundedOutline(empty.X, empty.Y, empty.Width, empty.Height, 22f, 2f,
                     palette.Primary * (0.68f * alpha));
             }
-            string emptyTitle = recordingLibraryKind == RecordingLibraryKind.DeathReplay
-                ? "暂无死亡回放"
-                : "暂无完整录像";
+            string emptyTitle = $"暂无{RecordingLibraryTitle}";
             MaterialUiKit.Text(emptyTitle, empty.Center,
                 new Vector2(0.5f), MaterialTextRole.Section, palette.OnSurfaceVariant, alpha,
                 scaleOverride: 0.34f);
             return;
         }
 
-        for (int index = 0; index < recordingFiles.Count; index++) {
+        for (int index = 0; IsRecorderLibrary && index < recordingFiles.Count; index++) {
             RecordingLibraryEntry file = recordingFiles[index];
             bool finalizing = AutoRecorder.TryGetFinalizationProgress(
                 file.Path,
@@ -460,9 +475,6 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void RenderRecorderSettings(OverlayLayout layout, MaterialPalette palette, float alpha) {
-        float headerY = RecorderSettingsHeaderY(layout);
-        MaterialUiKit.Text("录制设置", new Vector2(layout.Rows.X + 4f, headerY), Vector2.Zero,
-            MaterialTextRole.Section, palette.OnSurface, alpha, scaleOverride: 0.36f);
         for (int index = 0; index < CurrentRows.Count; index++) {
             MaterialRect rect = RecorderSettingRect(layout, index);
             if (rect.Bottom < layout.Rows.Y || rect.Y > layout.Rows.Bottom) continue;
@@ -725,13 +737,18 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         if (MInput.Keyboard.Pressed(Keys.R)) ToggleManualRecording();
         if (MInput.Keyboard.Pressed(Keys.X) && RecorderActive) DiscardManualRecording();
 
+        if (MInput.Keyboard.Pressed(Keys.Q) || MInput.Keyboard.Pressed(Keys.E)) {
+            SelectRecorderSection((int)recorderSettingsSection + (MInput.Keyboard.Pressed(Keys.Q) ? -1 : 1));
+            return;
+        }
         if (Input.MenuUp.Pressed) SelectRecorderItem(recorderSelectedItem - 1, layout);
         else if (Input.MenuDown.Pressed) SelectRecorderItem(recorderSelectedItem + 1, layout);
         else if (Input.MenuLeft.Pressed || Input.MenuRight.Pressed) {
             SettingRow? row = SelectedRecorderSetting();
             int direction = Input.MenuLeft.Pressed ? -1 : 1;
-            if (row is not null) AdjustRecorderSetting(row, direction);
-            else SelectRecordingLibraryKind(direction, layout);
+            if (recorderSelectedItem < 0) SelectRecorderSection((int)recorderSettingsSection + direction);
+            else if (row is not null) AdjustRecorderSetting(row, direction);
+            else if (IsRecorderLibrary) SelectRecordingLibraryKind(direction, layout);
         } else if (Input.MenuConfirm.Pressed
             || MInput.Keyboard.Pressed(Keys.Enter)
             || MInput.Keyboard.Pressed(Keys.Space)) {
@@ -770,16 +787,17 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             }
         }
 
-        if (RecorderLibraryTabRect(layout, 0).Contains(mouse)) {
-            if (MInput.Mouse.PressedLeftButton) {
-                SelectRecordingLibraryKind(RecordingLibraryKind.DeathReplay, layout);
-            }
+        foreach (RecorderSettingsSection section in Enum.GetValues<RecorderSettingsSection>()) {
+            if (!RecorderSectionTabRect(layout, section).Contains(mouse)) continue;
+            if (MInput.Mouse.PressedLeftButton) SelectRecorderSection((int)section);
             return;
         }
-        if (RecorderLibraryTabRect(layout, 1).Contains(mouse)) {
-            if (MInput.Mouse.PressedLeftButton) {
-                SelectRecordingLibraryKind(RecordingLibraryKind.Full, layout);
-            }
+        if (!RecorderViewport(layout).Contains(mouse)) return;
+
+        for (int index = 0; IsRecorderLibrary && index < 3; index++) {
+            if (!RecorderLibraryTabRect(layout, index).Contains(mouse)) continue;
+            if (MInput.Mouse.PressedLeftButton)
+                SelectRecordingLibraryKind((RecordingLibraryKind)index, layout);
             return;
         }
 
@@ -791,7 +809,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             return;
         }
 
-        for (int index = 0; index < recordingFiles.Count; index++) {
+        for (int index = 0; IsRecorderLibrary && index < recordingFiles.Count; index++) {
             MaterialRect rect = RecorderFileRect(layout, index);
             if (!rect.Contains(mouse)) continue;
             recorderSelectedItem = CurrentRows.Count + index;
@@ -831,11 +849,16 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void ActivateRecorderSelection() {
+        if (recorderSelectedItem < 0) {
+            SelectRecorderItem(0, OverlayLayout.Create(1f - Ease.CubeOut(ease)));
+            return;
+        }
         SettingRow? row = SelectedRecorderSetting();
         if (row is not null) {
             Activate(row);
             return;
         }
+        if (!IsRecorderLibrary) return;
         int fileIndex = recorderSelectedItem - CurrentRows.Count;
         if (fileIndex < 0 || fileIndex >= recordingFiles.Count) return;
         if (IsRecordingFinalizing(recordingFiles[fileIndex])) {
@@ -862,6 +885,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void RequestSelectedRecordingDelete() {
+        if (!IsRecorderLibrary || recorderSelectedItem < 0) return;
         int fileIndex = recorderSelectedItem - CurrentRows.Count;
         if (fileIndex < 0 || fileIndex >= recordingFiles.Count) {
             Audio.Play("event:/ui/main/button_invalid");
@@ -925,16 +949,15 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void SelectRecorderItem(int index, OverlayLayout layout) {
-        int count = Math.Max(1, recordingFiles.Count) + CurrentRows.Count;
-        if (count == 0) return;
-        recorderSelectedItem = (index % count + count) % count;
+        int count = IsRecorderLibrary ? Math.Max(1, recordingFiles.Count) : CurrentRows.Count;
+        recorderSelectedItem = Math.Clamp(index, -1, Math.Max(-1, count - 1));
         EnsureRecorderItemVisible(layout);
         Audio.Play("event:/ui/main/rollover_down");
     }
 
     private void SelectRecordingLibraryKind(int direction, OverlayLayout layout) {
         SelectRecordingLibraryKind(
-            direction < 0 ? RecordingLibraryKind.DeathReplay : RecordingLibraryKind.Full,
+            (RecordingLibraryKind)(((int)recordingLibraryKind + Math.Sign(direction) + 3) % 3),
             layout
         );
     }
@@ -946,9 +969,9 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         RefreshRecordingFiles();
         if (fileSelected) recorderSelectedItem = CurrentRows.Count;
         rowScroll.EnsureVisible(
-            RecorderLibraryHeaderY(layout) - layout.Rows.Y + rowScroll.Offset,
-            RecorderFilesStartY(layout) - layout.Rows.Y + rowScroll.Offset + RecorderFileHeight,
-            layout.Rows.Height,
+            0f,
+            98f + RecorderFileHeight,
+            RecorderViewport(layout).Height,
             MaxRowScroll(layout)
         );
         contentEase = 0f;
@@ -1320,10 +1343,17 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             targets.Add(new MaterialInteractionTarget("settings.recorder.toggle", RecorderButtonRect(hero, 1)));
             targets.Add(new MaterialInteractionTarget("settings.recorder.discard", RecorderButtonRect(hero, 2),
                 Enabled: active));
+            foreach (RecorderSettingsSection section in Enum.GetValues<RecorderSettingsSection>())
+                targets.Add(new MaterialInteractionTarget($"settings.recorder.section.{section}",
+                    RecorderSectionTabRect(layout, section), Focused: recorderSettingsSection == section));
+            if (IsRecorderLibrary) {
             targets.Add(new MaterialInteractionTarget("settings.recorder.library.deaths",
                 RecorderLibraryTabRect(layout, 0), Focused: recordingLibraryKind == RecordingLibraryKind.DeathReplay));
             targets.Add(new MaterialInteractionTarget("settings.recorder.library.full",
                 RecorderLibraryTabRect(layout, 1), Focused: recordingLibraryKind == RecordingLibraryKind.Full));
+            targets.Add(new MaterialInteractionTarget("settings.recorder.library.auto",
+                RecorderLibraryTabRect(layout, 2), Focused: recordingLibraryKind == RecordingLibraryKind.Automatic));
+            }
 
             for (int index = 0; index < CurrentRows.Count; index++) {
                 MaterialRect rect = RecorderSettingRect(layout, index);
@@ -1331,7 +1361,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 targets.Add(new MaterialInteractionTarget($"settings.row.{selectedTab}.{index}", rect,
                     CurrentRows[index].Enabled(), recorderSelectedItem == index));
             }
-            for (int index = 0; index < recordingFiles.Count; index++) {
+            for (int index = 0; IsRecorderLibrary && index < recordingFiles.Count; index++) {
                 RecordingLibraryEntry file = recordingFiles[index];
                 bool enabled = !IsRecordingFinalizing(file);
                 MaterialRect rect = RecorderFileRect(layout, index);
@@ -1365,8 +1395,9 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     private void UpdateRowAnimations(OverlayLayout layout) {
         Vector2 mouse = MInput.Mouse.Position;
         for (int tabIndex = 0; tabIndex < tabs.Count; tabIndex++) {
-            for (int index = 0; index < tabs[tabIndex].Rows.Count; index++) {
-                SettingRow row = tabs[tabIndex].Rows[index];
+            List<SettingRow> animatedRows = tabIndex == selectedTab ? CurrentRows : tabs[tabIndex].Rows;
+            for (int index = 0; index < animatedRows.Count; index++) {
+                SettingRow row = animatedRows[index];
                 bool current = tabIndex == selectedTab;
                 bool recorder = current && tabs[tabIndex].RecorderPage;
                 bool selected = current && (recorder
@@ -1400,7 +1431,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private float MaxRowScroll(OverlayLayout layout) {
-        if (IsRecorderTab) return Math.Max(0f, RecorderContentHeight(layout) - layout.Rows.Height);
+        if (IsRecorderTab) return Math.Max(0f, RecorderContentHeight(layout) - RecorderViewport(layout).Height);
         if (IsProfilerTab) return ProfilerMaxScroll(layout);
         int bands = (CurrentRows.Count + Columns - 1) / Columns;
         float contentHeight = bands == 0 ? 0f : bands * RowHeight + (bands - 1) * RowGap;
@@ -1462,9 +1493,19 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         MicroblocksQolUtilsModule.Instance.SaveSettings();
     }
 
-    private List<SettingRow> CurrentRows => tabs[selectedTab].Rows;
+    private List<SettingRow> CurrentRows {
+        get {
+            if (!IsRecorderTab) return tabs[selectedTab].Rows;
+            AutoRecordingMode mode = MicroblocksQolUtilsModule.Settings.AutomaticRecording;
+            if (visibleRecorderRows is null || visibleRecorderSection != recorderSettingsSection || visibleAutoMode != mode) {
+                visibleRecorderRows = tabs[selectedTab].Rows.Where(row => row.IsVisible?.Invoke() != false).ToList();
+                visibleRecorderSection = recorderSettingsSection;
+                visibleAutoMode = mode;
+            }
+            return visibleRecorderRows;
+        }
+    }
 
-    private List<SettingRow> RecorderRows => tabs.First(tab => tab.RecorderPage).Rows;
 
     private bool IsProfilerTab => tabs[selectedTab].ProfilerPage;
 
@@ -1524,44 +1565,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 Toggle("隐藏原生越界名字", () => settings.HideMiaoNetOffscreenNames,
                     value => settings.HideMiaoNetOffscreenNames = value)
             ]),
-            new SettingsTab("录制", "videocam", [
-                Toggle("自动录制", () => settings.AutoRecorderEnabled, value => settings.AutoRecorderEnabled = value),
-                Action("键盘快捷键", "使用 Everest 设置", () => OpenBindingConfig(controller: false)),
-                Action("手柄按键", "使用 Everest 设置", () => OpenBindingConfig(controller: true)),
-                Toggle("保存死亡回放", () => settings.DeathReplayEnabled,
-                    value => settings.DeathReplayEnabled = value),
-                Range("死亡回放时长", () => settings.DeathReplayBufferSeconds,
-                    value => settings.DeathReplayBufferSeconds = value,
-                    10, 60, 5, value => $"最近 {value} 秒"),
-                Toggle("显示录制红点", () => settings.ShowRecordingIndicator,
-                    value => settings.ShowRecordingIndicator = value),
-                Toggle("显示录制时长", () => settings.ShowRecordingDuration,
-                    value => settings.ShowRecordingDuration = value),
-                EnumRow("自动录制策略", () => settings.RecordingPolicy, value => settings.RecordingPolicy = value),
-                EnumRow("BGM 拼接", () => settings.BgmMode, value => settings.BgmMode = value),
-                Toggle("录制 UI 音效", () => settings.RecordingIncludeUiSfx,
-                    value => settings.RecordingIncludeUiSfx = value),
-                Toggle("剪辑冻结帧", () => settings.RecordingRemoveFreezeFrames,
-                    value => settings.RecordingRemoveFreezeFrames = value, highlightWhenOn: true),
-                Range("录制帧率", () => settings.RecordingFrameRate, value => settings.RecordingFrameRate = value,
-                    30, 120, 30, value => $"{value} FPS"),
-                Range("录制码率", () => settings.RecordingBitrateKbps,
-                    value => settings.RecordingBitrateKbps = value,
-                    2000, 50000, 1000, value => $"{value / 1000f:0.#} Mbps"),
-                Range("最多保留完整录像", () => settings.RecordingRetentionCount,
-                    value => settings.RecordingRetentionCount = value,
-                    0, 500, 10, value => value == 0 ? "不限" : $"{value} 个"),
-                Range("最多保留死亡回放", () => settings.DeathReplayRetentionCount,
-                    value => settings.DeathReplayRetentionCount = value,
-                    0, 200, 5, value => value == 0 ? "不限" : $"{value} 个"),
-                Action("立即清理旧录像", "清理", AutoRecorder.CleanupRecordings,
-                    () => (settings.RecordingRetentionCount > 0 || settings.DeathReplayRetentionCount > 0)
-                        && !AutoRecorder.IsCleaning),
-                Text("输出目录", () => settings.RecordingDirectory, value => settings.RecordingDirectory = value,
-                    "留空使用默认目录", 240),
-                Text("编码器", () => settings.RecordingEncoder, value => settings.RecordingEncoder = value,
-                    "auto / nvenc / qsv / amf…", 48)
-            ], RecorderPage: true),
+            new SettingsTab("录制", "videocam", BuildRecorderRows(settings), RecorderPage: true),
             new SettingsTab("界面与系统", "settings", [
                 Toggle("亚克力模糊背景", () => settings.MaterialAcrylicBackground,
                     value => settings.MaterialAcrylicBackground = value),
@@ -1589,6 +1593,55 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                     value => settings.WatchedPlayerNotifications = value)
             ])
         ];
+    }
+
+    private List<SettingRow> BuildRecorderRows(QolSettings settings) {
+        List<SettingRow> rows = [];
+        void Group(RecorderSettingsSection section, params SettingRow[] items) {
+            foreach (SettingRow row in items) {
+                Func<bool>? condition = row.IsVisible;
+                row.IsVisible = () => recorderSettingsSection == section && (condition?.Invoke() ?? true);
+                rows.Add(row);
+            }
+        }
+        SettingRow Golden(SettingRow row) {
+            row.IsVisible = () => settings.AutomaticRecording == AutoRecordingMode.Golden;
+            return row;
+        }
+        Group(RecorderSettingsSection.Automatic,
+            EnumRow("自动录制", () => settings.AutomaticRecording, value => settings.AutomaticRecording = value),
+            Golden(EnumRow("成功时录到", () => settings.GoldenRecordingEnd, value => settings.GoldenRecordingEnd = value)),
+            Golden(EnumRow("死亡后", () => settings.GoldenRecordingDeath, value => settings.GoldenRecordingDeath = value)));
+        Group(RecorderSettingsSection.DeathReplay,
+            Toggle("保存死亡回放", () => settings.DeathReplayEnabled, value => settings.DeathReplayEnabled = value),
+            Range("死亡回放时长", () => settings.DeathReplayBufferSeconds, value => settings.DeathReplayBufferSeconds = value,
+                10, 60, 5, value => $"最近 {value} 秒"));
+        Group(RecorderSettingsSection.Quality,
+            EnumRow("BGM 拼接", () => settings.BgmMode, value => settings.BgmMode = value),
+            Toggle("录制 UI 音效", () => settings.RecordingIncludeUiSfx, value => settings.RecordingIncludeUiSfx = value),
+            Toggle("剪辑冻结帧", () => settings.RecordingRemoveFreezeFrames, value => settings.RecordingRemoveFreezeFrames = value, highlightWhenOn: true),
+            Range("录制帧率", () => settings.RecordingFrameRate, value => settings.RecordingFrameRate = value,
+                30, 120, 30, value => $"{value} FPS"),
+            Range("录制码率", () => settings.RecordingBitrateKbps, value => settings.RecordingBitrateKbps = value,
+                2000, 50000, 1000, value => $"{value / 1000f:0.#} Mbps"),
+            Text("编码器", () => settings.RecordingEncoder, value => settings.RecordingEncoder = value, "auto / nvenc / qsv / amf…", 48));
+        Group(RecorderSettingsSection.Storage,
+            Range("最多保留手动录像", () => settings.RecordingRetentionCount, value => settings.RecordingRetentionCount = value,
+                0, 500, 10, value => value == 0 ? "不限" : $"{value} 个"),
+            Range("最多保留自动录像", () => settings.AutoRecordingRetentionCount, value => settings.AutoRecordingRetentionCount = value,
+                0, 500, 10, value => value == 0 ? "不限" : $"{value} 个"),
+            Range("最多保留死亡回放", () => settings.DeathReplayRetentionCount, value => settings.DeathReplayRetentionCount = value,
+                0, 200, 5, value => value == 0 ? "不限" : $"{value} 个"),
+            Action("立即清理旧录像", "清理", AutoRecorder.CleanupRecordings,
+                () => (settings.RecordingRetentionCount > 0 || settings.AutoRecordingRetentionCount > 0 || settings.DeathReplayRetentionCount > 0)
+                    && !AutoRecorder.IsCleaning),
+            Text("输出根目录", () => settings.RecordingDirectory, value => settings.RecordingDirectory = value, "留空使用默认目录", 240));
+        Group(RecorderSettingsSection.Controls,
+            Action("键盘快捷键", "使用 Everest 设置", () => OpenBindingConfig(controller: false)),
+            Action("手柄按键", "使用 Everest 设置", () => OpenBindingConfig(controller: true)),
+            Toggle("显示录制红点", () => settings.ShowRecordingIndicator, value => settings.ShowRecordingIndicator = value),
+            Toggle("显示录制时长", () => settings.ShowRecordingDuration, value => settings.ShowRecordingDuration = value));
+        return rows;
     }
 
     private static IEnumerable<SettingRow> WindowsSystemRows(QolSettings settings) {
@@ -1715,7 +1768,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         }
         if (AutoRecorder.IsFinalizing) return "正在生成视频";
         if (AutoRecorder.ManualMode) return "已开启，等待游戏画面";
-        return "空闲";
+        return AutoRecorder.AutoRecordingSuppressed ? "本次录制已停止" : "空闲";
     }
 
     private static string ShortPath(string path) => string.IsNullOrWhiteSpace(path)
@@ -1994,6 +2047,8 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         Audio.Play("event:/ui/main/rollover_down");
     }
 
+    private bool IsRecorderLibrary => recorderSettingsSection == RecorderSettingsSection.Library;
+
     private bool IsRecorderTab => tabs[selectedTab].RecorderPage;
 
     private static bool RecorderActive => AutoRecorder.ManualMode || AutoRecorder.IsRecording;
@@ -2002,38 +2057,30 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         AutoRecorder.TryGetFinalizationProgress(file.Path, out _, out _);
 
     private void RefreshRecordingFiles() {
-        bool firstRefresh = !recordingLibraryInitialized;
-        int previousCount = recordingFiles.Count;
-        int recorderSettingCount = RecorderRows.Count;
-        int selectedSetting = recorderSelectedItem >= 0 && recorderSelectedItem < recorderSettingCount
-            ? recorderSelectedItem
-            : -1;
-        int selectedFile = recorderSelectedItem - recorderSettingCount;
-        string selectedPath = selectedFile >= 0 && selectedFile < previousCount
-            ? recordingFiles[selectedFile].Path
-            : "";
+        string selectedPath = IsRecorderLibrary && recorderSelectedItem >= 0 && recorderSelectedItem < recordingFiles.Count
+            ? recordingFiles[recorderSelectedItem].Path : "";
         IReadOnlyList<RecordingLibraryEntry> allRecordings = RecordingLibrary.Scan();
+        autoRecordingCount = allRecordings.Count(file => file.Kind == RecordingLibraryKind.Automatic);
         fullRecordingCount = allRecordings.Count(file => file.Kind == RecordingLibraryKind.Full);
         deathReplayCount = allRecordings.Count(file => file.Kind == RecordingLibraryKind.DeathReplay);
-        RecordingLibraryEntry[] refreshed = allRecordings
-            .Where(file => file.Kind == recordingLibraryKind)
-            .ToArray();
         recordingFiles.Clear();
-        recordingFiles.AddRange(refreshed);
-        if (firstRefresh) {
-            recorderSelectedItem = 0;
-            recordingLibraryInitialized = true;
-        } else if (selectedSetting >= 0) {
-            recorderSelectedItem = Math.Clamp(selectedSetting, 0, Math.Max(0, recorderSettingCount - 1));
-        } else if (selectedPath.Length > 0) {
-            int matching = recordingFiles.FindIndex(file => string.Equals(file.Path, selectedPath,
-                StringComparison.OrdinalIgnoreCase));
-            recorderSelectedItem = recorderSettingCount
-                + (matching >= 0 ? matching : Math.Min(Math.Max(0, selectedFile), recordingFiles.Count));
+        recordingFiles.AddRange(allRecordings.Where(file => file.Kind == recordingLibraryKind));
+        if (IsRecorderLibrary && recorderSelectedItem >= 0) {
+            int matching = recordingFiles.FindIndex(file => string.Equals(file.Path, selectedPath, StringComparison.OrdinalIgnoreCase));
+            recorderSelectedItem = matching >= 0 ? matching : Math.Clamp(recorderSelectedItem, 0, Math.Max(0, recordingFiles.Count - 1));
         }
-        int itemCount = Math.Max(1, recordingFiles.Count) + recorderSettingCount;
-        recorderSelectedItem = itemCount == 0 ? 0 : Math.Clamp(recorderSelectedItem, 0, itemCount - 1);
         recordingRefreshTimer = 1f;
+    }
+
+    private void SelectRecorderSection(int index) {
+        int count = Enum.GetValues<RecorderSettingsSection>().Length;
+        recorderSettingsSection = (RecorderSettingsSection)((index % count + count) % count);
+        recorderSelectedItem = -1;
+        draggedSlider = null;
+        dropdownRow = null;
+        rowScroll.Reset();
+        if (IsRecorderLibrary) RefreshRecordingFiles();
+        Audio.Play("event:/ui/main/rollover_down");
     }
 
     private void ShowRecordingNotice(string notice) {
@@ -2042,6 +2089,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void EnsureRecorderItemVisible(OverlayLayout layout) {
+        if (recorderSelectedItem < 0) return;
         MaterialRect rect;
         if (recorderSelectedItem < CurrentRows.Count) {
             rect = RecorderSettingRect(layout, recorderSelectedItem);
@@ -2053,21 +2101,31 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 rect = RecorderFileRect(layout, fileIndex);
             }
         }
-        float top = rect.Y - layout.Rows.Y + rowScroll.Offset;
-        rowScroll.EnsureVisible(top, top + rect.Height, layout.Rows.Height, MaxRowScroll(layout));
+        MaterialRect viewport = RecorderViewport(layout);
+        float top = rect.Y - viewport.Y + rowScroll.Offset;
+        rowScroll.EnsureVisible(top, top + rect.Height, viewport.Height, MaxRowScroll(layout));
     }
 
     private MaterialRect RecorderHeroRect(OverlayLayout layout) => new(
         layout.Rows.X,
-        layout.Rows.Y - rowScroll.Offset,
+        layout.Rows.Y,
         layout.Rows.Width,
         RecorderHeroHeight
     );
 
-    private float RecorderSettingsHeaderY(OverlayLayout layout) =>
-        layout.Rows.Y + RecorderHeroHeight + 22f - rowScroll.Offset;
+    private static MaterialRect RecorderViewport(OverlayLayout layout) => new(
+        layout.Rows.X, layout.Rows.Y + RecorderHeroHeight + 82f,
+        layout.Rows.Width, Math.Max(1f, layout.Rows.Height - RecorderHeroHeight - 82f));
 
-    private float RecorderSettingsStartY(OverlayLayout layout) => RecorderSettingsHeaderY(layout) + 44f;
+    private static MaterialRect RecorderSectionTabRect(OverlayLayout layout, RecorderSettingsSection section) {
+        const float gap = 8f;
+        int count = Enum.GetValues<RecorderSettingsSection>().Length;
+        float width = (layout.Rows.Width - gap * (count - 1)) / count;
+        return new MaterialRect(layout.Rows.X + (int)section * (width + gap),
+            layout.Rows.Y + RecorderHeroHeight + 16f, width, 46f);
+    }
+
+    private float RecorderSettingsStartY(OverlayLayout layout) => RecorderViewport(layout).Y - rowScroll.Offset;
 
     private MaterialRect RecorderSettingRect(OverlayLayout layout, int index) {
         const float columnGap = 12f;
@@ -2090,11 +2148,11 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private float RecorderLibraryHeaderY(OverlayLayout layout) =>
-        RecorderSettingsStartY(layout) + RecorderSettingsHeight + 26f;
+        RecorderViewport(layout).Y - rowScroll.Offset;
 
     private MaterialRect RecorderLibraryTabRect(OverlayLayout layout, int index) {
         const float gap = 12f;
-        float width = (layout.Rows.Width - gap) / 2f;
+        float width = (layout.Rows.Width - gap * 2f) / 3f;
         return new MaterialRect(
             layout.Rows.X + index * (width + gap),
             RecorderLibraryHeaderY(layout) + 42f,
@@ -2124,13 +2182,14 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         : recordingFiles.Count * RecorderFileHeight + Math.Max(0, recordingFiles.Count - 1) * 10f;
 
     private float RecorderContentHeight(OverlayLayout layout) {
-        float filesStart = RecorderFilesStartY(layout) + rowScroll.Offset;
-        return filesStart - layout.Rows.Y + RecorderHistoryHeight + 8f;
+        return IsRecorderLibrary ? 98f + RecorderHistoryHeight + 8f : RecorderSettingsHeight + 8f;
     }
 
-    private string RecordingLibraryTitle => recordingLibraryKind == RecordingLibraryKind.DeathReplay
-        ? "死亡回放"
-        : "完整录像";
+    private string RecordingLibraryTitle => recordingLibraryKind switch {
+        RecordingLibraryKind.DeathReplay => "死亡回放",
+        RecordingLibraryKind.Automatic => "自动录像",
+        _ => "手动录像"
+    };
 
     private static MaterialRect RecorderButtonRect(MaterialRect hero, int index) {
         const float gap = 10f;
@@ -2181,6 +2240,20 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         MiniMapNameMode.None => "不显示",
         MiniMapNameMode.WatchedOnly => "仅关心的人",
         MiniMapNameMode.Everyone => "所有人",
+        RecorderSettingsSection.Automatic => "自动录制",
+        RecorderSettingsSection.DeathReplay => "死亡回放",
+        RecorderSettingsSection.Quality => "画质声音",
+        RecorderSettingsSection.Storage => "存储清理",
+        RecorderSettingsSection.Controls => "快捷键",
+        RecorderSettingsSection.Library => "录像库",
+        AutoRecordingMode.Off => "关闭",
+        AutoRecordingMode.Chapter => "完整流程",
+        AutoRecordingMode.Golden => "金草莓挑战",
+        GoldenRecordingEnd.BerryCollected => "金草莓结算",
+        GoldenRecordingEnd.ChapterComplete => "整关完成",
+        GoldenRecordingDeath.Discard => "丢弃录制",
+        GoldenRecordingDeath.Continue => "不停止录制",
+        GoldenRecordingDeath.Save => "保存录像",
         RecordingPolicy.EveryRoom => "完整流程",
         RecordingPolicy.GoldenRunsOnly => "仅金草莓",
         BgmRecordingMode.CaptureGameMix => "跟随游戏现场",
@@ -2283,6 +2356,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         public SettingKind Kind { get; }
         public Func<string> Value { get; }
         public Action<int>? Change { get; }
+        public Func<bool>? IsVisible { get; set; }
         public Func<bool>? IsEnabled { get; }
         public Func<bool>? ToggleValue { get; }
         public bool HighlightWhenOn { get; }

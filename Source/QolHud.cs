@@ -107,7 +107,7 @@ public sealed class QolHud : Entity {
 
     private static void UpdateRecordingBindings(Level level) {
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        if (AutoRecorder.ManualMode) {
+        if (AutoRecorder.IsRecording || AutoRecorder.ManualMode) {
             if (settings.StopRecordingBinding.Pressed)
                 AutoRecorder.StopManual(level, save: true);
         } else if (settings.StartRecordingBinding.Pressed) {

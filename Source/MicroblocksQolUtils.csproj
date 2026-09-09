@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Reference Include="YamlDotNet"><HintPath>$(CelesteRoot)/YamlDotNet.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Celeste"><HintPath>$(CelesteRoot)/Celeste.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="FNA"><HintPath>$(CelesteRoot)/FNA.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="MMHOOK_Celeste"><HintPath>$(CelesteRoot)/MMHOOK_Celeste.dll</HintPath><Private>false</Private></Reference>
