@@ -64,18 +64,21 @@ Windows 下，关注的玩家换房间且 Celeste 不在前台时，会发送系
 
 ### 录制与死亡回放
 
-录制功能支持 Windows、Linux 和 macOS native backend。Windows 使用 WGC，macOS
-使用 ScreenCaptureKit，Linux 使用 xdg-desktop-portal/PipeWire；不会启动 ffmpeg
-可执行文件，也不会使用托管帧缓冲或子进程。
+录制统一使用 Windows / Linux / macOS 的 SDL OpenGL native hook，不再依赖
+桌面录屏 API、权限选择器或屏幕位置。需要在 `everest-launch.txt` 中设置
+`--graphics OpenGL` 并重启（或在启动前设置 `FNA3D_FORCE_DRIVER=OpenGL`）。
+安装脚本会为没有显式 renderer 配置的游戏添加该启动参数，并备份原配置到 `.work`；
+已有显式覆盖会保留。普通 ZIP 安装需手动配置。需要 OpenGL 3.2（未来 Android 对应 GLES 3）。
 
-macOS 首次使用时需要授予 Celeste“屏幕与系统录音”权限。Linux 首次使用时会显示
-桌面门户的共享选择器，请选择 Celeste 窗口或其所在屏幕；支持持久授权的桌面门户
-会在后续启动中恢复该选择。Wayland 和支持 PipeWire 的 X11 桌面都走同一套门户接口。
+在 `SDL_GL_SwapWindow` **之前**提交每帧 PBO 异步读回；后续帧零等待检查 GPU fence，
+后台线程转成 BGRA 并分发，不在游戏线程编码或调用消费者。尺寸变化会重建 PBO；
+没有订阅时停止读回。无需 macOS 屏幕录制授权或 Linux 桌面门户。
+详见 [采集架构及测试](docs/capture-architecture.md)。
 
 - 自动录制策略：每个房间都录制，或只录制携带金草莓的 run。
 - 控制台和设置页都支持手动录制、保存和丢弃；开始录制和结束保存可以分别绑定
   可选的键盘或手柄按键，默认均不绑定。
-- 完整录像和死亡回放使用独立的捕获会话；死亡回放默认保留最近 30 秒，
+- 完整录像和死亡回放使用独立的编码/剪辑会话，共享唯一的像素和 FMOD 采集源；死亡回放默认保留最近 30 秒，
   可设置为 10–60 秒，并在死亡后自动保存、复活后继续录制。
 - 连续录制只保留成功片段。死亡、房间切换、暂停、SpeedrunTool 加载和自定义
   respawn 点会改变最终剪辑时间线，不会让失败过程进入最终视频。
@@ -88,7 +91,7 @@ macOS 首次使用时需要授予 Celeste“屏幕与系统录音”权限。Lin
   VideoToolbox、Linux NVENC/QSV）；Linux 在没有可直接使用的 H.264 编码器时回退到
   MP4 中的 MPEG-4 Part 2。音频使用 AAC。可以选择录制 UI 音效、帧率、码率和编码器，
   并设置完整录像/死亡回放的保留数量或立即清理旧录像。
-- 音频通过 FMOD DSP tap 采集 gameplay_sfx、music 和可选的 ui_sfx。
+- 音频通过唯一一套 FMOD DSP tap 采集 gameplay_sfx、music 和 ui_sfx（各消费者独立筛选 UI 音效）。
   音频块分总线写入 .sfxchunks sidecar，最终化时再分别处理 SFX 剪辑和 BGM 后期
   时间线，不把整段音频堆在内存中。因此 `.working` 里的 MKV 是无音轨的中间文件；
   应播放 `full` 或 `deaths` 目录下完成最终化的 MP4。
@@ -137,7 +140,7 @@ qol_record_discard
 qol_record_status
 ~~~
 
-前三个命令用于开发时检查平台 scap 捕获、队列深度、丢帧和媒体时长，
+前三个命令用于开发时检查共享 SDL 捕获、队列深度、丢帧和媒体时长，
 不会自动开启正常录制。
 
 ## 构建与安装
@@ -156,7 +159,7 @@ Windows 下如果要构建完整录制后端，还需要：
 - MSYS2、GNU make、Perl 和 NASM；
 - tar。
 
-Linux 完整构建还需要 Clang/libclang、GNU make、pkg-config、PipeWire 和 D-Bus
+Linux 完整构建还需要 Clang/libclang、GNU make、pkg-config
 开发包；macOS 完整构建需要 Xcode Command Line Tools。各平台都会从已校验的
 FFmpeg 8.1 源码构建并随包附带最小 LGPL shared runtime。
 
@@ -202,4 +205,6 @@ master 的每个提交会更新 nightly 预发布，v* 标签会发布相同的�
 
 - MiaoNet、CollabUtils2、SpeedrunTool：运行时可选，使用反射或桥接接口。
 - Material Symbols：仓库内嵌图标资源。
-- third_party/scap：固定版本并带本地补丁的捕获依赖。
+- Source/CaptureSource.cs / CaptureSubscription.cs：共享采集和可取消、隔离的回调。
+- Source/SdlFrameSource.cs / Native/src/sdl_readback.rs：SDL native hook 与 PBO 异步读回。
+- Tests/Capture / Capture.Integration：回调/时钟测试及真实 SDL、FMOD、编码集成测试。

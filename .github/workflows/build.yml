@@ -35,10 +35,12 @@ jobs:
           rustup default stable
           rustup component add rustfmt
 
-      - name: Install Linux capture dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          clang libclang-dev libdbus-1-dev libpipewire-0.3-dev pkg-config
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Test capture subscriptions and clocks
+        run: dotnet run --project Tests/Capture/Capture.csproj -c Release
 
       - name: Cache Cargo
         uses: actions/cache@v6
@@ -140,7 +142,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: MicroblocksQolUtils-windows-x64
           - name: Linux x64
-            # scap's VideoInfoRaw binding matches PipeWire 0.3.65 and newer.
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: MicroblocksQolUtils-linux-x64
@@ -189,7 +190,7 @@ jobs:
         if: runner.os == 'Linux'
         run: >-
           sudo apt-get update && sudo apt-get install -y
-          clang libclang-dev libdbus-1-dev libpipewire-0.3-dev libvpl-dev
+          clang libclang-dev libvpl-dev
           libffmpeg-nvenc-dev make patchelf pkg-config xz-utils unzip zip
 
       - name: Install Windows build tools

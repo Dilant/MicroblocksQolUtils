@@ -30,6 +30,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         MaterialAcrylicRenderer.Load();
         MaterialUiSmoke.Load();
         NativeCaptureBridge.InitializeFromMod(Metadata);
+        CaptureSource.Load();
         NativeCaptureSmoke.Load();
         FrameProfiler.Load();
         CollisionBoxRenderer.Load();
@@ -53,6 +54,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         MaterialUiSmoke.Unload();
         NativeCaptureCommands.Unload();
         AutoRecorder.Unload();
+        CaptureSource.Unload();
         CollisionBoxRenderer.Unload();
         InstantDeaths.Unload();
         InstantTransitions.Unload();
@@ -79,6 +81,8 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         FrameProfiler.BeginUpdate();
         try {
             orig(self, gameTime);
+            CaptureSource.Update();
+            NativeCaptureSmoke.Update();
             AutoRecorder.AfterEngineUpdate();
             InstantDeaths.AfterEngineUpdate();
             MaterialUiSmoke.Update();

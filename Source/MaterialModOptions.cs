@@ -152,7 +152,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     public override IEnumerator Leave(Oui next) {
         display = false;
         SetSearchTarget(SearchTarget.None);
-        menu?.Focused = false;
+        if (menu is not null) menu.Focused = false;
         SaveTabState();
         for (float timer = 0f; timer < 0.16f; timer += Engine.RawDeltaTime) yield return null;
         yield return Everest.SaveSettings();

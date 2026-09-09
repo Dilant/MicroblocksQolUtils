@@ -11,7 +11,7 @@ public static class NativeCaptureCommands {
         probe = NativeCaptureBridge.Start(
             MicroblocksQolUtilsModule.Settings.RecordingFrameRate
         );
-        Engine.Commands.Log("Native scap capture probe started.");
+        Engine.Commands.Log("Shared SDL capture probe started.");
     }
 
     [Command("qol_capture_probe_stats", "Show native platform capture statistics")]
@@ -33,7 +33,7 @@ public static class NativeCaptureCommands {
     public static void Stop() {
         probe?.Dispose();
         probe = null;
-        Engine.Commands.Log("Native scap capture probe stopped.");
+        Engine.Commands.Log("Shared SDL capture probe stopped.");
     }
 
     [Command("qol_record_start", "Start manual run recording")]

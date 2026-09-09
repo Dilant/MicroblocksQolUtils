@@ -217,6 +217,12 @@ impl VideoFileEncoder {
         })
     }
 
+    pub fn set_origin(&mut self, timestamp: u64) {
+        if self.origin_unix_nanos.is_none() {
+            self.origin_unix_nanos = Some(timestamp);
+        }
+    }
+
     pub fn encode(&mut self, captured: &CapturedFrame) -> Result<(), EncoderError> {
         let origin = *self
             .origin_unix_nanos

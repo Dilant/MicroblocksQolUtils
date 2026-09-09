@@ -74,21 +74,25 @@ while Celeste is not the foreground application.
 
 ### Recording and death replays
 
-Recording is available in the Windows, Linux, and macOS native backends. Windows
-uses WGC, macOS uses ScreenCaptureKit, and Linux uses
-xdg-desktop-portal/PipeWire. Runtime capture does not launch an ffmpeg executable,
-use a managed frame buffer, or create a subprocess.
+Windows, Linux and macOS share an SDL OpenGL native-hook source; there is no desktop
+capture service, permission picker, or screen-coordinate dependency. Set
+`--graphics OpenGL` in `everest-launch.txt` and restart (or set
+`FNA3D_FORCE_DRIVER=OpenGL` before launch). The installer adds the launch flag only when
+no explicit renderer override exists and backs up the config under `.work`. Plain ZIP
+installation requires configuring this manually; explicit overrides are preserved.
+OpenGL 3.2 is required (GLES 3 is the future Android extension point).
 
-macOS asks for Screen & System Audio Recording permission on first use. Linux
-shows the desktop portal source picker on first use; select the Celeste window or
-its display. Portals that support persistent grants restore that selection on later
-launches. The portal path works on Wayland and PipeWire-enabled X11 desktops.
+PBO readback is submitted **before** `SDL_GL_SwapWindow`, with zero-timeout fence
+polling on subsequent frames. A worker converts/distributes owned BGRA pixels;
+encoding and consumer callbacks never run on the render thread. Resizing rebuilds
+PBOs; no subscribers means no readback. No desktop recording permission is needed.
+See [capture architecture and testing](docs/capture-architecture.md).
 
 - Automatic recording can cover every room or only runs carrying a golden berry.
 - Manual recording can be started, saved, and discarded from the settings page or
   through console commands. Starting and stopping/saving can also use separate,
   optional keyboard or controller bindings; both are unbound by default.
-- Full recordings and death replays use independent capture sessions. Death
+- Full recordings and death replays use independent encoding/editing sessions sharing one pixel/FMOD source. Death
   replays retain the latest 30 seconds by default, configurable from 10 to 60
   seconds, save after death, and resume automatically after respawn.
 - Continuous capture keeps only successful segments. Deaths, room transitions,
@@ -106,7 +110,7 @@ launches. The portal path works on Wayland and PipeWire-enabled X11 desktops.
   in the MP4 container when no directly usable H.264 encoder is available. Audio
   uses AAC. Frame rate, bitrate, encoder preference, UI SFX capture, and retention
   limits are configurable.
-- FMOD DSP taps capture gameplay_sfx, music, and optional ui_sfx. Chunks are
+- One set of FMOD DSP taps captures gameplay_sfx, music, and ui_sfx (filtered per consumer). Chunks are
   streamed by bus to an .sfxchunks sidecar, then SFX edits and the BGM post-mix
   timeline are handled separately during finalization instead of buffering an
   entire run in memory. MKV files under `.working` are therefore silent
@@ -160,7 +164,7 @@ qol_record_discard
 qol_record_status
 ~~~
 
-The capture probe is for development diagnostics: it reports platform scap capture,
+The capture probe is for development diagnostics: it reports shared SDL capture,
 queue depth, dropped frames, and media time without enabling normal recording.
 
 ## Build and install
@@ -181,7 +185,7 @@ requires:
 - tar.
 
 A complete Linux build also needs Clang/libclang, GNU make, pkg-config, and the
-PipeWire and D-Bus development packages. A complete macOS build needs Xcode
+FFmpeg encoder development packages. A complete macOS build needs Xcode
 Command Line Tools. Every platform builds a verified FFmpeg 8.1 source archive
 into the minimal LGPL shared runtime packaged with the mod.
 
@@ -230,4 +234,6 @@ release.
 
 - MiaoNet, CollabUtils2, and SpeedrunTool are optional runtime bridges.
 - Material Symbols are embedded in the repository.
-- third_party/scap is pinned and locally patched.
+- Source/CaptureSource.cs and CaptureSubscription.cs own shared acquisition and isolated subscriptions.
+- Source/SdlFrameSource.cs and Native/src/sdl_readback.rs implement SDL hooks and PBO readback.
+- Tests/Capture and Capture.Integration exercise subscriptions, clocks, and real SDL/FMOD encoding.

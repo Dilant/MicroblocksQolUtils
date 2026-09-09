@@ -5,7 +5,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// <summary>
 /// Installs pass-through DSPs at the tail of Celeste's gameplay audio buses. FMOD calls the
 /// read callbacks on its mixer thread, so the callback only copies the bus audio
-/// to the output and offers the samples to the native bounded queue.
+/// to the output and offers samples once to the shared source bounded queue.
 /// </summary>
 internal sealed class FmodSfxTap : IDisposable {
     private const int GameplayBusId = 1;
@@ -17,17 +17,16 @@ internal sealed class FmodSfxTap : IDisposable {
 
     private FmodSfxTap() { }
 
-    public static FmodSfxTap? Attach(NativeCaptureSession capture, bool includeUiSfx) {
+    public static FmodSfxTap? Attach() {
         try {
             FMOD.Studio.System studio = GetStudioSystem();
             Check(studio.getLowLevelSystem(out FMOD.System lowLevel), "get low-level system");
             Check(lowLevel.getSoftwareFormat(out int sampleRate, out _, out _), "get software format");
 
             FmodSfxTap owner = new();
-            owner.TryAttachBus(studio, lowLevel, capture, "bus:/gameplay_sfx", GameplayBusId, sampleRate);
-            if (includeUiSfx)
-                owner.TryAttachBus(studio, lowLevel, capture, "bus:/ui_sfx", UiBusId, sampleRate);
-            owner.TryAttachBus(studio, lowLevel, capture, "bus:/music", MusicBusId, sampleRate);
+            owner.TryAttachBus(studio, lowLevel, "bus:/gameplay_sfx", GameplayBusId, sampleRate);
+            owner.TryAttachBus(studio, lowLevel, "bus:/ui_sfx", UiBusId, sampleRate);
+            owner.TryAttachBus(studio, lowLevel, "bus:/music", MusicBusId, sampleRate);
 
             if (owner.taps.Count == 0) {
                 owner.Dispose();
@@ -52,13 +51,12 @@ internal sealed class FmodSfxTap : IDisposable {
     private void TryAttachBus(
         FMOD.Studio.System studio,
         FMOD.System lowLevel,
-        NativeCaptureSession capture,
         string path,
         int busId,
         int sampleRate
     ) {
         try {
-            taps.Add(BusTap.Attach(studio, lowLevel, capture, path, busId, sampleRate));
+            taps.Add(BusTap.Attach(studio, lowLevel, path, busId, sampleRate));
         } catch (Exception exception) {
             Logger.Log(
                 LogLevel.Warn,
@@ -85,17 +83,16 @@ internal sealed class FmodSfxTap : IDisposable {
     }
 
     private sealed class BusTap : IDisposable {
-        private readonly NativeCaptureSession capture;
         private readonly FMOD.Studio.Bus bus;
         private readonly FMOD.ChannelGroup group;
         private readonly FMOD.DSP dsp;
         private readonly FMOD.DSP_READCALLBACK callback;
         private readonly int busId;
         private readonly int sampleRate;
+        private readonly FmodCaptureClock audioClock = new();
         private int disposed;
 
         private BusTap(
-            NativeCaptureSession capture,
             FMOD.Studio.Bus bus,
             FMOD.ChannelGroup group,
             FMOD.DSP dsp,
@@ -103,7 +100,6 @@ internal sealed class FmodSfxTap : IDisposable {
             int busId,
             int sampleRate
         ) {
-            this.capture = capture;
             this.bus = bus;
             this.group = group;
             this.dsp = dsp;
@@ -115,7 +111,6 @@ internal sealed class FmodSfxTap : IDisposable {
         public static BusTap Attach(
             FMOD.Studio.System studio,
             FMOD.System lowLevel,
-            NativeCaptureSession capture,
             string path,
             int busId,
             int sampleRate
@@ -144,7 +139,7 @@ internal sealed class FmodSfxTap : IDisposable {
                     read = callback
                 };
                 FmodSfxTap.Check(lowLevel.createDSP(ref description, out dsp), $"create DSP for {path}");
-                owner = new BusTap(capture, bus, group, dsp, callback, busId, sampleRate);
+                owner = new BusTap(bus, group, dsp, callback, busId, sampleRate);
                 FmodSfxTap.Check(group.addDSP(FMOD.CHANNELCONTROL_DSP_INDEX.TAIL, dsp), $"add DSP to {path}");
                 return owner;
             } catch {
@@ -181,8 +176,11 @@ internal sealed class FmodSfxTap : IDisposable {
                 long byteCount = (long)sampleCount * sizeof(float);
                 Buffer.MemoryCopy(input.ToPointer(), output.ToPointer(), byteCount, byteCount);
                 outputChannels = inputChannels;
-                if (Volatile.Read(ref disposed) == 0)
-                    capture.PushAudio((float*)input.ToPointer(), sampleCount, sampleRate, inputChannels, busId);
+                if (Volatile.Read(ref disposed) == 0) {
+                    _ = group.getDSPClock(out ulong clock, out _);
+                    ulong timestamp = audioClock.Timestamp(clock, sampleRate, SdlFrameSource.ClockNanos());
+                    CaptureSource.PublishAudio((float*)input.ToPointer(), sampleCount, sampleRate, inputChannels, busId, clock, timestamp);
+                }
                 return FMOD.RESULT.OK;
             } catch {
                 // Never unwind managed exceptions through FMOD's real-time mixer thread.
@@ -192,8 +190,7 @@ internal sealed class FmodSfxTap : IDisposable {
 
         public void Dispose() {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-            // removeDSP synchronizes removal from the mix graph before capture.Dispose closes
-            // the native queue. Keep the callback delegate rooted until after DSP release.
+            // removeDSP synchronizes removal from the shared mix graph. Keep the callback delegate rooted until after DSP release.
             try { if (group.isValid() && dsp.isValid()) _ = group.removeDSP(dsp); } catch { }
             try { if (dsp.isValid()) _ = dsp.release(); } catch { }
             try { if (bus.isValid()) _ = bus.unlockChannelGroup(); } catch { }

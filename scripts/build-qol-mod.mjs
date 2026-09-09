@@ -1,4 +1,4 @@
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { ensureQolFfmpeg, findLibclangDirectory } from "./qol-ffmpeg.mjs";
@@ -184,5 +184,19 @@ if (process.argv.includes("--install")) {
   mkdirSync(modsRoot, { recursive: true });
   rmSync(installedDirectory, { recursive: true, force: true });
   copyFileSync(archive, installedArchive);
+  // FNA creates its SDL window before Everest loads mods: renderer selection must
+  // happen at process launch, not in a module initializer. Preserve explicit overrides.
+  const launchPath = resolve(celesteRoot, "everest-launch.txt");
+  const launch = existsSync(launchPath) ? readFileSync(launchPath, "utf8") : "";
+  const active = launch.split(/\r?\n/u).filter((line) => !line.trimStart().startsWith("#")).join(" ");
+  if (!/(?:^|\s)--graphics(?:\s|=)/u.test(active)) {
+    const backup = resolve(root, ".work", `everest-launch-before-${Date.now()}.txt`);
+    mkdirSync(dirname(backup), { recursive: true });
+    writeFileSync(backup, launch);
+    writeFileSync(launchPath, launch + "\n# MicroblocksQolUtils shared SDL capture requires OpenGL.\n--graphics OpenGL\n");
+    console.log(`Configured OpenGL for SDL capture; previous launch config: ${backup}`);
+  } else {
+    console.log("Preserved existing --graphics override; SDL capture requires OpenGL.");
+  }
   console.log(`Installed ${installedArchive}`);
 }

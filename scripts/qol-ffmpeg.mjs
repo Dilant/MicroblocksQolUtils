@@ -93,6 +93,14 @@ const configureArguments = process.platform === "win32"
 
 export async function ensureQolFfmpeg(root) {
   if (!["win32", "darwin", "linux"].includes(process.platform)) return null;
+  // Explicit development/CI override; the default remains the reproducible minimal build.
+  // Supply a redistributable LGPL shared SDK matching the FFmpeg headers/runtime ABI.
+  if (process.env.QOL_FFMPEG_DIR) {
+    const sdk = resolve(process.env.QOL_FFMPEG_DIR);
+    if (!complete(sdk)) throw new Error(`Incomplete QOL_FFMPEG_DIR SDK at ${sdk}`);
+    console.log(`Using supplied FFmpeg SDK at ${sdk}`);
+    return { ...ffmpegLayout(sdk), digest: "external-sdk" };
+  }
   const cache = resolve(root, ".cache", "ffmpeg");
   const archive = resolve(cache, archiveName);
   const source = resolve(cache, extractedName);

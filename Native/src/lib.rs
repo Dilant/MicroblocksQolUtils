@@ -10,7 +10,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +17,7 @@ use thiserror::Error;
 #[cfg(windows)]
 mod dwrite_raster;
 mod raster;
+mod sdl_readback;
 
 #[cfg(feature = "ffmpeg")]
 mod encoder;
@@ -26,12 +26,11 @@ mod finalizer;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_audio;
 
-const ABI_VERSION: u32 = 4;
+const ABI_VERSION: u32 = 5;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
 const ERR_ALREADY_RUNNING: i32 = -3;
-const ERR_NOT_RUNNING: i32 = -4;
 const ERR_PLATFORM: i32 = -5;
 const ERR_CAPTURE: i32 = -6;
 const ERR_PANIC: i32 = -127;
@@ -46,39 +45,27 @@ static LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CaptureConfig {
-    pub window_title: String,
     pub fps: u32,
     pub queue_capacity: usize,
-    pub show_cursor: bool,
     pub output_path: Option<String>,
     pub encoder: String,
     pub bitrate_kbps: u32,
-    pub window_handle: u64,
 }
 
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            window_title: "Celeste".to_owned(),
             fps: 60,
             queue_capacity: 3,
-            show_cursor: false,
             output_path: None,
             encoder: "auto".to_owned(),
             bitrate_kbps: 12_000,
-            window_handle: 0,
         }
     }
 }
 
 impl CaptureConfig {
     fn validate(mut self) -> Result<Self, CaptureError> {
-        self.window_title = self.window_title.trim().to_owned();
-        if self.window_handle == 0 && self.window_title.is_empty() {
-            return Err(CaptureError::InvalidConfig(
-                "window_handle and window_title are both empty",
-            ));
-        }
         if !(1..=240).contains(&self.fps) {
             return Err(CaptureError::InvalidConfig("fps must be between 1 and 240"));
         }
@@ -110,13 +97,6 @@ impl CaptureConfig {
 enum CaptureError {
     #[error("invalid capture config: {0}")]
     InvalidConfig(&'static str),
-    #[error("capture window not found: {0}")]
-    WindowNotFound(String),
-    #[error("scap capture is unavailable: {0}")]
-    Scap(String),
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-    #[error("screen capture is unavailable on this platform")]
-    UnsupportedPlatform,
 }
 
 #[repr(C)]
@@ -186,12 +166,16 @@ struct AudioBusClock {
 }
 
 impl AudioBusClock {
-    const RESYNC_THRESHOLD_NANOS: u64 = 250_000_000;
+    const RESYNC_THRESHOLD_NANOS: u64 = 2_000_000;
 
     const fn new() -> Self {
         Self {
             next_nanos: AtomicU64::new(u64::MAX),
         }
+    }
+
+    fn reset(&self) {
+        self.next_nanos.store(u64::MAX, Ordering::Release);
     }
 
     fn reserve(&self, frame_count: u64, sample_rate: u32, fallback_nanos: u64) -> u64 {
@@ -201,9 +185,8 @@ impl AudioBusClock {
             .unwrap_or(0);
         let mut observed = self.next_nanos.load(Ordering::Acquire);
         loop {
-            // FMOD can stop producing DSP blocks while a pause or save-state load is being
-            // removed from the video timeline. Snap forward to the video clock after a real
-            // stall so every later SFX chunk keeps its original on-screen timestamp.
+            // Source timestamps derive from the FMOD sample clock, not worker arrival.
+            // Preserve dropped blocks/stalls instead of compressing their missing duration.
             let start = if observed == u64::MAX
                 || fallback_nanos.saturating_sub(observed) > Self::RESYNC_THRESHOLD_NANOS
             {
@@ -399,13 +382,15 @@ struct AtomicStats {
 struct CaptureSession {
     config: CaptureConfig,
     running: AtomicBool,
-    stop_requested: AtomicBool,
-    capture_finished: AtomicBool,
+    started: AtomicBool,
+    origin_nanos: AtomicU64,
+    last_video_nanos: AtomicU64,
+    lifecycle: Mutex<()>,
     queue: Arc<LatestFrameQueue>,
     audio_queue: Arc<AudioChunkQueue>,
     audio_clocks: [AudioBusClock; AUDIO_BUS_COUNT],
     stats: Arc<AtomicStats>,
-    capture_thread: Mutex<Option<JoinHandle<()>>>,
+
     consumer_thread: Mutex<Option<JoinHandle<()>>>,
     audio_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -422,152 +407,144 @@ impl CaptureSession {
             ],
             config,
             running: AtomicBool::new(false),
-            stop_requested: AtomicBool::new(false),
-            capture_finished: AtomicBool::new(true),
+            started: AtomicBool::new(false),
+            origin_nanos: AtomicU64::new(u64::MAX),
+            last_video_nanos: AtomicU64::new(0),
+            lifecycle: Mutex::new(()),
             stats: Arc::new(AtomicStats::default()),
-            capture_thread: Mutex::new(None),
+
             consumer_thread: Mutex::new(None),
             audio_thread: Mutex::new(None),
         }
     }
 
     fn start(self: &Arc<Self>) -> Result<(), i32> {
-        if self.running.swap(true, Ordering::AcqRel) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        // Closed queues cannot be restarted. Allocate a new sink for each recording.
+        if self.started.swap(true, Ordering::AcqRel) {
             return Err(ERR_ALREADY_RUNNING);
         }
-        self.stop_requested.store(false, Ordering::Release);
-        self.capture_finished.store(false, Ordering::Release);
-
-        let capture_session = Arc::clone(self);
-        let capture = thread::Builder::new()
-            .name("microblocks-qol-capture".to_owned())
-            .spawn(move || {
-                match catch_unwind(AssertUnwindSafe(|| run_capture(&capture_session))) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => set_last_error(error.to_string()),
-                    Err(payload) => set_last_error(format!(
-                        "scap capture thread panicked: {}",
-                        panic_payload_message(payload)
-                    )),
-                }
-                capture_session
-                    .capture_finished
-                    .store(true, Ordering::Release);
-                capture_session.queue.close();
-                capture_session.audio_queue.close();
-                capture_session.running.store(false, Ordering::Release);
-            })
-            .map_err(|error| {
-                self.running.store(false, Ordering::Release);
-                set_last_error(format!("failed to spawn capture thread: {error}"));
-                ERR_CAPTURE
-            })?;
-        *self
-            .capture_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capture);
-
+        #[cfg(not(feature = "ffmpeg"))]
+        if self.config.output_path.is_some() {
+            set_last_error("this native library was built without FFmpeg encoding support");
+            return Err(ERR_PLATFORM);
+        }
+        self.running.store(true, Ordering::Release);
         let consumer_session = Arc::clone(self);
         let consumer = thread::Builder::new()
-            .name("microblocks-qol-encoder-feed".to_owned())
+            .name("mqol-encoder".into())
             .spawn(move || {
                 match catch_unwind(AssertUnwindSafe(|| run_consumer(&consumer_session))) {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         set_last_error(error);
-                        consumer_session
-                            .stop_requested
-                            .store(true, Ordering::Release);
+                        consumer_session.fail();
                     }
                     Err(payload) => {
-                        set_last_error(format!(
-                            "FFmpeg consumer thread panicked: {}",
-                            panic_payload_message(payload)
-                        ));
-                        consumer_session
-                            .stop_requested
-                            .store(true, Ordering::Release);
+                        set_last_error(panic_payload_message(payload));
+                        consumer_session.fail();
                     }
                 }
             })
             .map_err(|error| {
-                self.stop_requested.store(true, Ordering::Release);
-                set_last_error(format!("failed to spawn encoder-feed thread: {error}"));
+                self.fail();
+                set_last_error(error.to_string());
                 ERR_CAPTURE
             })?;
         *self
             .consumer_thread
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(consumer);
-
+            .unwrap_or_else(|p| p.into_inner()) = Some(consumer);
         let audio_session = Arc::clone(self);
         let audio = thread::Builder::new()
-            .name("microblocks-qol-audio-writer".to_owned())
+            .name("mqol-audio-writer".into())
             .spawn(move || {
-                if let Err(error) = run_audio_writer(&audio_session) {
-                    set_last_error(error);
-                    audio_session.stop_requested.store(true, Ordering::Release);
+                match catch_unwind(AssertUnwindSafe(|| run_audio_writer(&audio_session))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        set_last_error(error);
+                        audio_session.fail();
+                    }
+                    Err(payload) => {
+                        set_last_error(panic_payload_message(payload));
+                        audio_session.fail();
+                    }
                 }
             })
             .map_err(|error| {
-                self.stop_requested.store(true, Ordering::Release);
-                set_last_error(format!("failed to spawn audio-writer thread: {error}"));
+                self.fail();
+                self.join_threads();
+                set_last_error(error.to_string());
                 ERR_CAPTURE
             })?;
-        *self
-            .audio_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(audio);
+        *self.audio_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(audio);
         Ok(())
+    }
+
+    fn fail(&self) {
+        self.running.store(false, Ordering::Release);
+        self.queue.close();
+        self.audio_queue.close();
     }
 
     fn stop(&self) -> Result<(), i32> {
-        if !self.running.load(Ordering::Acquire) && self.capture_finished.load(Ordering::Acquire) {
-            self.join_finished_threads();
-            return Err(ERR_NOT_RUNNING);
-        }
-        self.stop_requested.store(true, Ordering::Release);
-
-        // A platform capture source can stop producing frames while minimized or while its
-        // portal is closing. Do not block the game thread indefinitely: join only after the
-        // capture callback has observed the stop request.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !self.capture_finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(5));
-        }
-        if self.capture_finished.load(Ordering::Acquire) {
-            self.join_finished_threads();
-        }
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        self.fail();
+        self.join_threads();
         Ok(())
     }
 
-    fn join_finished_threads(&self) {
-        if let Some(thread) = self
-            .capture_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = thread.join();
+    fn join_threads(&self) {
+        for slot in [&self.consumer_thread, &self.audio_thread] {
+            if let Some(thread) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = thread.join();
+            }
         }
-        self.queue.close();
-        self.audio_queue.close();
-        if let Some(thread) = self
-            .consumer_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = thread.join();
+    }
+
+    fn accepts_timestamp(&self, timestamp: u64) -> bool {
+        let origin = self.origin_nanos.load(Ordering::Acquire);
+        if origin == u64::MAX {
+            return true;
         }
-        if let Some(thread) = self
-            .audio_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = thread.join();
+        let bucket = |time: u64| {
+            u128::from(time.saturating_sub(origin)) * u128::from(self.config.fps) / 1_000_000_000
+        };
+        bucket(timestamp) > bucket(self.last_video_nanos.load(Ordering::Acquire))
+    }
+
+    fn push_frame(&self, frame: CapturedFrame) {
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        let timestamp = frame.captured_at_unix_nanos;
+        if !self.accepts_timestamp(timestamp) {
+            return;
+        }
+        // PR #2 audio-sync only: the first video frame establishes the audio origin.
+        // Timestamp is saved at GPU submission, never at delayed readback/delivery.
+        if self.origin_nanos.load(Ordering::Acquire) == u64::MAX {
+            for clock in &self.audio_clocks {
+                clock.reset();
+            }
+            self.origin_nanos.store(timestamp, Ordering::Release);
+        }
+        self.last_video_nanos.store(timestamp, Ordering::Release);
+        self.stats.width.store(frame.width, Ordering::Relaxed);
+        self.stats.height.store(frame.height, Ordering::Relaxed);
+        self.stats.frames_captured.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_captured
+            .fetch_add(frame.bgra.len() as u64, Ordering::Relaxed);
+        self.stats
+            .last_frame_unix_nanos
+            .store(timestamp, Ordering::Relaxed);
+        self.stats.media_time_nanos.store(
+            timestamp.saturating_sub(self.origin_nanos.load(Ordering::Acquire)),
+            Ordering::Relaxed,
+        );
+        if self.queue.push_latest(frame) {
+            self.stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -608,6 +585,10 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
                         .map_err(|error| error.to_string())?,
                 );
             }
+            encoder
+                .as_mut()
+                .unwrap()
+                .set_origin(session.origin_nanos.load(Ordering::Acquire));
             encoder
                 .as_mut()
                 .expect("encoder initialized above")
@@ -688,311 +669,9 @@ fn write_audio_chunk(writer: &mut impl Write, chunk: &AudioChunk) -> Result<(), 
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
-        self.stop_requested.store(true, Ordering::Release);
         self.queue.close();
         self.audio_queue.close();
     }
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn run_capture(session: &Arc<CaptureSession>) -> Result<(), CaptureError> {
-    use scap::capturer::{Capturer, Options, Resolution};
-    use scap::frame::{Frame, FrameType};
-
-    if !scap::is_supported() {
-        return Err(CaptureError::Scap(
-            "screen capture is not supported by this operating system".to_owned(),
-        ));
-    }
-    if !scap::has_permission() && !scap::request_permission() {
-        return Err(CaptureError::Scap(
-            "screen recording permission was not granted".to_owned(),
-        ));
-    }
-    let target = find_capture_target(&session.config)?;
-
-    let mut capturer = Capturer::build(Options {
-        fps: session.config.fps,
-        show_cursor: session.config.show_cursor,
-        show_highlight: false,
-        target,
-        crop_area: None,
-        output_type: FrameType::BGRAFrame,
-        output_resolution: Resolution::Captured,
-        excluded_targets: None,
-        captures_audio: false,
-        exclude_current_process_audio: false,
-        restore_token_path: linux_portal_restore_token_path(),
-    })
-    .map_err(|error| CaptureError::Scap(error.to_string()))?;
-
-    capturer.start_capture();
-    let mut origin_unix_nanos = None;
-    while !session.stop_requested.load(Ordering::Acquire) {
-        let Some(frame) = capturer
-            .get_next_frame_timeout(Duration::from_millis(100))
-            .map_err(|error| CaptureError::Scap(error.to_string()))?
-        else {
-            continue;
-        };
-        let Frame::Video(frame) = frame else {
-            continue;
-        };
-        let Some(captured) = captured_frame(frame) else {
-            continue;
-        };
-        let captured_at_unix_nanos = captured.captured_at_unix_nanos;
-        let origin = *origin_unix_nanos.get_or_insert(captured_at_unix_nanos);
-        let media_time_nanos = captured_at_unix_nanos.saturating_sub(origin);
-        session.stats.width.store(captured.width, Ordering::Relaxed);
-        session
-            .stats
-            .height
-            .store(captured.height, Ordering::Relaxed);
-        session
-            .stats
-            .frames_captured
-            .fetch_add(1, Ordering::Relaxed);
-        session
-            .stats
-            .bytes_captured
-            .fetch_add(captured.bgra.len() as u64, Ordering::Relaxed);
-        session
-            .stats
-            .last_frame_unix_nanos
-            .store(captured_at_unix_nanos, Ordering::Relaxed);
-        session
-            .stats
-            .media_time_nanos
-            .store(media_time_nanos, Ordering::Relaxed);
-        if session.queue.push_latest(captured) {
-            session.stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    capturer.stop_capture();
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_portal_restore_token_path() -> Option<PathBuf> {
-    let state_root = std::env::var_os("XDG_STATE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from)
-                .map(|home| home.join(".local/state"))
-        })?;
-    Some(
-        state_root
-            .join("microblocks-qol-utils")
-            .join("screencast-restore-token"),
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_portal_restore_token_path() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn captured_frame(frame: scap::frame::VideoFrame) -> Option<CapturedFrame> {
-    let scap::frame::VideoFrame::BGRA(frame) = frame else {
-        return None;
-    };
-    Some(CapturedFrame {
-        width: frame.width.max(0) as u32,
-        height: frame.height.max(0) as u32,
-        captured_at_unix_nanos: frame
-            .display_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX),
-        bgra: frame.data,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn captured_frame(frame: scap::frame::VideoFrame) -> Option<CapturedFrame> {
-    use scap::frame::VideoFrame;
-
-    let (display_time, width, height, data, layout) = match frame {
-        VideoFrame::RGB(frame) => (frame.display_time, frame.width, frame.height, frame.data, 3),
-        VideoFrame::RGBx(frame) => (frame.display_time, frame.width, frame.height, frame.data, 4),
-        VideoFrame::XBGR(frame) => (frame.display_time, frame.width, frame.height, frame.data, 5),
-        VideoFrame::BGRx(frame) => (frame.display_time, frame.width, frame.height, frame.data, 6),
-        _ => return None,
-    };
-    let pixel_count = (width.max(0) as usize).checked_mul(height.max(0) as usize)?;
-    let bytes_per_pixel = if layout == 3 { 3 } else { 4 };
-    if data.len() < pixel_count.checked_mul(bytes_per_pixel)? {
-        return None;
-    }
-    let mut bgra = Vec::with_capacity(pixel_count * 4);
-    for pixel in data.chunks_exact(bytes_per_pixel).take(pixel_count) {
-        bgra.extend_from_slice(&pipewire_pixel_to_bgra(pixel, layout)?);
-    }
-    Some(CapturedFrame {
-        width: width.max(0) as u32,
-        height: height.max(0) as u32,
-        captured_at_unix_nanos: display_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX),
-        bgra,
-    })
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn pipewire_pixel_to_bgra(pixel: &[u8], layout: u8) -> Option<[u8; 4]> {
-    let (red, green, blue) = if layout == 3 {
-        (*pixel.first()?, *pixel.get(1)?, *pixel.get(2)?)
-    } else {
-        // SPA names packed 32-bit formats into in-memory order, identical to GStreamer.
-        // Decode the word before extracting its components.
-        let packed = u32::from_ne_bytes(pixel.try_into().ok()?);
-        match layout {
-            4 => (packed as u8, (packed >> 8) as u8, (packed >> 16) as u8), // RGBx
-            5 => (
-                (packed >> 24) as u8,
-                (packed >> 16) as u8,
-                (packed >> 8) as u8,
-            ), // xBGR
-            6 => ((packed >> 16) as u8, (packed >> 8) as u8, packed as u8), // BGRx
-            _ => return None,
-        }
-    };
-    Some([blue, green, red, u8::MAX])
-}
-
-#[cfg(target_os = "linux")]
-fn find_capture_target(_config: &CaptureConfig) -> Result<Option<scap::Target>, CaptureError> {
-    // The xdg-desktop-portal picker owns source selection on Linux. Passing no target is
-    // intentional and works on both Wayland and PipeWire-enabled X11 desktops.
-    Ok(None)
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn find_capture_target(config: &CaptureConfig) -> Result<Option<scap::Target>, CaptureError> {
-    find_capture_window(config)
-        .map(|window| Some(scap::Target::Window(window)))
-        .ok_or_else(|| CaptureError::WindowNotFound(config.window_title.clone()))
-}
-
-#[cfg(windows)]
-fn find_capture_window(config: &CaptureConfig) -> Option<scap::Window> {
-    use std::ffi::c_void;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-
-    if config.window_handle != 0 {
-        let raw_handle = HWND(config.window_handle as usize as *mut c_void);
-        if unsafe { IsWindow(raw_handle).as_bool() } {
-            return Some(scap::Window {
-                id: config.window_handle as u32,
-                title: config.window_title.clone(),
-                raw_handle,
-            });
-        }
-    }
-    find_current_process_window(&config.window_title).or_else(|| {
-        scap::get_all_targets()
-            .into_iter()
-            .filter_map(|target| match target {
-                scap::Target::Window(window) => Some(window),
-                scap::Target::Display(_) => None,
-            })
-            .find(|window| {
-                window.title == config.window_title || window.title.contains(&config.window_title)
-            })
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn find_capture_window(config: &CaptureConfig) -> Option<scap::Window> {
-    scap::get_all_targets()
-        .into_iter()
-        .filter_map(|target| match target {
-            scap::Target::Window(window) => Some(window),
-            scap::Target::Display(_) => None,
-        })
-        .find(|window| {
-            window.title == config.window_title || window.title.contains(&config.window_title)
-        })
-}
-
-#[cfg(windows)]
-fn find_current_process_window(title: &str) -> Option<scap::Window> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindowVisible,
-    };
-
-    struct Search {
-        process_id: u32,
-        title: String,
-        found: Option<(HWND, String)>,
-        fallback: Option<(HWND, String, u64)>,
-    }
-
-    unsafe extern "system" fn visit(window: HWND, parameter: LPARAM) -> BOOL {
-        // SAFETY: `parameter` points to the Search value for the duration of EnumWindows.
-        let search = unsafe { &mut *(parameter.0 as *mut Search) };
-        let mut process_id = 0;
-        unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
-        if process_id != search.process_id {
-            return TRUE;
-        }
-        let length = unsafe { GetWindowTextLengthW(window) }.max(0);
-        let mut utf16 = vec![0_u16; length as usize + 1];
-        let copied = unsafe { GetWindowTextW(window, &mut utf16) }.max(0);
-        let actual = String::from_utf16_lossy(&utf16[..copied as usize]);
-        let mut rect = RECT::default();
-        let _ = unsafe { GetClientRect(window, &mut rect) };
-        let area = (rect.right - rect.left).max(0) as u64 * (rect.bottom - rect.top).max(0) as u64;
-        let visible_bonus = u64::from(unsafe { IsWindowVisible(window).as_bool() }) << 63;
-        let score = visible_bonus | area.min(i64::MAX as u64);
-        if search
-            .fallback
-            .as_ref()
-            .is_none_or(|(_, _, previous_score)| score > *previous_score)
-        {
-            search.fallback = Some((window, actual.clone(), score));
-        }
-        if !actual.is_empty() && (actual == search.title || actual.contains(&search.title)) {
-            search.found = Some((window, actual));
-            return BOOL(0);
-        }
-        TRUE
-    }
-
-    let mut search = Search {
-        process_id: unsafe { GetCurrentProcessId() },
-        title: title.to_owned(),
-        found: None,
-        fallback: None,
-    };
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(std::ptr::addr_of_mut!(search) as isize)) };
-    search
-        .found
-        .or_else(|| search.fallback.map(|(window, title, _)| (window, title)))
-        .map(|(raw_handle, actual_title)| scap::Window {
-            id: raw_handle.0 as usize as u32,
-            title: actual_title,
-            raw_handle,
-        })
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn run_capture(_session: &Arc<CaptureSession>) -> Result<(), CaptureError> {
-    Err(CaptureError::UnsupportedPlatform)
 }
 
 fn sessions() -> &'static Mutex<HashMap<u64, Arc<CaptureSession>>> {
@@ -1139,6 +818,41 @@ pub extern "C" fn mqol_capture_destroy(handle: u64) -> i32 {
     })
 }
 
+/// Push top-down packed BGRA8 from the shared source; input is borrowed for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mqol_capture_push_frame(
+    handle: u64,
+    pixels: *const u8,
+    length: usize,
+    width: u32,
+    height: u32,
+    timestamp: u64,
+) -> i32 {
+    ffi_status(|| {
+        if pixels.is_null() || sdl_readback::pixel_bytes(width, height) != Some(length) {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        let session = sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&handle)
+            .cloned()
+            .ok_or(ERR_NOT_FOUND)?;
+        if !session.running.load(Ordering::Acquire) || !session.accepts_timestamp(timestamp) {
+            return Ok(OK);
+        }
+        // SAFETY: caller provides length readable bytes; dimensions and size were checked.
+        let bgra = unsafe { std::slice::from_raw_parts(pixels, length) }.to_vec();
+        session.push_frame(CapturedFrame {
+            width,
+            height,
+            captured_at_unix_nanos: timestamp,
+            bgra,
+        });
+        Ok(OK)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mqol_capture_push_audio(
     handle: u64,
@@ -1147,6 +861,7 @@ pub unsafe extern "C" fn mqol_capture_push_audio(
     sample_rate: u32,
     channels: u16,
     bus_id: u16,
+    timestamp_nanos: u64,
 ) -> i32 {
     ffi_status(|| {
         if samples.is_null()
@@ -1170,13 +885,17 @@ pub unsafe extern "C" fn mqol_capture_push_audio(
         if session.config.output_path.is_none() || !session.running.load(Ordering::Acquire) {
             return Ok(OK);
         }
+        let origin = session.origin_nanos.load(Ordering::Acquire);
+        if origin == u64::MAX || timestamp_nanos < origin {
+            return Ok(OK);
+        }
         // SAFETY: The caller guarantees `sample_count` readable f32 samples for this call.
         let values = unsafe { std::slice::from_raw_parts(samples, sample_count) };
         let frame_count = (sample_count / channels as usize) as u64;
         let media_time_nanos = session.audio_clocks[usize::from(bus_id) - 1].reserve(
             frame_count,
             sample_rate,
-            session.stats.media_time_nanos.load(Ordering::Relaxed),
+            timestamp_nanos.saturating_sub(origin),
         );
         // Locked FMOD buses continue producing zero-filled blocks while idle. Advance the bus
         // clock above, but do not spend queue or disk bandwidth on silence; the finalizer fills
@@ -1432,26 +1151,6 @@ mod tests {
     }
 
     #[test]
-    fn pipewire_packed_pixels_decode_in_memory_order() {
-        assert_eq!(
-            pipewire_pixel_to_bgra(&[0x11, 0x22, 0x33], 3),
-            Some([0x33, 0x22, 0x11, 0xff])
-        );
-        assert_eq!(
-            pipewire_pixel_to_bgra(&[0x11, 0x22, 0x33, 0x00], 4),
-            Some([0x33, 0x22, 0x11, 0xff])
-        );
-        assert_eq!(
-            pipewire_pixel_to_bgra(&[0x00, 0x33, 0x22, 0x11], 5),
-            Some([0x33, 0x22, 0x11, 0xff])
-        );
-        assert_eq!(
-            pipewire_pixel_to_bgra(&[0x33, 0x22, 0x11, 0x00], 6),
-            Some([0x33, 0x22, 0x11, 0xff])
-        );
-    }
-
-    #[test]
     fn config_rejects_unbounded_memory_settings() {
         assert!(
             CaptureConfig {
@@ -1491,9 +1190,91 @@ mod tests {
     fn audio_bus_clock_advances_and_resynchronizes_after_a_video_clock_jump() {
         let clock = AudioBusClock::new();
         assert_eq!(clock.reserve(480, 48_000, 2_000_000_000), 2_000_000_000);
-        assert_eq!(clock.reserve(960, 48_000, 2_050_000_000), 2_010_000_000);
+        assert_eq!(clock.reserve(960, 48_000, 2_050_000_000), 2_050_000_000);
         assert_eq!(clock.reserve(480, 48_000, 9_000_000_000), 9_000_000_000);
         assert_eq!(clock.reserve(480, 48_000, 9_000_000_000), 9_010_000_000);
+    }
+
+    #[test]
+    fn audio_clock_reset_and_dropped_blocks_preserve_time() {
+        let clock = AudioBusClock::new();
+        assert_eq!(clock.reserve(480, 48000, 0), 0);
+        assert_eq!(clock.reserve(480, 48000, 30_000_000), 30_000_000);
+        clock.reset();
+        assert_eq!(clock.reserve(480, 48000, 0), 0);
+    }
+
+    #[test]
+    fn audio_is_gated_by_first_video_and_keeps_submission_timestamp() {
+        let session = Arc::new(CaptureSession::new(CaptureConfig {
+            output_path: Some("unused".into()),
+            ..Default::default()
+        }));
+        session.running.store(true, Ordering::Release);
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        sessions()
+            .lock()
+            .unwrap()
+            .insert(handle, Arc::clone(&session));
+        let samples = [0.5; 960];
+        let send = |timestamp| unsafe {
+            mqol_capture_push_audio(
+                handle,
+                samples.as_ptr(),
+                samples.len(),
+                48000,
+                2,
+                1,
+                timestamp,
+            )
+        };
+        assert_eq!(send(100), OK);
+        assert_eq!(session.stats().audio_frames_captured, 0);
+        let mut first = frame(1);
+        first.captured_at_unix_nanos = 1_000_000_000;
+        session.push_frame(first);
+        assert_eq!(session.origin_nanos.load(Ordering::Acquire), 1_000_000_000);
+        assert_eq!(send(999_999_999), OK);
+        assert_eq!(session.stats().audio_frames_captured, 0);
+        assert_eq!(send(1_030_000_000), OK);
+        assert_eq!(
+            session.audio_queue.pop().unwrap().media_time_nanos,
+            30_000_000
+        );
+        session.fail();
+        sessions().lock().unwrap().remove(&handle);
+    }
+
+    #[test]
+    fn independent_fps_buckets_do_not_accumulate_capture_jitter() {
+        for fps in [30, 60, 120] {
+            let session = CaptureSession::new(CaptureConfig {
+                fps,
+                ..Default::default()
+            });
+            session.running.store(true, Ordering::Release);
+            for n in 0..144u64 {
+                let mut input = frame(1);
+                input.captured_at_unix_nanos = 1_000_000_000 + n * 1_000_000_000 / 144;
+                session.push_frame(input);
+            }
+            assert_eq!(session.stats().frames_captured, u64::from(fps));
+        }
+    }
+
+    #[test]
+    fn stopping_one_sink_leaves_other_running_and_restart_is_rejected() {
+        let a = Arc::new(CaptureSession::new(CaptureConfig::default()));
+        let b = Arc::new(CaptureSession::new(CaptureConfig::default()));
+        a.start().unwrap();
+        b.start().unwrap();
+        a.stop().unwrap();
+        b.push_frame(frame(1));
+        assert!(b.running.load(Ordering::Acquire));
+        assert_eq!(b.stats().frames_captured, 1);
+        assert_eq!(a.start(), Err(ERR_ALREADY_RUNNING));
+        b.stop().unwrap();
+        b.stop().unwrap();
     }
 
     #[test]

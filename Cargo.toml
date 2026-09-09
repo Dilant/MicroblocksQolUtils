@@ -1,6 +1,5 @@
 [workspace]
 members = ["Native"]
-exclude = ["third_party/scap"]
 resolver = "2"
 
 [workspace.package]

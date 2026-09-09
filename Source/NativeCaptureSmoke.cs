@@ -1,90 +1,75 @@
 namespace Celeste.Mod.MicroblocksQolUtils;
 
+// Opt-in only. Starts after live Engine updates, not during parallel mod loading.
 internal static class NativeCaptureSmoke {
-    private const string OutputVariable = "MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT";
+    private static string? output;
+    private static int updates;
     private static CancellationTokenSource? cancellation;
-    private static NativeCaptureSession? active;
-    private static FmodSfxTap? activeTap;
-
+    private static NativeCaptureSession? active, second;
     public static void Load() {
-        string? configured = Environment.GetEnvironmentVariable(OutputVariable);
-        if (string.IsNullOrWhiteSpace(configured)) return;
-        string output = Path.GetFullPath(configured);
-        cancellation = new CancellationTokenSource();
-        _ = RunAsync(output, cancellation.Token);
+        output = Environment.GetEnvironmentVariable("MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT");
+        updates = 0;
     }
-
+    public static void Update() {
+        if (string.IsNullOrWhiteSpace(output) || cancellation is not null || ++updates < 180) return;
+        cancellation = new();
+        _ = RunAsync(Path.GetFullPath(output), cancellation.Token);
+    }
     public static void Unload() {
         cancellation?.Cancel();
-        cancellation?.Dispose();
-        cancellation = null;
-        Interlocked.Exchange(ref activeTap, null)?.Dispose();
         Interlocked.Exchange(ref active, null)?.Dispose();
+        Interlocked.Exchange(ref second, null)?.Dispose();
+        output = null;
     }
-
-    private static async Task RunAsync(string output, CancellationToken token) {
+    private static async Task RunAsync(string path, CancellationToken token) {
         try {
-            Directory.CreateDirectory(Path.GetDirectoryName(output)!);
-            await Task.Delay(3_000, token).ConfigureAwait(false);
-            NativeCaptureSession capture = NativeCaptureBridge.StartRecording(
-                30,
-                output,
-                "libopenh264",
-                2_000
-            );
-            Interlocked.Exchange(ref active, capture)?.Dispose();
-            FmodSfxTap tap = FmodSfxTap.Attach(capture, includeUiSfx: true)
-                ?? throw new InvalidOperationException("FMOD SFX tap did not attach to any bus");
-            Interlocked.Exchange(ref activeTap, tap)?.Dispose();
-            Audio.Play("event:/ui/main/button_select");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            long pixelCallbacks = 0, audioCallbacks = 0;
+            ulong previousSequence = 0;
+            using CaptureSubscription observer = CaptureSource.Subscribe(frame => {
+                if (frame.Sequence <= previousSequence || frame.Pixels.Length != frame.Width * frame.Height * 4)
+                    throw new InvalidDataException("Invalid pixel metadata/order");
+                previousSequence = frame.Sequence;
+                Interlocked.Increment(ref pixelCallbacks);
+            }, chunk => {
+                if (chunk.SampleRate <= 0 || chunk.Samples.Length % chunk.Channels != 0 || chunk.TimestampNanos == 0)
+                    throw new InvalidDataException("Invalid audio metadata");
+                Interlocked.Increment(ref audioCallbacks);
+            });
+            using CaptureSubscription slow = CaptureSource.Subscribe(_ => Thread.Sleep(200));
+            NativeCaptureSession capture = NativeCaptureBridge.StartRecording(30, path, "auto", 2_000);
+            active = capture;
+            await Task.Delay(1_000, token).ConfigureAwait(false);
+            second = NativeCaptureBridge.StartRecording(60, path + ".second.mkv", "auto", 2_000);
             await Task.Delay(2_000, token).ConfigureAwait(false);
             CaptureStatistics statistics = capture.Statistics;
-            Interlocked.Exchange(ref activeTap, null)?.Dispose();
             Interlocked.Exchange(ref active, null)?.Dispose();
-            FileInfo file = new(output);
-            long length = file.Exists ? file.Length : 0;
-            if (length < 1_000) {
-                throw new InvalidDataException(
-                    $"native capture output is missing or too small: {length} bytes; "
-                    + $"running={statistics.Running} captured={statistics.FramesCaptured} "
-                    + $"consumed={statistics.FramesConsumed} dropped={statistics.FramesDropped}; "
-                    + $"nativeError={NativeCaptureBridge.LastError()}"
-                );
-            }
-            string sidecar = output + ".sfxchunks";
-            byte[] audio = File.Exists(sidecar) ? File.ReadAllBytes(sidecar) : [];
-            if (statistics.AudioFramesCaptured == 0
-                || audio.Length <= 8
-                || !audio.AsSpan(0, 8).SequenceEqual("MQOLAUD1"u8)) {
-                throw new InvalidDataException(
-                    $"FMOD SFX sidecar is invalid: bytes={audio.Length} "
-                    + $"frames={statistics.AudioFramesCaptured} dropped={statistics.AudioChunksDropped}"
-                );
-            }
-            string finalized = output + ".final.mp4";
+            ulong before = second.Statistics.FramesCaptured;
+            await Task.Delay(1_000, token).ConfigureAwait(false);
+            if (second.Statistics.FramesCaptured <= before) throw new Exception("Unsubscribing first recorder stopped second recorder");
+            Interlocked.Exchange(ref second, null)?.Dispose();
+            observer.Dispose(); await observer.Completion.ConfigureAwait(false);
+            slow.Dispose(); await slow.Completion.ConfigureAwait(false);
+            if (pixelCallbacks < 10 || audioCallbacks == 0 || observer.CallbackErrors != 0 || slow.DroppedFrames == 0)
+                throw new Exception($"Callback isolation failed: pixels={pixelCallbacks} audio={audioCallbacks} errors={observer.CallbackErrors} slowDrops={slow.DroppedFrames}");
+            if (!File.Exists(path) || new FileInfo(path).Length < 1_000 || statistics.FramesCaptured < 10)
+                throw new Exception($"No captured video; {statistics}; source={CaptureSource.VideoError}; native={NativeCaptureBridge.LastError()}");
+            byte[] audio = File.ReadAllBytes(path + ".sfxchunks");
+            if (audio.Length < 8 || !audio.AsSpan(0,8).SequenceEqual("MQOLAUD1"u8)) throw new Exception("Invalid PCM sidecar");
+            string finalized = path + ".final.mp4";
             await NativeCaptureBridge.FinalizeRecordingAsync(
-                [new RecordingClip(output, 0, Math.Max(0.1, statistics.MediaTimeSeconds), "", 0)],
-                finalized,
-                "libopenh264",
-                2_000,
-                30,
-                false,
-                false,
-                ""
-            ).ConfigureAwait(false);
-            if (!File.Exists(finalized) || new FileInfo(finalized).Length < 1_000)
-                throw new InvalidDataException("native A/V finalizer did not produce an MP4");
-            Logger.Log(
-                LogLevel.Info,
-                "MicroblocksQolUtils/Recorder",
-                $"QOL_CAPTURE_SMOKE_PASSED {output} finalized={finalized}"
-            );
-        } catch (OperationCanceledException) {
-        } catch (Exception exception) {
+                [new RecordingClip(path, 0, Math.Max(0.1, statistics.MediaTimeSeconds), "", 0)],
+                finalized, "auto", 2_000, 30, false, false, "").ConfigureAwait(false);
+            if (new FileInfo(finalized).Length < 1_000) throw new Exception("Finalization failed");
+            File.WriteAllText(path + ".passed", $"pixels={pixelCallbacks} audioCallbacks={audioCallbacks} slowDrops={slow.DroppedFrames}\n{statistics}\n");
+            Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Recorder", $"QOL_CAPTURE_SMOKE_PASSED {path}");
+        } catch (OperationCanceledException) { }
+        catch (Exception exception) {
+            File.WriteAllText(path + ".failed", exception.ToString());
             Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/CaptureSmoke");
         } finally {
-            Interlocked.Exchange(ref activeTap, null)?.Dispose();
             Interlocked.Exchange(ref active, null)?.Dispose();
+            Interlocked.Exchange(ref second, null)?.Dispose();
         }
     }
 }

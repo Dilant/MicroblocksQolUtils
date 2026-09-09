@@ -2,13 +2,12 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 internal sealed class NativeRoomRecording {
     private readonly NativeCaptureSession capture;
-    private readonly FmodSfxTap? sfxTap;
     private int stopped;
     private double lastMediaTime;
 
     public string Path { get; }
     public string AudioPath => Path + ".sfxchunks";
-    public bool HasAudioTap => sfxTap is not null;
+    public bool HasAudioTap => capture.HasAudioTap;
 
     public CaptureStatistics Statistics {
         get {
@@ -22,9 +21,8 @@ internal sealed class NativeRoomRecording {
         }
     }
 
-    private NativeRoomRecording(NativeCaptureSession capture, FmodSfxTap? sfxTap, string path) {
+    private NativeRoomRecording(NativeCaptureSession capture, string path) {
         this.capture = capture;
-        this.sfxTap = sfxTap;
         Path = path;
     }
 
@@ -47,10 +45,10 @@ internal sealed class NativeRoomRecording {
                 settings.RecordingFrameRate,
                 output,
                 settings.RecordingEncoder,
-                settings.RecordingBitrateKbps
+                settings.RecordingBitrateKbps,
+                includeUiSfx: settings.RecordingIncludeUiSfx
             );
-            FmodSfxTap? sfxTap = FmodSfxTap.Attach(capture, settings.RecordingIncludeUiSfx);
-            return new NativeRoomRecording(capture, sfxTap, output);
+            return new NativeRoomRecording(capture, output);
         } catch (Exception exception) {
             Logger.Log(LogLevel.Error, "MicroblocksQolUtils/Recorder", $"Cannot start native recording: {exception.Message}");
             return null;
@@ -59,14 +57,13 @@ internal sealed class NativeRoomRecording {
 
     public Task StopAsync() {
         if (Interlocked.Exchange(ref stopped, 1) != 0) return Task.CompletedTask;
-        // Detach synchronously so FMOD cannot race another callback into a closing native queue.
-        sfxTap?.Dispose();
+        // Disposing this sink unregisters only its callbacks; the shared DSP stays for other consumers.
         CaptureStatistics statistics = Statistics;
-        if (sfxTap is null || statistics.AudioFramesCaptured == 0) {
+        if (!capture.HasAudioTap || statistics.AudioFramesCaptured == 0) {
             Logger.Log(
                 LogLevel.Warn,
                 "MicroblocksQolUtils/Recorder",
-                $"Recording stopped without captured FMOD audio (tap={sfxTap is not null}, "
+                $"Recording stopped without captured FMOD audio (tap={capture.HasAudioTap}, "
                 + $"videoFrames={statistics.FramesCaptured}, audioFrames={statistics.AudioFramesCaptured})."
             );
         } else {
