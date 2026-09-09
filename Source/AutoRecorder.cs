@@ -39,6 +39,7 @@ public static class AutoRecorder {
     private static bool branchActive;
     private static bool waitingForStablePlayer;
     private static bool pauseSuspended;
+    private static NativeRoomRecording? saveSuspendedFull, saveSuspendedDeath;
     private static bool transitioningRoom;
     private static bool deathReplayBranchActive;
     private static bool deathReplayWaitingForStablePlayer;
@@ -128,12 +129,14 @@ public static class AutoRecorder {
         Everest.Events.Level.OnExit += LevelExitStarted;
         SpeedrunToolBridge.Load();
         RecordingDeathRecovery.Load();
+        RecordingDeathAudio.Load();
         CleanupRecordings();
     }
 
     public static void Unload() {
         SessionState.ResetRun();
         RecordingDeathRecovery.Unload();
+        RecordingDeathAudio.Unload();
         SpeedrunToolBridge.Unload();
         Everest.Events.Level.OnEnd -= LevelEnd;
         Everest.Events.Level.OnExit -= LevelExitStarted;
@@ -310,7 +313,7 @@ public static class AutoRecorder {
     public static RecordingTimelineSnapshot? CaptureTimeline(Level level) {
         NativeRoomRecording? recording = current;
         if (recording is null
-            || !branchActive
+            || (!branchActive && !ReferenceEquals(recording, saveSuspendedFull))
             || !string.Equals(RunKey(level), runKey, StringComparison.Ordinal)) {
             return null;
         }
@@ -330,6 +333,7 @@ public static class AutoRecorder {
         }
         ActivePrefix.Clear();
         ActivePrefix.AddRange(snapshot.Clips);
+        RecordingDeathAudio.StopRemainder();
         respawnAnchor = snapshot.RespawnAnchorClips is null
             ? null
             : new RecordingTimelineSnapshot(snapshot.RespawnAnchorClips.ToArray());
@@ -496,7 +500,8 @@ public static class AutoRecorder {
     private static void StartBranchAtCurrentTime(bool seamlessFromPrevious = false) {
         NativeRoomRecording? recording = current;
         if (recording is null) return;
-        branchStartSeconds = recording.MediaTimeSeconds;
+        if (waitingForStablePlayer) RecordingDeathAudio.StopRemainder();
+        branchStartSeconds = recording.TimelineTimeSeconds;
         branchMusicStart = MusicPosition.Read();
         branchSeamlessFromPrevious = seamlessFromPrevious;
         branchRoomName = recordingRoomName ?? "";
@@ -508,7 +513,7 @@ public static class AutoRecorder {
     private static void StartDeathReplayBranchAtCurrentTime(bool seamlessFromPrevious = false) {
         NativeRoomRecording? recording = deathReplayCurrent;
         if (recording is null) return;
-        deathReplayBranchStartSeconds = recording.MediaTimeSeconds;
+        deathReplayBranchStartSeconds = recording.TimelineTimeSeconds;
         deathReplayMusicStart = MusicPosition.Read();
         deathReplayBranchSeamlessFromPrevious = seamlessFromPrevious;
         deathReplayBranchRoomName = recordingRoomName ?? "";
@@ -517,11 +522,46 @@ public static class AutoRecorder {
         deathReplayWaitingForStablePlayer = false;
     }
 
+    internal static void SuspendForInternalSave(ulong timestamp) {
+        if (current is { } full && branchActive) {
+            RecordingClip? clip = CurrentClip(full.FrameTimeAt(timestamp, roundUp: false), 0d);
+            if (clip is not null) ActivePrefix.Add(clip);
+            saveSuspendedFull = full;
+            branchActive = false;
+            respawnAnchor = new RecordingTimelineSnapshot(ActivePrefix.ToArray());
+        }
+        if (deathReplayCurrent is { } death && deathReplayBranchActive) {
+            RecordingClip? clip = CurrentDeathReplayClip(death.FrameTimeAt(timestamp, roundUp: false), 0d);
+            if (clip is not null) DeathReplayPrefix.Add(clip);
+            saveSuspendedDeath = death;
+            deathReplayBranchActive = false;
+        }
+    }
+
+    internal static void ResumeAfterInternalSave(ulong timestamp) {
+        if (saveSuspendedFull is { } full && ReferenceEquals(full, current) && !waitingForStablePlayer) {
+            StartBranchAtCurrentTime(seamlessFromPrevious: true);
+            branchStartSeconds = full.FrameTimeAt(timestamp, roundUp: true);
+        }
+        if (saveSuspendedDeath is { } death && ReferenceEquals(death, deathReplayCurrent) && !deathReplayWaitingForStablePlayer) {
+            StartDeathReplayBranchAtCurrentTime(seamlessFromPrevious: true);
+            deathReplayBranchStartSeconds = death.FrameTimeAt(timestamp, roundUp: true);
+        }
+        saveSuspendedFull = saveSuspendedDeath = null;
+    }
+
+    internal static void CancelInternalSave() {
+        // Do not reopen a stale branch on a scene switch or during unload.
+        if (saveSuspendedFull is not null && ReferenceEquals(saveSuspendedFull, current)) waitingForStablePlayer = true;
+        if (saveSuspendedDeath is not null && ReferenceEquals(saveSuspendedDeath, deathReplayCurrent)) deathReplayWaitingForStablePlayer = true;
+        saveSuspendedFull = saveSuspendedDeath = null;
+    }
+
     private static void SuspendForPause() {
         if (pauseSuspended) return;
         NativeRoomRecording? recording = current;
         if (recording is not null && branchActive) {
-            RecordingClip? completed = CurrentClip(recording.MediaTimeSeconds);
+            RecordingClip? completed = CurrentClip(recording.TimelineTimeSeconds);
             if (completed is not null) ActivePrefix.Add(completed);
             branchActive = false;
         }
@@ -533,7 +573,7 @@ public static class AutoRecorder {
         if (deathReplayPauseSuspended) return;
         NativeRoomRecording? recording = deathReplayCurrent;
         if (recording is not null && deathReplayBranchActive) {
-            RecordingClip? completed = CurrentDeathReplayClip(recording.MediaTimeSeconds);
+            RecordingClip? completed = CurrentDeathReplayClip(recording.TimelineTimeSeconds);
             if (completed is not null) DeathReplayPrefix.Add(completed);
             deathReplayBranchActive = false;
         }
@@ -542,7 +582,7 @@ public static class AutoRecorder {
     }
 
     private static void ResumeFullRecordingAfterPause(NativeRoomRecording recording) {
-        double now = recording.MediaTimeSeconds;
+        double now = recording.TimelineTimeSeconds;
         if (pauseResumeAfterMediaSeconds is not double clearedAt) {
             pauseResumeAfterMediaSeconds = now;
             return;
@@ -554,7 +594,7 @@ public static class AutoRecorder {
     }
 
     private static void ResumeDeathReplayAfterPause(NativeRoomRecording recording) {
-        double now = recording.MediaTimeSeconds;
+        double now = recording.TimelineTimeSeconds;
         if (deathReplayPauseResumeAfterMediaSeconds is not double clearedAt) {
             deathReplayPauseResumeAfterMediaSeconds = now;
             return;
@@ -566,7 +606,7 @@ public static class AutoRecorder {
     }
 
     private static void ObserveMusicTimeline(NativeRoomRecording recording) {
-        double now = recording.MediaTimeSeconds;
+        double now = recording.TimelineTimeSeconds;
         MusicPosition observed = MusicPosition.Read();
         bool eventChanged = !string.Equals(observed.Event, branchMusicStart.Event, StringComparison.Ordinal);
         int expectedTimeline = branchMusicStart.TimelineMilliseconds
@@ -584,7 +624,7 @@ public static class AutoRecorder {
     }
 
     private static void ObserveDeathReplayMusicTimeline(NativeRoomRecording recording) {
-        double now = recording.MediaTimeSeconds;
+        double now = recording.TimelineTimeSeconds;
         MusicPosition observed = MusicPosition.Read();
         bool eventChanged = !string.Equals(observed.Event, deathReplayMusicStart.Event, StringComparison.Ordinal);
         int expectedTimeline = deathReplayMusicStart.TimelineMilliseconds
@@ -609,7 +649,7 @@ public static class AutoRecorder {
         }
         List<RecordingClip> clips = [.. ActivePrefix];
         if (branchActive) {
-            RecordingClip? finalClip = CurrentClip(recording.MediaTimeSeconds);
+            RecordingClip? finalClip = CurrentClip(recording.TimelineTimeSeconds);
             if (finalClip is not null) clips.Add(finalClip);
         }
         current = null;
@@ -688,14 +728,14 @@ public static class AutoRecorder {
 
     private static List<RecordingClip> CaptureCurrentClips(NativeRoomRecording recording) {
         List<RecordingClip> clips = [.. ActivePrefix];
-        RecordingClip? currentClip = CurrentClip(recording.MediaTimeSeconds);
+        RecordingClip? currentClip = CurrentClip(recording.TimelineTimeSeconds);
         if (currentClip is not null) clips.Add(currentClip);
         return clips;
     }
 
     private static List<RecordingClip> CaptureCurrentDeathReplayClips(NativeRoomRecording recording) {
         List<RecordingClip> clips = [.. DeathReplayPrefix];
-        RecordingClip? currentClip = CurrentDeathReplayClip(recording.MediaTimeSeconds);
+        RecordingClip? currentClip = CurrentDeathReplayClip(recording.TimelineTimeSeconds);
         if (currentClip is not null) clips.Add(currentClip);
         return clips;
     }
@@ -758,8 +798,8 @@ public static class AutoRecorder {
         // handles teleports and restored saves, not just normal TransitionTo calls.
         NativeRoomRecording? full = current;
         NativeRoomRecording? death = deathReplayCurrent;
-        double fullTime = full?.MediaTimeSeconds ?? 0;
-        double deathTime = death?.MediaTimeSeconds ?? 0;
+        double fullTime = full?.TimelineTimeSeconds ?? 0;
+        double deathTime = death?.TimelineTimeSeconds ?? 0;
         if (branchActive && CurrentClip(fullTime, minimumDuration: 0) is { } fullClip) ActivePrefix.Add(fullClip);
         if (deathReplayBranchActive && CurrentDeathReplayClip(deathTime, minimumDuration: 0) is { } deathClip)
             DeathReplayPrefix.Add(deathClip);

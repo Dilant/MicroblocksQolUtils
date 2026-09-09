@@ -82,6 +82,7 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     }
     public static class MicroblocksQolUtilsModule { public static QolSettings Settings = new(); }
     public static class RecordingDeathRecovery { public static void Load(){} public static void Unload(){} public static void AfterEngineUpdate(){} }
+    public static class RecordingDeathAudio { public static void Load(){} public static void Unload(){} public static void StopRemainder(){} }
     public static class RecordingTransitionAutoSave { public static void Queue(Level l,string room){} public static void Cancel(){} public static void Reset(){} public static void AfterEngineUpdate(){} }
     public static class SpeedrunToolBridge { public static void Load(){} public static void Unload(){} }
     public static class RhythmMapDetector { public static bool IsRhythmSensitive(object map, string room) => false; }
@@ -93,6 +94,9 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static bool FailNextStart;
         public string Path=""; public string AudioPath=>Path+".audio"; public string BgmPath=>Path+".bgm"; public string MusicEventsPath=>Path+".music"; public string CaptureReportPath=>Path+".capture.json";
         public double MediaTimeSeconds; public bool HasAudioTap=>true;
+        public double TimelineTimeSeconds => MediaTimeSeconds;
+        public double TimeAt(ulong timestamp) => MediaTimeSeconds;
+        public double FrameTimeAt(ulong timestamp, bool roundUp) => MediaTimeSeconds;
         public (ulong AudioFramesCaptured, ulong AudioChunksDropped) Statistics => (0,0);
         public bool Stopped;
         public static NativeRoomRecording? Start(string path) {

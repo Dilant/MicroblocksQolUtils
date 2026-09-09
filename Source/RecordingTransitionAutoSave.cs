@@ -29,6 +29,7 @@ internal static class RecordingTransitionAutoSave {
     }
 
     internal static void Cancel() {
+        RecordingSavePause.Cancel();
         pendingLevel = null;
         pendingSession = null;
         pendingRoom = "";
@@ -40,6 +41,10 @@ internal static class RecordingTransitionAutoSave {
     }
 
     internal static void AfterEngineUpdate() {
+        if (RecordingSavePause.Active) {
+            RecordingSavePause.Update();
+            return;
+        }
         if (!Enabled || Engine.Scene is not Level) {
             Reset();
             SpeedrunToolRecoverySlot.Release();
@@ -65,10 +70,19 @@ internal static class RecordingTransitionAutoSave {
 
         // Deep-cloning may mutate EntityList. Never call SL from QolHud.Update or
         // inside the transition coroutine; wait until the entire scene update ends.
-        RecoveryResult result = SpeedrunToolAutoSave.TrySave();
-        if (result == RecoveryResult.Success)
-            anchor = new(level, level.Session.Area, level.Session.Level, level.Session.RespawnPoint, AutoRecorder.CurrentPath);
-        if (result != RecoveryResult.Busy) Cancel();
+        if (!SpeedrunToolAutoSave.CanUse) { Cancel(); return; }
+        if (!SpeedrunToolAutoSave.ReadyToSave) return;
+        RecordingSavePause.Begin(level, result => {
+            if (result == RecoveryResult.Success)
+                anchor = new(level, level.Session.Area, level.Session.Level, level.Session.RespawnPoint, AutoRecorder.CurrentPath);
+            // Don't cancel the pause: its clean-frame presentation gate still owns
+            // the resume. A busy user SL can be retried once gameplay runs again.
+            if (result != RecoveryResult.Busy) {
+                pendingLevel = null;
+                pendingSession = null;
+                pendingRoom = "";
+            }
+        });
     }
 
     private sealed record RecoveryAnchor(Level Level, AreaKey Area, string Room, Vector2? Respawn, string RecordingPath);

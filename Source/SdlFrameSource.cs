@@ -119,8 +119,10 @@ internal static class SdlFrameSource {
                 if (enabled) {
                     SDL_GL_GetDrawableSize(value, out int width, out int height);
                     if (width > 0 && height > 0) {
+                        ulong timestamp = ClockNanos();
+                        RecordingSavePause.Presented(timestamp);
                         int status = Frame(resolver, SDL_GL_GetCurrentContext(), (uint)width, (uint)height,
-                            ClockNanos(), (ulong)Interlocked.Increment(ref sequence));
+                            timestamp, (ulong)Interlocked.Increment(ref sequence));
                         if (status != 0) failure = NativeCaptureBridge.LastError();
                     }
                 }
@@ -146,8 +148,10 @@ internal static class SdlFrameSource {
                 WmInfo info = new() { Major = 2, Minor = 0, Patch = 0 };
                 if (window != 0 && SDL_GetWindowWMInfo(window, ref info) != 0 && info.Subsystem == 1) {
                     if (trace) Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Capture", $"DXGI HWND={info.Handle:X}");
+                    ulong timestamp = ClockNanos();
+                    RecordingSavePause.Presented(timestamp);
                     int status = D3dFrame(chain, info.Handle, CaptureSource.WantsPixels && failure is null ? 1u : 0u,
-                        ClockNanos(), (ulong)Interlocked.Increment(ref sequence));
+                        timestamp, (ulong)Interlocked.Increment(ref sequence));
                     if (status == 1) { Backend = "D3D11"; Volatile.Write(ref lastPresentAt, Environment.TickCount64); }
                     else if (status < 0) failure = NativeCaptureBridge.LastError();
                     if (trace) Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Capture", $"DXGI readback status={status}");

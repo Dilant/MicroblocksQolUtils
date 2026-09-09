@@ -114,7 +114,7 @@ internal static class SpeedrunToolAutoSave {
     private static PropertyInfo RequiredProperty(Type type, string name, BindingFlags flags) =>
         type.GetProperty(name, flags) ?? throw new MissingMemberException(type.FullName, name);
 
-    internal static RecoveryResult TrySave() => Run(loadState: false, preserveMarks: false);
+    internal static RecoveryResult TrySave(bool deferPreClone = false) => Run(loadState: false, preserveMarks: false, deferPreClone);
     internal static RecoveryResult TryLoad(Level level) => Run(loadState: true,
         preserveMarks: level.Session.GetFlag("SpeedrunTool_SavedSate"));
 
@@ -126,7 +126,16 @@ internal static class SpeedrunToolAutoSave {
         }
     }
 
-    private static RecoveryResult Run(bool loadState, bool preserveMarks) {
+    internal static bool ReadyToSave {
+        get {
+            if (!CanUse || SpeedrunToolRecoverySlot.Completing) return false;
+            object? manager = managerInstance!.GetValue(null);
+            return manager is not null && savedByTas!.GetValue(manager) is not true
+                && allFree!() && managerState!.GetValue(manager)?.ToString() == "None";
+        }
+    }
+
+    private static RecoveryResult Run(bool loadState, bool preserveMarks, bool deferPreClone = false) {
         if (!Available) return RecoveryResult.Unavailable;
         try {
             if (!CanUse) return RecoveryResult.Unavailable;
@@ -142,7 +151,7 @@ internal static class SpeedrunToolAutoSave {
                 if ((loadState ? load : save)!.Invoke(ownedManager, arguments) is true) return RecoveryResult.Success;
                 Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool", $"Recording recovery skipped: {arguments[1]}");
                 return RecoveryResult.Failed;
-            }, create: !loadState);
+            }, create: !loadState, deferPreClone);
         } catch (Exception exception) {
             Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool", $"Recording recovery failed: {exception.GetBaseException().Message}");
             return RecoveryResult.Failed;

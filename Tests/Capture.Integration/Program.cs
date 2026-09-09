@@ -61,6 +61,9 @@ Fmod(studio.getEvent("event:/music/menu/level_select", out var musicDescription)
 Fmod(musicDescription.createInstance(out var song));
 typeof(Celeste.Audio).GetField("currentMusicEvent",BindingFlags.Static|BindingFlags.NonPublic)!.SetValue(null,song);
 Fmod(song.start());
+RecordingDeathAudio.Load();
+Fmod(studio.getEvent("event:/char/madeline/death", out var deathDescription));
+Fmod(deathDescription.createInstance(out var deathSound));
 using var observer=CaptureSource.Subscribe(frame=> {
     if(frame.Sequence<=lastSequence) Interlocked.Increment(ref badPixels);
     lastSequence=frame.Sequence;
@@ -84,8 +87,26 @@ for(int i=0;i<240;i++) {
     Fmod(song.setParameterValue("fade", i >= 150 && i < 155 ? 0.5f : 1f));
     if(i%30==0) {Fmod(description.createInstance(out var sound));Fmod(sound.start());Fmod(sound.release()); Fmod(jumpDescription.createInstance(out var jump));Fmod(jump.start());Fmod(jump.release());}
     if(i==60) second=NativeCaptureBridge.StartRecording(60,Path.Combine(output,"second.mkv"),encoder,1000);
-    if(i==80) Fmod(song.setPaused(true));
-    if(i==90) Fmod(song.setPaused(false));
+    if(i==70) { Fmod(deathSound.start()); Fmod(studio.flushCommands()); }
+    if(i==75) {
+        RecordingDeathAudio.StopRemainder();
+        Fmod(deathSound.getPlaybackState(out var deathState));
+        Check(deathState == FMOD.Studio.PLAYBACK_STATE.STOPPED, "real death one-shot survived retained-attempt cleanup");
+        Fmod(song.getPlaybackState(out var songState));
+        Check(songState != FMOD.Studio.PLAYBACK_STATE.STOPPED, "death tail cleanup stopped BGM");
+    }
+    if(i==80) {
+        RecordingPauseAudio.Pause();
+        Fmod(studio.flushCommands());
+        Fmod(song.getPaused(out bool paused));
+        Check(paused && Celeste.Audio.BusPaused("bus:/gameplay_sfx"), "save wait did not pause real gameplay audio/music");
+    }
+    if(i==90) {
+        RecordingPauseAudio.Resume();
+        Fmod(studio.flushCommands());
+        Fmod(song.getPaused(out bool paused));
+        Check(!paused && !Celeste.Audio.BusPaused("bus:/gameplay_sfx"), "save wait leaked an audio pause");
+    }
     if(i==100) Fmod(song.setTimelinePosition(500));
     if(i==160) { Fmod(song.stop(FMOD.Studio.STOP_MODE.IMMEDIATE)); Fmod(song.start()); }
     if(i==120) {Parallel.Invoke(first.Dispose, first.Dispose); before=second!.Statistics.FramesCaptured; Sdl.SetWindowSize(window,192,108);}
@@ -96,6 +117,7 @@ for(int i=0;i<240;i++) {
     Sdl.Swap(window);Thread.Sleep(16);
 }
 second!.Dispose(); first.Dispose();
+RecordingDeathAudio.Unload(); Fmod(deathSound.release());
 observer.Dispose();observer.Completion.GetAwaiter().GetResult();
 slow.Dispose();slow.Completion.GetAwaiter().GetResult();
 CaptureSource.Update();
@@ -181,6 +203,8 @@ internal static class Sdl {
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] internal delegate void Scissor(int x,int y,int w,int h);
 }
 namespace Celeste.Mod.MicroblocksQolUtils {
+    internal static class RecordingSavePause { internal static void Presented(ulong time) { } }
+    internal static class AutoRecorder { internal static bool IsRecording => true; }
     internal enum LogLevel {Info,Warn,Error}
     internal static class Logger {
         internal static void Log(LogLevel level,string tag,string text)=>Console.WriteLine($"{level} {tag}: {text}");

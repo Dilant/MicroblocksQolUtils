@@ -18,6 +18,9 @@ internal static class SpeedrunToolRecoverySlot {
     private static Func<string, bool>? switchSlot;
     private static Hook? clearAllHook;
     private static object? ownedSlot;
+    private static Action? finishPending;
+    private static Task? pendingClone;
+    internal static bool Completing => finishPending is not null;
 
     private static IDictionary Slots => (IDictionary)dictionary!.GetValue(null)!;
     internal static bool HasState => ownedSlot is not null && ReferenceEquals(Slots[Name], ownedSlot)
@@ -41,7 +44,8 @@ internal static class SpeedrunToolRecoverySlot {
         clearAllHook = new Hook(slots.GetMethod("ClearAll", Static, [])!, (Action<Action>)ClearUserSlots);
     }
 
-    internal static RecoveryResult Run(Func<object, RecoveryResult> operation, bool create) {
+    internal static RecoveryResult Run(Func<object, RecoveryResult> operation, bool create, bool deferPreClone = false) {
+        if (Completing) return RecoveryResult.Busy;
         if (currentSlot is null || (!create && !HasState)) return RecoveryResult.Unavailable;
         object? previousSlot = currentSlot.GetValue(null);
         object? previousName = currentName!.GetValue(null);
@@ -49,23 +53,52 @@ internal static class SpeedrunToolRecoverySlot {
         if (!switchSlot!(Name)) return RecoveryResult.Busy;
         ownedSlot = currentSlot.GetValue(null)!;
         object manager = slotManager!.GetValue(ownedSlot)!;
+        bool deferred = false;
         try {
-            return operation(manager);
+            RecoveryResult result = operation(manager);
+            if (deferPreClone && result == RecoveryResult.Success) {
+                pendingClone = preClone!.GetValue(manager) as Task;
+                finishPending = Finish;
+                deferred = true;
+            }
+            return result;
         } finally {
+            if (!deferred) Finish();
+        }
+
+        void Finish() {
             // Pre-cloning reads StateManager.Instance on its worker. It MUST finish
             // before restoring the user's selection, even on an exception.
             try {
                 (preClone!.GetValue(manager) as Task)?.GetAwaiter().GetResult();
+            } catch {
+                // SRT waits this task again when switching/clearing slots. A
+                // faulted task must not poison every subsequent user SL action.
+                preClone!.SetValue(manager, null);
+                clear!.Invoke(manager, [false]);
+                throw;
             } finally {
                 try {
                     if (state!.GetValue(manager)?.ToString() is "Saving" or "Loading")
                         clear!.Invoke(manager, [false]);
                 } finally {
-                    currentSlot.SetValue(null, previousSlot);
-                    currentName.SetValue(null, previousName);
+                    currentSlot!.SetValue(null, previousSlot);
+                    currentName!.SetValue(null, previousName);
                 }
             }
         }
+    }
+
+    // The game/input update stays paused while the worker owns StateManager.Instance.
+    // Never move the scene clone itself off the game thread.
+    internal static RecoveryResult CompletePending(bool wait = false) {
+        if (finishPending is not { } finish) return RecoveryResult.Success;
+        if (!wait && pendingClone is { IsCompleted: false }) return RecoveryResult.Busy;
+        try { finish(); return RecoveryResult.Success; }
+        catch (Exception exception) {
+            Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool", $"Recovery pre-clone failed: {exception.GetBaseException().Message}");
+            return RecoveryResult.Failed;
+        } finally { finishPending = null; pendingClone = null; }
     }
 
     private static void ClearUserSlots(Action orig) {
@@ -78,6 +111,7 @@ internal static class SpeedrunToolRecoverySlot {
     }
 
     internal static bool Release() {
+        CompletePending(wait: true);
         if (ownedSlot is null) return true;
         if (!ReferenceEquals(Slots[Name], ownedSlot)) { ownedSlot = null; return true; }
         // The state may have been cleared by scene switching, but still owns a slot.

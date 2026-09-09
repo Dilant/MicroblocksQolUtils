@@ -9,6 +9,8 @@
     <Compile Include="../../Source/SpeedrunToolRecoverySlot.cs" Link="SpeedrunToolRecoverySlot.cs" />
     <Compile Include="../../Source/RecordingDeathRecovery.cs" Link="RecordingDeathRecovery.cs" />
     <Compile Include="../../Source/RecordingTransitionAutoSave.cs" Link="RecordingTransitionAutoSave.cs" />
+    <Compile Include="../../Source/RecordingSavePause.cs" Link="RecordingSavePause.cs" />
+    <Compile Include="../../Source/RecordingDeathAudio.cs" Link="RecordingDeathAudio.cs" />
     <Compile Include="../../Source/SpeedrunToolBridge.cs" Link="SpeedrunToolBridge.cs" />
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs" />
     <Reference Include="Mono.Cecil"><HintPath>$(CelesteRoot)/Mono.Cecil.dll</HintPath></Reference>

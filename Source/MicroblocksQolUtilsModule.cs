@@ -80,7 +80,9 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         MaterialTextInputFocus.BeginFrame();
         FrameProfiler.BeginUpdate();
         try {
-            orig(self, gameTime);
+            // Freeze simulation AND input/SL hotkeys, but keep rendering, audio
+            // capture and the main-thread save coordinator alive.
+            if (RecordingSavePause.BeforeEngineUpdate(ref gameTime)) orig(self, gameTime);
             CaptureSource.Update();
             NativeCaptureSmoke.Update();
             AutoRecorder.AfterEngineUpdate();

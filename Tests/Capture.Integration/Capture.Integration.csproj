@@ -16,5 +16,7 @@
     <Compile Include="../../Source/SdlFrameSource.cs" Link="SdlFrameSource.cs"/>
     <Compile Include="../../Source/NativeCaptureBridge.cs" Link="NativeCaptureBridge.cs"/>
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs"/>
+    <Compile Include="../../Source/RecordingDeathAudio.cs" Link="RecordingDeathAudio.cs"/>
+    <Compile Include="../../Source/RecordingPauseAudio.cs" Link="RecordingPauseAudio.cs"/>
   </ItemGroup>
 </Project>

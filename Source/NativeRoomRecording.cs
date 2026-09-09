@@ -47,6 +47,17 @@ internal sealed class NativeRoomRecording {
         }
     }
 
+    internal double TimelineTimeSeconds => capture.TimelineTimeSeconds ?? MediaTimeSeconds;
+    internal double TimeAt(ulong timestamp) => capture.TimeAt(timestamp) ?? MediaTimeSeconds;
+    internal double FrameTimeAt(ulong timestamp, bool roundUp) {
+        double time = TimeAt(timestamp);
+        if (targetFrameRate <= 0) return time;
+        // Encoder PTS are quantized to frame ticks. An indicator presented just
+        // after a tick may round backwards; never retain that UI as the last frame.
+        double ticks = time * targetFrameRate;
+        return (roundUp ? Math.Ceiling(ticks) : Math.Floor(ticks)) / targetFrameRate;
+    }
+
     public static NativeRoomRecording? Start(string output) {
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
         try {

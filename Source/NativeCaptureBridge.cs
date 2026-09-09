@@ -282,6 +282,13 @@ public sealed class NativeCaptureSession : IDisposable {
     private readonly Queue<CaptureAudio> preroll = new(32);
     private bool videoStarted;
     private ulong origin;
+    // Publish only after the first frame is accepted. Delivery stats lag the
+    // game thread by GPU readback + subscriber queues and are not an edit clock.
+    internal double? TimeAt(ulong timestamp) {
+        ulong start = Volatile.Read(ref origin);
+        return start == 0 ? null : timestamp <= start ? 0 : (timestamp - start) / 1_000_000_000d;
+    }
+    internal double? TimelineTimeSeconds => Volatile.Read(ref origin) == 0 ? null : TimeAt(SdlFrameSource.ClockNanos());
     private readonly MusicJournal? musicJournal;
     private int stopped;
     internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath, uint fps) {
@@ -323,7 +330,7 @@ public sealed class NativeCaptureSession : IDisposable {
         }
         if (!videoStarted) {
             videoStarted = true;
-            origin = frame.TimestampNanos;
+            Volatile.Write(ref origin, frame.TimestampNanos);
             musicJournal?.Start(origin);
             // PBO delivery is late: retain eligible PCM while waiting, but discard pre-video PCM.
             while (preroll.TryDequeue(out var chunk))

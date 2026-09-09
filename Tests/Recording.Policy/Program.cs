@@ -89,6 +89,31 @@ Check(saved.Clips.Select(c => c.BgmFollowsVideo).SequenceEqual([false, true, fal
 SetField(full, "lastMediaTime", 6.01d); session.Level = normal.Name; Call("ObserveRoom", level);
 Check(Math.Abs(State<List<RecordingClip>>("ActivePrefix").Last().DurationSeconds - .01) < 1e-9,
     "metadata-only room split dropped a short room");
+// Save waits are explicit holes in BOTH timelines, not freeze-frame heuristics.
+SetField(full, "lastMediaTime", 7d); SetField(death, "lastMediaTime", 7d);
+Call("SuspendForInternalSave", 100UL);
+Check(!State<bool>("branchActive") && !State<bool>("deathReplayBranchActive"), "save pause left a sink recording UI");
+var pausedSnapshot = AutoRecorder.CaptureTimeline(level);
+Check(pausedSnapshot is not null && pausedSnapshot.Clips.Last().StartSeconds + pausedSnapshot.Clips.Last().DurationSeconds == 7d,
+    "internal save lost its closed timeline snapshot");
+SetField(full, "lastMediaTime", 12d); SetField(death, "lastMediaTime", 12d);
+Check(AutoRecorder.CaptureTimeline(level)!.Clips.SequenceEqual(pausedSnapshot!.Clips), "saving wait grew the saved prefix");
+Call("ResumeAfterInternalSave", 200UL);
+Check(State<double>("branchStartSeconds") == 12d && State<double>("deathReplayBranchStartSeconds") == 12d
+    && State<bool>("branchSeamlessFromPrevious") && State<bool>("deathReplayBranchSeamlessFromPrevious"),
+    "resume used an old boundary or created a dissolve at the save seam");
+var clockCapture = Bare<NativeCaptureSession>();
+SetField(clockCapture, "origin", 1_000_000_000UL);
+var timeAt = typeof(NativeCaptureSession).GetMethod("TimeAt", BindingFlags.Instance | BindingFlags.NonPublic)!;
+Check((double)timeAt.Invoke(clockCapture, [9_000_000_000UL])! == 8d
+    && (double)timeAt.Invoke(clockCapture, [500_000_000UL])! == 0d,
+    "event clock used stale delivered frame statistics or underflowed before origin");
+SetField(full, "targetFrameRate", 60);
+SetField(full, "lastMediaTime", 12.001d);
+var frameTime = full.GetType().GetMethod("FrameTimeAt", BindingFlags.Instance | BindingFlags.NonPublic)!;
+Check((double)frameTime.Invoke(full, [0UL, false])! == 12d
+    && Math.Abs((double)frameTime.Invoke(full, [0UL, true])! - (12d + 1d / 60)) < 1e-9,
+    "encoder PTS rounding can leak an indicator frame into a retained clip");
 SetState("current", null); SetState("deathReplayCurrent", null);
 Call("ResetTimelineState");
 

@@ -2,7 +2,16 @@ using System.Runtime.CompilerServices;
 using Celeste.Mod.MicroblocksQolUtils;
 using MonoMod.RuntimeDetour;
 
-namespace Microsoft.Xna.Framework { public readonly record struct Vector2(float X, float Y); }
+namespace Microsoft.Xna.Framework {
+    public readonly record struct Vector2(float X, float Y);
+    public class GameTime {
+        public TimeSpan ElapsedGameTime { get; set; }
+        public TimeSpan TotalGameTime { get; set; }
+        public bool IsRunningSlowly { get; set; }
+        public GameTime() { }
+        public GameTime(TimeSpan total, TimeSpan elapsed, bool slow) { TotalGameTime = total; ElapsedGameTime = elapsed; IsRunningSlowly = slow; }
+    }
+}
 namespace Monocle {
     public class Scene;
     public class Entity {
@@ -15,6 +24,10 @@ namespace Monocle {
     public static class Engine { public static Scene? Scene; public static float FreezeTimer; }
 }
 namespace Celeste {
+    public static class Audio {
+        public static FMOD.Studio.System System = new();
+        public static string GetEventName(FMOD.Studio.EventInstance instance) => instance.Path;
+    }
     public readonly record struct AreaKey(int ID, int Mode = 0);
     public class Session {
         public string Level = "next";
@@ -82,7 +95,16 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public class QolSettings { public bool Enabled = true, RecordingAutoSaveOnTransition = true; }
     public static class MicroblocksQolUtilsModule { public static QolSettings Settings = new(); }
     public static class InstantDeaths { public static void Reset() { } }
+    public static class RecordingPauseAudio {
+        public static bool Paused;
+        public static void Pause() => Paused = true;
+        public static void Resume() => Paused = false;
+    }
     public static class AutoRecorder {
+        public static int Suspends, Resumes;
+        public static void SuspendForInternalSave(ulong time) => Suspends++;
+        public static void ResumeAfterInternalSave(ulong time) => Resumes++;
+        public static void CancelInternalSave() { }
         public static bool IsRecording = true, CanSaveTransitionTimeline = true;
         public static string CurrentPath = "run.mkv";
         public static RecordingTimelineSnapshot Timeline = new([new("run.mkv", 0, 12, "music", 0)],
@@ -171,12 +193,35 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         [MethodImpl(MethodImplOptions.NoInlining)]
         private void PreCloneSavedEntities() {
             Clones++;
-            preCloneTask = Task.Run(async () => { await Task.Delay(2); PreCloneObservedSlot = SaveSlotsManager.SlotName; });
+            preCloneTask = Task.Run(async () => {
+                if (CloneGate is { } gate) await gate.Task;
+                await Task.Delay(2);
+                PreCloneObservedSlot = SaveSlotsManager.SlotName;
+                if (FailClone) throw new Exception("expected clone failure");
+            });
         }
+        public static TaskCompletionSource? CloneGate;
+        public static bool FailClone;
         private void LoadStateComplete(Level level) => State = State.None;
         public bool ClearStateImpl(bool gc) {
             preCloneTask?.Wait(); IsSaved = false; savedSession = null; Values.Clear(); State = State.None; return true;
         }
+    }
+}
+namespace FMOD {
+    public enum RESULT { OK }
+}
+namespace FMOD.Studio {
+    public enum STOP_MODE { IMMEDIATE }
+    public sealed class System { public int Flushes; public void flushCommands() => Flushes++; }
+    public class EventInstance(string path) {
+        public string Path = path;
+        public bool Valid = true;
+        public int Stops;
+        public bool isValid() => Valid;
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public FMOD.RESULT start() => FMOD.RESULT.OK;
+        public void stop(STOP_MODE mode) => Stops++;
     }
 }
 namespace Celeste.Mod.SpeedrunTool.SaveLoad.Utils {

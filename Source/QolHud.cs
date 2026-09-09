@@ -29,6 +29,12 @@ public sealed class QolHud : Entity {
 
         float miniMapBottom = Scene is Level level ? MiniMapRenderer.Render(level) : 0f;
         RecordingHudRenderer.Render(miniMapBottom);
+        if (RecordingSavePause.ShowIndicator) {
+            string dots = new('.', 1 + (int)(Environment.TickCount64 / 160 % 3));
+            Vector2 center = new(960, 960);
+            Draw.Rect(730, 918, 460, 86, Color.Black * 0.8f);
+            SystemTtfFont.Draw("正在保存" + dots, center, new Vector2(0.5f), 0.65f, Color.White, 0f, Color.Black);
+        }
         RenderProfilerStatus();
 
         if (settings.ShowFps) {

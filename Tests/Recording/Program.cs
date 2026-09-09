@@ -28,7 +28,17 @@ Level Reset() {
     SaveData.Instance = new();
     Level level = new(); Engine.Scene = level; return level;
 }
-void Tick() { RecordingDeathRecovery.AfterEngineUpdate(); RecordingTransitionAutoSave.AfterEngineUpdate(); }
+void Tick() {
+    RecordingDeathRecovery.AfterEngineUpdate(); RecordingTransitionAutoSave.AfterEngineUpdate();
+    long deadline = Environment.TickCount64 + 5000;
+    while (RecordingSavePause.Active) {
+        if (Environment.TickCount64 > deadline) throw new Exception("save pause did not finish");
+        RecordingSavePause.Presented(123);
+        if (!RecordingSavePause.Active) break;
+        RecordingTransitionAutoSave.AfterEngineUpdate();
+        Thread.Sleep(1);
+    }
+}
 void Queue(Level level) => RecordingTransitionAutoSave.Queue(level, level.Session.Level);
 void SaveHere(Level level) { Queue(level); Tick(); Check(RecordingTransitionAutoSave.CanRecover(level), "recovery anchor not saved"); }
 PlayerDeadBody Die(Level level) {
@@ -37,6 +47,65 @@ PlayerDeadBody Die(Level level) {
 }
 
 Level level = Reset();
+// A real presentation must precede cloning. The worker owns the private slot
+// across frames, and two clean presentations must precede simulation resume.
+StateManager.CloneGate = new();
+var originalSlot = SaveSlotsManager.Slot;
+var normalStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(1d / 60) };
+Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "idle gate blocked gameplay");
+Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(RecordingSavePause.Active && RecordingSavePause.ShowIndicator && RecordingPauseAudio.Paused,
+    "save did not pause before presenting its indicator");
+RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(!SpeedrunToolAutoSave.HasState, "save ran before any indicator presentation");
+int suspends = AutoRecorder.Suspends, resumes = AutoRecorder.Resumes;
+RecordingSavePause.Presented(100);
+RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(AutoRecorder.Suspends == suspends + 1 && SpeedrunToolRecoverySlot.Completing
+    && SaveSlotsManager.SlotName == SpeedrunToolRecoverySlot.Name, "pre-clone lost its private slot lease");
+Check(!RecordingTransitionAutoSave.CanRecover(level), "unfinished clone was published as a recovery point");
+RecordingSavePause.Presented(200); RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(RecordingSavePause.ShowIndicator && AutoRecorder.Resumes == resumes, "worker wait leaked into gameplay");
+double position = 100d;
+for (int i = 0; i < 200; i++) {
+    var elapsed = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
+    if (RecordingSavePause.BeforeEngineUpdate(ref elapsed)) position += 200;
+}
+Check(position == 100d, "physics advanced from A to B during saving/catch-up updates");
+StateManager.CloneGate.SetResult(); StateManager.CloneGate = null;
+while (SpeedrunToolRecoverySlot.Completing) { Thread.Sleep(1); RecordingTransitionAutoSave.AfterEngineUpdate(); }
+Check(ReferenceEquals(SaveSlotsManager.Slot, originalSlot) && !RecordingPauseAudio.Paused
+    && RecordingSavePause.Active && !RecordingSavePause.ShowIndicator, "clone did not restore audio/selection before clean frame");
+RecordingSavePause.Presented(300);
+Check(RecordingSavePause.Active, "resumed before clean presentation guard");
+RecordingSavePause.Presented(400);
+Check(!RecordingSavePause.Active && AutoRecorder.Resumes == resumes + 1, "clean frame failed to resume exactly once");
+var delayedStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
+Check(RecordingSavePause.BeforeEngineUpdate(ref delayedStep) && delayedStep.ElapsedGameTime == normalStep.ElapsedGameTime,
+    "save wall-time became a giant physics step on resume");
+level = Reset();
+StateManager.FailClone = true; Queue(level); Tick(); StateManager.FailClone = false;
+Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused && !RecordingTransitionAutoSave.CanRecover(level)
+    && SaveSlotsManager.SlotName == "user", "failed background clone leaked pause/slot/anchor");
+level = Reset(); Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate();
+RecordingTransitionAutoSave.Reset();
+Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "cancel leaked saving pause");
+
+RecordingDeathAudio.Load();
+var predeath = new FMOD.Studio.EventInstance("event:/char/madeline/predeath");
+var deathSound = new FMOD.Studio.EventInstance("event:/char/madeline/death");
+var goldenSound = new FMOD.Studio.EventInstance("event:/new_content/char/madeline/death_golden");
+var dashSound = new FMOD.Studio.EventInstance("event:/char/madeline/dash_red_left");
+predeath.start(); deathSound.start(); goldenSound.start(); dashSound.start();
+Check(predeath.Stops == 0 && deathSound.Stops == 0, "death audio suppressed before a retained attempt resumes");
+RecordingDeathAudio.StopRemainder();
+Check(predeath.Stops == 1 && deathSound.Stops == 1 && goldenSound.Stops == 0 && dashSound.Stops == 0
+    && Audio.System.Flushes == 1, "death tail cleanup affected unrelated audio or did not flush stops");
+RecordingDeathAudio.StopRemainder();
+Check(deathSound.Stops == 1, "stale death audio was stopped twice");
+RecordingDeathAudio.Unload();
+
+level = Reset();
 StateManager user = StateManager.Instance;
 level.Transitioning = true; Queue(level); Tick();
 Check(!SpeedrunToolAutoSave.HasState, "saved during transition");
