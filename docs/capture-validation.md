@@ -103,6 +103,30 @@ UI smoke 现在有自己的 `MICROBLOCKS_QOL_MATERIAL_UI_SMOKE` 开关，不再�
 
 ## 复现测试
 
+### 2026-09-09：BGM 例外缩小到对应 room（ABI 7）
+
+用户导出的第一章视频 sidecar 中 `reconstructBgm=false`，设置却为 `SfxOnlyWithPostMix`；
+日志显示整张地图被判为 rhythm-sensitive。原因是地图内任意磁带房会关闭全章重构，
+不是这次导出缺少 PCM 块。现在模式仍按用户设置，例外保存为每个片段的 `BgmFollowsVideo` / `RoomName`。
+
+本轮验证：
+- Rust **47/47**：包含真实 D3D11 staging / DXGI hook 测试、FFmpeg 编码/解码及新增房间策略测试。
+  7 段音频采样测试覆盖普通→敏感→普通、敏感房内多次剪切、离开后的连续 metadata 切分；
+  经生产 `build_audio_track` 同时验证 SFX 裁切、BGM 游标、显式现场混音模式，逐样本误差 < `1e-6`。
+  敏感段不被静态外部音乐替换；JSON/去冻结帧切分保留策略。
+- `Tests/Recording.Policy` 使用实际编译的 AutoRecorder 和 Celeste 类型（不是复制策略）：
+  同地图普通房不受 cassette/音乐同步 trigger 房影响，两条 sink 分支切分、恢复快照、极短房间、
+  死亡回放裁尾及旧 timeline 默认值均通过。时钟由无 native handle 的测试对象固定，不改用户存档。
+- 原有 managed Capture 回归通过。
+- 实际 SDL OpenGL + FMOD 集成：**238** 像素 callback、**419** 非静音 PCM callback，像素/顺序错误 **0**。
+  两个 sink 编码队列分别消耗 **63/178** 帧、丢弃均 **0**；慢订阅者是故意制造的负向测试。
+  新 `room-bgm.mp4` 与普通混音/连续 BGM 输出均可被 FFmpeg 完整解码，房间策略视频 0.900s、AAC 0.917s。
+  集成测试末尾的 unsupported-renderer 日志是非 GL 窗口拒绝测试的预期结果。
+
+证据在 `.work/bgm-continuity/.work/`：`rust-tests.log`、`room-policy.log`、`managed-tests.log`、
+`integration.log`、`integration/room-bgm.mp4`。未把此轮自动化验证称为用户实际通关后的听感确认。
+旧用户 MP4 对应原始 MKV/独立音轨已被成功导出清理；本修复不会凭空修复已混合的旧文件，需重新录制。
+
 设置本机 `CELESTE_ROOT`、`FFMPEG_DIR`、`LIBCLANG_PATH`、Rust/.NET PATH，TEMP/TMP 指到 `.work`：
 
 ```powershell
@@ -110,6 +134,7 @@ $env:MQOL_TEST_FFMPEG = '1'
 $env:MQOL_TEST_D3D11 = '1'
 cargo test -p microblocks-qol-native --features ffmpeg --lib -- --test-threads=1
 dotnet run --project Tests/Capture/Capture.csproj -c Release
+dotnet run --project Tests/Recording.Policy/Recording.Policy.csproj -c Release
 # 集成测试另外设置 MQOL_NATIVE_PATH 到 release DLL，MQOL_TEST_OUTPUT 到 .work 目录
 # 并确保 SDL/FMOD/FFmpeg DLL 可加载。
 dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Release

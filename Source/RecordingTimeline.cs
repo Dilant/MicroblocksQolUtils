@@ -6,8 +6,20 @@ public sealed record RecordingClip(
     double DurationSeconds,
     string MusicEvent,
     int MusicTimelineMilliseconds,
-    bool SeamlessFromPrevious = false
-);
+    bool SeamlessFromPrevious = false,
+    bool BgmFollowsVideo = false,
+    string RoomName = ""
+) {
+    public RecordingClip RetainTail(double durationSeconds) {
+        double duration = Math.Clamp(durationSeconds, 0, DurationSeconds);
+        double offset = DurationSeconds - duration;
+        return this with {
+            StartSeconds = StartSeconds + offset,
+            DurationSeconds = duration,
+            MusicTimelineMilliseconds = MusicTimelineMilliseconds + (int)Math.Round(offset * 1_000d)
+        };
+    }
+}
 
 public sealed record RecordingTimelineSnapshot(
     IReadOnlyList<RecordingClip> Clips,

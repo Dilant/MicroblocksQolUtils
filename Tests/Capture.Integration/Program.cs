@@ -106,6 +106,11 @@ NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(outpu
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,0.4,"",0),
     new RecordingClip(Path.Combine(output,"first.mkv"),0.8,0.4,"",0)],
     Path.Combine(output,"continuous-bgm.mp4"),encoder,1000,30,true,false,"").GetAwaiter().GetResult();
+NativeCaptureBridge.FinalizeRecordingAsync([
+    new RecordingClip(Path.Combine(output,"first.mkv"),0,0.3,"",0,true,false,"normal"),
+    new RecordingClip(Path.Combine(output,"first.mkv"),0.5,0.3,"",0,true,true,"cassette"),
+    new RecordingClip(Path.Combine(output,"first.mkv"),1.0,0.3,"",0,true,false,"normal")],
+    Path.Combine(output,"room-bgm.mp4"),encoder,1000,30,true,false,"").GetAwaiter().GetResult();
 // Unhook and hook again while context remains alive (mod reload).
 CaptureSource.Unload(); CaptureSource.Load();
 using(var probe=NativeCaptureBridge.Start(60)) {
@@ -158,5 +163,4 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         internal static void Log(LogLevel level,string tag,string text)=>Console.WriteLine($"{level} {tag}: {text}");
         internal static void LogDetailed(Exception e,string tag)=>Console.WriteLine($"{tag}: {e}");
     }
-    public sealed record RecordingClip(string Source,double StartSeconds,double DurationSeconds,string MusicEvent,int MusicTimelineMilliseconds,bool SeamlessFromPrevious=false);
 }

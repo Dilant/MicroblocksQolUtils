@@ -54,6 +54,9 @@ pub struct FinalizeClip {
     pub music_timeline_milliseconds: i64,
     #[serde(default)]
     pub seamless_from_previous: bool,
+    /// This room needs the original music/video phase, not a continuous post-edit cursor.
+    #[serde(default)]
+    pub bgm_follows_video: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -442,12 +445,18 @@ fn remove_freeze_segments(clips: &[FinalizeClip], freezes: &[FreezeSegment]) -> 
             if start > cursor {
                 let duration = start - cursor;
                 result.push(FinalizeClip {
+                    bgm_follows_video: clip.bgm_follows_video,
                     source: clip.source.clone(),
                     start_seconds: cursor,
                     duration_seconds: duration,
                     music_event: clip.music_event.clone(),
                     music_timeline_milliseconds: clip.music_timeline_milliseconds
-                        + (retained * 1_000.0).round() as i64,
+                        + (if clip.bgm_follows_video {
+                            cursor - clip.start_seconds
+                        } else {
+                            retained
+                        } * 1_000.0)
+                            .round() as i64,
                     seamless_from_previous: if first_piece {
                         clip.seamless_from_previous
                     } else {
@@ -462,12 +471,18 @@ fn remove_freeze_segments(clips: &[FinalizeClip], freezes: &[FreezeSegment]) -> 
         if cursor < clip_end {
             let duration = clip_end - cursor;
             result.push(FinalizeClip {
+                bgm_follows_video: clip.bgm_follows_video,
                 source: clip.source.clone(),
                 start_seconds: cursor,
                 duration_seconds: duration,
                 music_event: clip.music_event.clone(),
                 music_timeline_milliseconds: clip.music_timeline_milliseconds
-                    + (retained * 1_000.0).round() as i64,
+                    + (if clip.bgm_follows_video {
+                        cursor - clip.start_seconds
+                    } else {
+                        retained
+                    } * 1_000.0)
+                        .round() as i64,
                 seamless_from_previous: if first_piece {
                     clip.seamless_from_previous
                 } else {
@@ -876,6 +891,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -884,6 +900,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let mut selection = TimelineSelection::new(&clips);
@@ -927,6 +944,7 @@ mod tests {
                 music_event: "event:/music/a".to_owned(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -935,6 +953,7 @@ mod tests {
                 music_event: "event:/music/a".to_owned(),
                 music_timeline_milliseconds: 1_000,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
         ];
         let layout = timeline_layout(&clips);
@@ -952,6 +971,7 @@ mod tests {
             music_event: "event:/music/a".to_owned(),
             music_timeline_milliseconds: 100,
             seamless_from_previous: false,
+            bgm_follows_video: false,
         }];
         let edited = remove_freeze_segments(
             &clips,
@@ -971,6 +991,35 @@ mod tests {
     }
 
     #[test]
+    fn room_music_policy_survives_json_and_freeze_splits() {
+        let clip: FinalizeClip = serde_json::from_str(
+            r#"{
+            "source":"run.mkv","start_seconds":0,"duration_seconds":3,
+            "music_timeline_milliseconds":100,"bgm_follows_video":true
+        }"#,
+        )
+        .unwrap();
+        let edited = remove_freeze_segments(
+            &[clip],
+            &[FreezeSegment {
+                start_seconds: 1.0,
+                end_seconds: 2.0,
+            }],
+        );
+        assert_eq!(edited.len(), 2);
+        assert!(edited.iter().all(|clip| clip.bgm_follows_video));
+        assert_eq!(edited[1].music_timeline_milliseconds, 2100);
+        assert!(edited[1].seamless_from_previous);
+        let legacy: FinalizeClip = serde_json::from_str(
+            r#"{
+            "source":"run.mkv","start_seconds":0,"duration_seconds":1
+        }"#,
+        )
+        .unwrap();
+        assert!(!legacy.bgm_follows_video);
+    }
+
+    #[test]
     fn seamless_clip_uses_a_frame_exact_cut_without_fading() {
         let clips = vec![
             FinalizeClip {
@@ -980,6 +1029,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: false,
+                bgm_follows_video: false,
             },
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -988,6 +1038,7 @@ mod tests {
                 music_event: String::new(),
                 music_timeline_milliseconds: 0,
                 seamless_from_previous: true,
+                bgm_follows_video: false,
             },
         ];
         let layout = timeline_layout(&clips);
@@ -1033,6 +1084,7 @@ mod tests {
                     music_event: String::new(),
                     music_timeline_milliseconds: 0,
                     seamless_from_previous: false,
+                    bgm_follows_video: false,
                 },
                 FinalizeClip {
                     source: source.to_string_lossy().into_owned(),
@@ -1041,6 +1093,7 @@ mod tests {
                     music_event: String::new(),
                     music_timeline_milliseconds: 0,
                     seamless_from_previous: false,
+                    bgm_follows_video: false,
                 },
             ],
             output_path: output.to_string_lossy().into_owned(),
