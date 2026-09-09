@@ -3,10 +3,11 @@ using System.Runtime.InteropServices;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
-/// <summary>The only acquisition owner: one SDL/PBO pipeline and one DSP per FMOD bus.</summary>
+/// <summary>The only acquisition owner: one native frame pipeline and one DSP per FMOD bus.</summary>
 public static class CaptureSource {
     private static readonly object gate = new();
     private static CaptureSubscription[] subscriptions = [];
+    private static CaptureMusic[] musicSnapshots = [];
     private static FmodSfxTap? tap;
     private static CancellationTokenSource? cancellation;
     private static Task? worker;
@@ -20,17 +21,20 @@ public static class CaptureSource {
     public static int SubscriberCount => Volatile.Read(ref subscriptions).Length;
     public static bool AudioAvailable => Volatile.Read(ref tap) is not null;
     public static string? VideoError => Volatile.Read(ref workerError) ?? SdlFrameSource.Failure;
+    public static string? MusicError => MusicCapture.Failure;
+    public static string VideoBackend => SdlFrameSource.Backend;
     public static long DroppedAudioChunks => Interlocked.Read(ref sourceAudioDrops);
     internal static bool WantsPixels => Volatile.Read(ref subscriptions).Any(s => s.WantsPixels);
 
     /// <summary>Register any combination of pixel and FMOD callbacks. Dispose the returned registration to unsubscribe.</summary>
-    public static CaptureSubscription Subscribe(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null) {
-        if (pixels is null && fmod is null) throw new ArgumentException("At least one callback is required");
+    public static CaptureSubscription Subscribe(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
+        if (pixels is null && fmod is null && music is null) throw new ArgumentException("At least one callback is required");
         lock (gate) {
             if (!loaded) throw new InvalidOperationException("Capture source has not been loaded");
             if (pixels is not null && VideoError is { } error) throw new NotSupportedException(error);
             if (subscriptions.Length >= 16) throw new InvalidOperationException("At most 16 capture subscribers are supported");
-            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos());
+            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music);
+            foreach (var snapshot in musicSnapshots) subscription.Offer(snapshot with { Kind = "snapshot" });
             Volatile.Write(ref subscriptions, [.. subscriptions, subscription]);
             return subscription;
         }
@@ -43,7 +47,9 @@ public static class CaptureSource {
             if (loaded) return;
             if (!NativeCaptureBridge.Available) return;
             workerError = null;
+            musicSnapshots = [];
             SdlFrameSource.Load();
+            MusicCapture.Load();
             cancellation = new();
             loaded = true;
             CancellationToken token = cancellation.Token;
@@ -53,11 +59,19 @@ public static class CaptureSource {
     /// <summary>Called on the game thread: FMOD graph attach/detach never runs inside DSP or user callbacks.</summary>
     internal static void Update() {
         SdlFrameSource.Update();
+        MusicCapture.Update();
         bool wantsAudio = Volatile.Read(ref subscriptions).Any(s => s.WantsAudio);
         if (!wantsAudio) { Interlocked.Exchange(ref tap, null)?.Dispose(); retryAudioAt = 0; }
         else if (tap is null && Environment.TickCount64 >= retryAudioAt) {
             retryAudioAt = Environment.TickCount64 + 2_000;
             tap = FmodSfxTap.Attach();
+        }
+    }
+    internal static void PublishMusic(CaptureMusic[] latest, IEnumerable<CaptureMusic> changes) {
+        lock (gate) {
+            musicSnapshots = latest;
+            foreach (var change in changes)
+                foreach (var subscription in subscriptions) subscription.Offer(change);
         }
     }
     // FMOD real-time producer: nonblocking, pooled copy only, no user code or native encoder calls.
@@ -108,10 +122,11 @@ public static class CaptureSource {
     }
     internal static void Unload() {
         CaptureSubscription[] old;
-        lock (gate) { loaded = false; old = subscriptions; Volatile.Write(ref subscriptions, []); }
+        lock (gate) { loaded = false; old = subscriptions; musicSnapshots = []; Volatile.Write(ref subscriptions, []); }
         foreach (var subscription in old) subscription.Dispose();
         Interlocked.Exchange(ref tap, null)?.Dispose();
         SdlFrameSource.Unload();
+        MusicCapture.Unload();
         cancellation?.Cancel();
         worker?.GetAwaiter().GetResult();
         cancellation?.Dispose(); cancellation = null; worker = null;

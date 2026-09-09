@@ -735,7 +735,7 @@ public static class AutoRecorder {
         Task stop,
         IReadOnlyList<RecordingFinalizationJob> jobs
     ) {
-        string[] temporaryFiles = [recording.Path, recording.AudioPath];
+        string[] temporaryFiles = [recording.Path, recording.AudioPath, recording.BgmPath, recording.MusicEventsPath];
         if (jobs.Count == 0) {
             _ = stop.ContinueWith(_ => DeleteTemporaryFiles(temporaryFiles), TaskScheduler.Default);
             return;

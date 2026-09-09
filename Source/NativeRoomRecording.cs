@@ -7,6 +7,8 @@ internal sealed class NativeRoomRecording {
 
     public string Path { get; }
     public string AudioPath => Path + ".sfxchunks";
+    public string BgmPath => Path + ".bgmchunks";
+    public string MusicEventsPath => Path + ".music.jsonl";
     public bool HasAudioTap => capture.HasAudioTap;
 
     public CaptureStatistics Statistics {
@@ -80,13 +82,7 @@ internal sealed class NativeRoomRecording {
 
 public readonly record struct MusicPosition(string Event, int TimelineMilliseconds) {
     public static MusicPosition Read() {
-        try {
-            FMOD.Studio.EventInstance instance = Audio.CurrentMusicEventInstance;
-            string name = Audio.GetEventName(instance) ?? "";
-            instance.getTimelinePosition(out int position);
-            return new MusicPosition(name, Math.Max(0, position));
-        } catch {
-            return new MusicPosition("", 0);
-        }
+        CaptureMusic? state = MusicCapture.Snapshots.FirstOrDefault(s => s.Track == "main");
+        return state is null ? new("", 0) : new(state.Event, state.TimelineMilliseconds);
     }
 }

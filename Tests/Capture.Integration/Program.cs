@@ -32,14 +32,22 @@ var enable=Marshal.GetDelegateForFunctionPointer<Sdl.Enable>(Sdl.GetProc("glEnab
 var disable=Marshal.GetDelegateForFunctionPointer<Sdl.Enable>(Sdl.GetProc("glDisable"));
 var scissor=Marshal.GetDelegateForFunctionPointer<Sdl.Scissor>(Sdl.GetProc("glScissor"));
 Fmod(FMOD.Studio.System.create(out var studio));
+Fmod(studio.getLowLevelSystem(out var lowLevel));
+Fmod(lowLevel.setSoftwareFormat(48000, FMOD.SPEAKERMODE._7POINT1, 0));
 Fmod(studio.initialize(128,FMOD.Studio.INITFLAGS.NORMAL,FMOD.INITFLAGS.NORMAL,0));
-foreach(var bank in new[]{"Master Bank.bank","Master Bank.strings.bank","ui.bank"})
+foreach(var bank in new[]{"Master Bank.bank","Master Bank.strings.bank","ui.bank","music.bank","sfx.bank"})
     Fmod(studio.loadBankFile(Path.Combine(root,"Content","FMOD","Desktop",bank),FMOD.Studio.LOAD_BANK_FLAGS.NORMAL,out _));
 typeof(Celeste.Audio).GetField("system",BindingFlags.Static|BindingFlags.NonPublic)!.SetValue(null,studio);
 Fmod(studio.getEvent("event:/ui/main/button_select",out var description));
+Fmod(studio.getEvent("event:/char/madeline/jump",out var jumpDescription));
 NativeCaptureBridge.Initialize(null); Check(NativeCaptureBridge.Available,"native load failed");
 CaptureSource.Load(); Check(CaptureSource.VideoError is null,$"hook failed: {CaptureSource.VideoError}");
-long frameCount=0,audioCount=0; ulong lastSequence=0; int badPixels=0;
+long frameCount=0,audioCount=0; ulong lastSequence=0; int badPixels=0, surroundChunks=0, bgmChunks=0;
+var musicChanges = new System.Collections.Concurrent.ConcurrentQueue<CaptureMusic>();
+Fmod(studio.getEvent("event:/music/menu/level_select", out var musicDescription));
+Fmod(musicDescription.createInstance(out var song));
+typeof(Celeste.Audio).GetField("currentMusicEvent",BindingFlags.Static|BindingFlags.NonPublic)!.SetValue(null,song);
+Fmod(song.start());
 using var observer=CaptureSource.Subscribe(frame=> {
     if(frame.Sequence<=lastSequence) Interlocked.Increment(ref badPixels);
     lastSequence=frame.Sequence;
@@ -47,16 +55,27 @@ using var observer=CaptureSource.Subscribe(frame=> {
     // Top half blue, bottom half red verifies channel conversion and vertical orientation.
     if(pixels[0]!=255||pixels[2]!=0||pixels[^4]!=0||pixels[^2]!=255) Interlocked.Increment(ref badPixels);
     Interlocked.Increment(ref frameCount);
-}, chunk=>{if(chunk.Samples.Span.ContainsAnyExcept(0f)) Interlocked.Increment(ref audioCount);});
+}, chunk=>{
+    if(chunk.Channels==8) Interlocked.Increment(ref surroundChunks);
+    if(chunk.Samples.Span.ContainsAnyExcept(0f)) {
+        Interlocked.Increment(ref audioCount);
+        if(chunk.BusId==3) Interlocked.Increment(ref bgmChunks);
+    }
+}, change=>musicChanges.Enqueue(change));
 using var slow=CaptureSource.Subscribe(_=>Thread.Sleep(120));
 var first=NativeCaptureBridge.StartRecording(30,Path.Combine(output,"first.mkv"),encoder,1000);
 NativeCaptureSession? second=null;
 ulong before=0;
 for(int i=0;i<240;i++) {
     Sdl.Pump(); CaptureSource.Update(); Fmod(studio.update());
-    if(i%30==0) {Fmod(description.createInstance(out var sound));Fmod(sound.start());Fmod(sound.release());}
+    Fmod(song.setParameterValue("fade", i >= 150 && i < 155 ? 0.5f : 1f));
+    if(i%30==0) {Fmod(description.createInstance(out var sound));Fmod(sound.start());Fmod(sound.release()); Fmod(jumpDescription.createInstance(out var jump));Fmod(jump.start());Fmod(jump.release());}
     if(i==60) second=NativeCaptureBridge.StartRecording(60,Path.Combine(output,"second.mkv"),encoder,1000);
-    if(i==120) {first.Dispose(); before=second!.Statistics.FramesCaptured; Sdl.SetWindowSize(window,192,108);}
+    if(i==80) Fmod(song.setPaused(true));
+    if(i==90) Fmod(song.setPaused(false));
+    if(i==100) Fmod(song.setTimelinePosition(500));
+    if(i==160) { Fmod(song.stop(FMOD.Studio.STOP_MODE.IMMEDIATE)); Fmod(song.start()); }
+    if(i==120) {Parallel.Invoke(first.Dispose, first.Dispose); before=second!.Statistics.FramesCaptured; Sdl.SetWindowSize(window,192,108);}
     if(i==210) {Check(second!.Statistics.FramesCaptured>before,"second stopped when first unsubscribed");}
     Sdl.Drawable(window,out int w,out int h);
     disable(0x0C11);clearColor(1,0,0,1);clear(0x4000);
@@ -69,15 +88,24 @@ slow.Dispose();slow.Completion.GetAwaiter().GetResult();
 CaptureSource.Update();
 Check(frameCount>100 && audioCount>0,$"no callbacks: {frameCount} frames, {audioCount} audio; {CaptureSource.VideoError}");
 Check(badPixels==0,$"pixel/order errors: {badPixels}");
+Check(surroundChunks>0 && bgmChunks>0,$"real 7.1 BGM PCM was not observed: surround={surroundChunks} bgm={bgmChunks} audio={audioCount}");
+Check(musicChanges.Any(e=>e.Kind=="pause") && musicChanges.Any(e=>e.Kind=="resume")
+    && musicChanges.Any(e=>e.Kind=="seek") && musicChanges.Any(e=>e.Kind=="start"),"music control hooks missed commands");
+Check(musicChanges.Count(e=>e.Kind=="parameter") is >0 and <20,"redundant parameter setters split continuous music");
 Check(slow.DroppedFrames>0 && observer.CallbackErrors==0,"callback isolation failed");
 Check(CaptureSource.SubscriberCount==0 && !CaptureSource.AudioAvailable,"last unsubscribe did not release audio");
 foreach(var name in new[]{"first.mkv","second.mkv"}) {
     string path=Path.Combine(output,name);
     Check(File.Exists(path)&&new FileInfo(path).Length>1000,"missing video");
     Check(new FileInfo(path+".sfxchunks").Length>8,"missing FMOD PCM");
+    Check(new FileInfo(path+".bgmchunks").Length>8,"missing independent BGM PCM");
+    Check(File.ReadAllLines(path+".music.jsonl").Last().Contains("\"complete\":true"),"incomplete music journal");
 }
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,1.5,"",0)],
     Path.Combine(output,"final.mp4"),encoder,1000,30,false,false,"").GetAwaiter().GetResult();
+NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,0.4,"",0),
+    new RecordingClip(Path.Combine(output,"first.mkv"),0.8,0.4,"",0)],
+    Path.Combine(output,"continuous-bgm.mp4"),encoder,1000,30,true,false,"").GetAwaiter().GetResult();
 // Unhook and hook again while context remains alive (mod reload).
 CaptureSource.Unload(); CaptureSource.Load();
 using(var probe=NativeCaptureBridge.Start(60)) {
@@ -90,6 +118,11 @@ Sdl.DeleteContext(context);Sdl.DestroyWindow(window);
 nint plain = Sdl.CreateWindow("Celeste non-GL integration",0,0,64,64,0x8);
 Check(plain!=0,"plain SDL window failed");
 CaptureSource.Load();
+if(OperatingSystem.IsWindows()) {
+    using(var waiting=CaptureSource.Subscribe(pixels:_=>{})) {
+        CaptureSource.Update(); Thread.Sleep(5_100); CaptureSource.Update();
+    }
+}
 Check(CaptureSource.VideoError is not null,"non-GL renderer was silently accepted");
 bool rejected=false;
 try { using var invalid=CaptureSource.Subscribe(pixels:_=>{}); } catch(NotSupportedException) { rejected=true; }

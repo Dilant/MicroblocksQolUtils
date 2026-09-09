@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(windows)]
+mod d3d11_readback;
+#[cfg(windows)]
 mod dwrite_raster;
 mod raster;
 mod sdl_readback;
@@ -26,7 +28,7 @@ mod finalizer;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_audio;
 
-const ABI_VERSION: u32 = 5;
+const ABI_VERSION: u32 = 6;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
@@ -608,7 +610,7 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
 }
 
 fn run_audio_writer(session: &Arc<CaptureSession>) -> Result<(), String> {
-    let mut writer = if let Some(path) = audio_sidecar_path(&session.config) {
+    let create_writer = |path: PathBuf| -> Result<BufWriter<File>, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create audio sidecar directory: {error}"))?;
@@ -619,18 +621,27 @@ fn run_audio_writer(session: &Arc<CaptureSession>) -> Result<(), String> {
         writer
             .write_all(b"MQOLAUD1")
             .map_err(|error| format!("cannot write audio sidecar header: {error}"))?;
-        Some(writer)
-    } else {
-        None
+        Ok(writer)
     };
+    let mut writer = audio_sidecar_path(&session.config)
+        .map(&create_writer)
+        .transpose()?;
+    let mut bgm = audio_sidecar_path(&session.config)
+        .map(|path| create_writer(path.with_extension("bgmchunks")))
+        .transpose()?;
 
     while let Some(chunk) = session.audio_queue.pop() {
-        if let Some(writer) = writer.as_mut() {
+        let target = if chunk.bus_id == 3 {
+            &mut bgm
+        } else {
+            &mut writer
+        };
+        if let Some(writer) = target.as_mut() {
             write_audio_chunk(writer, &chunk)?;
         }
         session.audio_queue.recycle(chunk);
     }
-    if let Some(writer) = writer.as_mut() {
+    for writer in [&mut writer, &mut bgm].into_iter().flatten() {
         writer
             .flush()
             .map_err(|error| format!("cannot flush audio sidecar: {error}"))?;

@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 5;
+    private const uint ExpectedAbiVersion = 6;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -70,7 +70,7 @@ public static class NativeCaptureBridge {
         ThrowIfFailed(status, "create");
         try {
             ThrowIfFailed(CaptureStart(handle), "start");
-            return new NativeCaptureSession(handle, includeUiSfx, outputPath is not null);
+            return new NativeCaptureSession(handle, includeUiSfx, outputPath);
         } catch {
             CaptureDestroy(handle);
             throw;
@@ -262,22 +262,39 @@ public sealed class NativeCaptureSession : IDisposable {
     private ulong handle;
     private readonly CaptureSubscription subscription;
     private readonly object gate = new();
+    private readonly object stopGate = new();
     private readonly Queue<CaptureAudio> preroll = new(32);
     private bool videoStarted;
-    internal NativeCaptureSession(ulong handle, bool includeUiSfx, bool audio) {
+    private ulong origin;
+    private readonly MusicJournal? musicJournal;
+    private int stopped;
+    internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath) {
         this.handle = handle;
-        subscription = CaptureSource.Subscribe(PushFrame, audio ? chunk => {
-            if (includeUiSfx || chunk.BusId != 2) PushAudio(chunk);
-        } : null);
+        musicJournal = outputPath is null ? null : new MusicJournal(outputPath + ".music.jsonl");
+        try {
+            subscription = CaptureSource.Subscribe(PushFrame, outputPath is not null ? chunk => {
+                if (includeUiSfx || chunk.BusId != 2) PushAudio(chunk);
+            } : null, musicJournal is null ? null : musicJournal.Accept);
+        } catch { musicJournal?.Dispose(); throw; }
     }
     public CaptureStatistics Statistics { get { lock (gate) return handle == 0 ? default : NativeCaptureBridge.GetStats(handle); } }
     public bool HasAudioTap => CaptureSource.AudioAvailable;
     public void Stop() {
-        subscription.Dispose();
-        subscription.Completion.GetAwaiter().GetResult();
-        lock (gate) {
-            preroll.Clear();
-            if (handle != 0) NativeCaptureBridge.Stop(handle);
+        // Concurrent Stop/Dispose callers must all wait for the drain, not destroy a
+        // handle while the first caller is still waiting for its callback worker.
+        lock (stopGate) {
+            if (stopped != 0) return;
+            stopped = 1;
+            subscription.Complete();
+            subscription.Completion.GetAwaiter().GetResult();
+            lock (gate) {
+                preroll.Clear();
+                try {
+                    if (handle != 0) NativeCaptureBridge.Stop(handle);
+                    musicJournal?.Finish(subscription.DroppedMusicEvents == 0 && subscription.CallbackErrors == 0
+                        && CaptureSource.MusicError is null && videoStarted);
+                } finally { musicJournal?.Dispose(); }
+            }
         }
     }
     private unsafe void PushFrame(CaptureFrame frame) {
@@ -288,6 +305,8 @@ public sealed class NativeCaptureSession : IDisposable {
         }
         if (!videoStarted) {
             videoStarted = true;
+            origin = frame.TimestampNanos;
+            musicJournal?.Start(origin);
             // PBO delivery is late: retain eligible PCM while waiting, but discard pre-video PCM.
             while (preroll.TryDequeue(out var chunk))
                 if (chunk.TimestampNanos >= frame.TimestampNanos) PushAudio(chunk);
@@ -299,15 +318,18 @@ public sealed class NativeCaptureSession : IDisposable {
             preroll.Enqueue(chunk); return;
         }
         fixed (float* samples = chunk.Samples.Span) {
-            _ = NativeCaptureBridge.CapturePushAudio(handle, samples, (nuint)chunk.Samples.Length,
+            int status = NativeCaptureBridge.CapturePushAudio(handle, samples, (nuint)chunk.Samples.Length,
                 (uint)chunk.SampleRate, (ushort)chunk.Channels, (ushort)chunk.BusId, chunk.TimestampNanos);
+            if (status != 0) throw new InvalidOperationException(NativeCaptureBridge.LastError());
         }
     }
     public void Dispose() {
-        Stop();
-        lock (gate) {
-            ulong owned = handle; handle = 0;
-            if (owned != 0) NativeCaptureBridge.Destroy(owned);
+        try { Stop(); }
+        finally {
+            lock (gate) {
+                ulong owned = handle; handle = 0;
+                if (owned != 0) NativeCaptureBridge.Destroy(owned);
+            }
         }
     }
 }

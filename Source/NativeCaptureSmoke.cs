@@ -11,7 +11,8 @@ internal static class NativeCaptureSmoke {
         updates = 0;
     }
     public static void Update() {
-        if (string.IsNullOrWhiteSpace(output) || cancellation is not null || ++updates < 180) return;
+        if (string.IsNullOrWhiteSpace(output) || cancellation is not null
+            || Monocle.Engine.Scene is not (Overworld or Level) || ++updates < 180) return;
         cancellation = new();
         _ = RunAsync(Path.GetFullPath(output), cancellation.Token);
     }
@@ -24,12 +25,19 @@ internal static class NativeCaptureSmoke {
     private static async Task RunAsync(string path, CancellationToken token) {
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            long pixelCallbacks = 0, audioCallbacks = 0;
+            long pixelCallbacks = 0, audioCallbacks = 0, visibleFrames = 0;
             ulong previousSequence = 0;
             using CaptureSubscription observer = CaptureSource.Subscribe(frame => {
                 if (frame.Sequence <= previousSequence || frame.Pixels.Length != frame.Width * frame.Height * 4)
                     throw new InvalidDataException("Invalid pixel metadata/order");
                 previousSequence = frame.Sequence;
+                var pixels = frame.Pixels.Span;
+                bool varied = false;
+                for (int i = 0; i < pixels.Length; i += Math.Max(4, (pixels.Length / 1024) & ~3)) {
+                    if (Math.Abs(pixels[i] - pixels[0]) + Math.Abs(pixels[i + 1] - pixels[1])
+                        + Math.Abs(pixels[i + 2] - pixels[2]) > 24) { varied = true; break; }
+                }
+                if (varied) Interlocked.Increment(ref visibleFrames);
                 Interlocked.Increment(ref pixelCallbacks);
             }, chunk => {
                 if (chunk.SampleRate <= 0 || chunk.Samples.Length % chunk.Channels != 0 || chunk.TimestampNanos == 0)
@@ -54,6 +62,7 @@ internal static class NativeCaptureSmoke {
                 throw new Exception($"Callback isolation failed: pixels={pixelCallbacks} audio={audioCallbacks} errors={observer.CallbackErrors} slowDrops={slow.DroppedFrames}");
             if (!File.Exists(path) || new FileInfo(path).Length < 1_000 || statistics.FramesCaptured < 10)
                 throw new Exception($"No captured video; {statistics}; source={CaptureSource.VideoError}; native={NativeCaptureBridge.LastError()}");
+            if (visibleFrames < 10) throw new Exception($"Captured only {visibleFrames} visibly varied frames; a solid-color game window is not a successful visual smoke test.");
             byte[] audio = File.ReadAllBytes(path + ".sfxchunks");
             if (audio.Length < 8 || !audio.AsSpan(0,8).SequenceEqual("MQOLAUD1"u8)) throw new Exception("Invalid PCM sidecar");
             string finalized = path + ".final.mp4";

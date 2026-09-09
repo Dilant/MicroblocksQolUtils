@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use ffmpeg::{ChannelLayout, Packet, Rational, codec, encoder, format, frame, media, software};
@@ -102,13 +102,13 @@ struct AudioClipLayout {
     fade_out_frames: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PostMixSegment {
-    clip_index: usize,
     output_start_frames: u64,
     frames: u64,
     captured_source_start_frames: u64,
     mapped_source_start_seconds: f64,
+    music_event: String,
 }
 
 impl AudioClipLayout {
@@ -149,15 +149,20 @@ pub fn build_audio_track(
         .map(load_bgm_map)
         .transpose()?
         .unwrap_or_default();
-    let has_mapped_bgm = clips
-        .iter()
-        .any(|clip| bgm_map.contains_key(&clip.music_event));
+    // Names may come from the independent journal rather than clip-start metadata.
+    let has_mapped_bgm = !bgm_map.is_empty();
+    let separate_bgm = sidecar.with_extension("bgmchunks");
+    let bgm_sidecar = if separate_bgm.exists() {
+        &separate_bgm
+    } else {
+        sidecar
+    };
     let captured_spec = sidecar
         .exists()
         .then(|| render_mix(sidecar, clips, mixed_pcm, reconstruct_bgm))
         .transpose()?
         .flatten();
-    if captured_spec.is_none() && !has_mapped_bgm {
+    if captured_spec.is_none() && !has_mapped_bgm && !separate_bgm.exists() {
         return Ok(false);
     }
     let spec = captured_spec.unwrap_or(AudioSpec {
@@ -169,12 +174,15 @@ pub fn build_audio_track(
         create_empty_mix(mixed_pcm, spec)?;
     }
     if reconstruct_bgm {
-        if sidecar.exists() {
-            mix_captured_bgm(sidecar, mixed_pcm, clips, &bgm_map, spec)?;
+        if bgm_sidecar.exists() {
+            mix_captured_bgm(bgm_sidecar, mixed_pcm, clips, &bgm_map, spec)?;
         }
         if has_mapped_bgm {
-            mix_bgm_tracks(mixed_pcm, clips, &bgm_map, spec)?;
+            mix_bgm_tracks(bgm_sidecar, mixed_pcm, clips, &bgm_map, spec)?;
         }
+    } else if separate_bgm.exists() {
+        // Normal export still cuts music with video, but never mixes it into the SFX source.
+        mix_separate_bgm_with_video(&separate_bgm, mixed_pcm, clips, spec)?;
     }
     encode_aac(mixed_pcm, audio_output, spec)?;
     Ok(true)
@@ -259,6 +267,47 @@ fn render_mix(
         channels: first.channels,
         total_frames,
     }))
+}
+
+fn mix_separate_bgm_with_video(
+    sidecar: &Path,
+    mixed_pcm: &Path,
+    clips: &[FinalizeClip],
+    spec: AudioSpec,
+) -> Result<(), AudioFinalizeError> {
+    let mut reader = BufReader::new(File::open(sidecar).map_err(|e| io_error(sidecar, e))?);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| io_error(sidecar, e))?;
+    if &magic != SIDECAR_MAGIC {
+        return Err(invalid(sidecar, "bad magic"));
+    }
+    let layout = audio_timeline_layout(clips, spec.sample_rate)?;
+    let mut mixed = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mixed_pcm)
+        .map_err(|e| io_error(mixed_pcm, e))?;
+    while let Some(chunk) = read_chunk(&mut reader, sidecar)? {
+        if chunk.sample_rate != spec.sample_rate {
+            return Err(invalid(sidecar, "FMOD sample rate changed"));
+        }
+        if chunk.bus_id != 3 {
+            return Err(invalid(sidecar, "non-music data in BGM sidecar"));
+        }
+        mix_chunk(
+            &mut mixed,
+            &chunk,
+            clips,
+            &layout,
+            spec.sample_rate,
+            spec.channels,
+            false,
+            sidecar,
+        )?;
+    }
+    mixed.flush().map_err(|e| io_error(mixed_pcm, e))
 }
 
 fn total_timeline_frames(
@@ -392,12 +441,115 @@ fn post_mix_segments(
             (actual_captured_start, actual_mapped_start)
         };
         result.push(PostMixSegment {
-            clip_index: index,
             output_start_frames: clip_layout.output_start_frames,
             frames,
             captured_source_start_frames,
             mapped_source_start_seconds,
+            music_event: clip.music_event.clone(),
         });
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct MusicEvent {
+    time_nanos: u64,
+    kind: String,
+    track: String,
+    event: String,
+    timeline_milliseconds: i64,
+}
+
+// New recordings use the independent control journal, not clip-start guesses.
+// Legacy recordings retain their per-clip metadata fallback.
+fn journal_segments(
+    sidecar: &Path,
+    clips: &[FinalizeClip],
+    rate: u32,
+) -> Result<Vec<PostMixSegment>, AudioFinalizeError> {
+    let path = sidecar.with_extension("music.jsonl");
+    if !path.exists() {
+        return post_mix_segments(clips, rate);
+    }
+    let file = File::open(&path).map_err(|e| io_error(&path, e))?;
+    let mut events = Vec::<MusicEvent>::new();
+    let mut complete = false;
+    let mut header = false;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| io_error(&path, e))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| invalid(&path, e.to_string()))?;
+        if complete {
+            return Err(invalid(&path, "data after music journal end"));
+        }
+        match value["type"].as_str() {
+            Some("header") if !header && events.is_empty() && value["version"] == 1 => {
+                header = true
+            }
+            Some("event") if header => events
+                .push(serde_json::from_value(value).map_err(|e| invalid(&path, e.to_string()))?),
+            Some("end") if header && value["complete"] == true => complete = true,
+            _ => return Err(invalid(&path, "unsupported or incomplete music journal")),
+        }
+    }
+    if !complete {
+        return Err(invalid(&path, "music journal was not completed"));
+    }
+    // Stable sort retains command order at an identical timestamp.
+    events.sort_by_key(|e| e.time_nanos);
+    // Natural STARTING -> PLAYING is not a new musical take. Switch/stop/seek,
+    // pause and interactive parameter changes ARE boundaries, including alt music.
+    events.retain(|e| e.kind != "playback" && !e.kind.starts_with("command"));
+    let layout = audio_timeline_layout(clips, rate)?;
+    let total = total_frames_from_layout(&layout)?;
+    let mut result: Vec<PostMixSegment> = Vec::new();
+    let mut previous_run = None;
+    for (index, (clip, output)) in clips.iter().zip(&layout).enumerate() {
+        let output_end = layout
+            .get(index + 1)
+            .map(|l| l.output_start_frames)
+            .unwrap_or(total);
+        let start = seconds_to_frames(clip.start_seconds, rate)?;
+        let end = start + output_end.saturating_sub(output.output_start_frames);
+        let mut cuts = vec![start];
+        cuts.extend(
+            events
+                .iter()
+                .map(|e| nanos_to_frames(e.time_nanos, rate))
+                .filter(|&t| t > start && t < end),
+        );
+        cuts.push(end);
+        cuts.sort_unstable();
+        cuts.dedup();
+        for interval in cuts.windows(2) {
+            let actual = interval[0];
+            let run = events.partition_point(|e| nanos_to_frames(e.time_nanos, rate) <= actual);
+            let output_start = output.output_start_frames + actual - start;
+            let main = events[..run].iter().rev().find(|e| e.track == "main");
+            let mut source_start = actual;
+            let mut mapped_start = main
+                .map(|e| {
+                    e.timeline_milliseconds.max(0) as f64 / 1000.0
+                        + (actual - nanos_to_frames(e.time_nanos, rate)) as f64 / rate as f64
+                })
+                .unwrap_or(0.0);
+            if previous_run == Some(run) {
+                if let Some(previous) = result.last() {
+                    let delta = output_start - previous.output_start_frames;
+                    source_start = previous.captured_source_start_frames + delta;
+                    mapped_start =
+                        previous.mapped_source_start_seconds + delta as f64 / rate as f64;
+                }
+            }
+            result.push(PostMixSegment {
+                output_start_frames: output_start,
+                frames: interval[1] - actual,
+                captured_source_start_frames: source_start,
+                mapped_source_start_seconds: mapped_start,
+                music_event: main.map(|e| e.event.clone()).unwrap_or_default(),
+            });
+            previous_run = Some(run);
+        }
     }
     Ok(result)
 }
@@ -409,7 +561,7 @@ fn mix_captured_bgm(
     event_map: &HashMap<String, PathBuf>,
     spec: AudioSpec,
 ) -> Result<(), AudioFinalizeError> {
-    let segments = post_mix_segments(clips, spec.sample_rate)?;
+    let segments = journal_segments(sidecar, clips, spec.sample_rate)?;
     let file = File::open(sidecar).map_err(|source| io_error(sidecar, source))?;
     let mut reader = BufReader::new(file);
     let mut magic = [0_u8; 8];
@@ -435,7 +587,7 @@ fn mix_captured_bgm(
             ));
         }
         if chunk.bus_id == 3 {
-            mix_captured_bgm_chunk(&mut mixed, &chunk, clips, &segments, event_map, spec)?;
+            mix_captured_bgm_chunk(&mut mixed, &chunk, &segments, event_map, spec)?;
         }
     }
     mixed.flush().map_err(|source| io_error(mixed_pcm, source))
@@ -444,7 +596,6 @@ fn mix_captured_bgm(
 fn mix_captured_bgm_chunk(
     mixed: &mut File,
     chunk: &SidecarChunk,
-    clips: &[FinalizeClip],
     segments: &[PostMixSegment],
     event_map: &HashMap<String, PathBuf>,
     spec: AudioSpec,
@@ -454,7 +605,7 @@ fn mix_captured_bgm_chunk(
     let chunk_start = nanos_to_frames(chunk.media_time_nanos, spec.sample_rate);
     let chunk_end = chunk_start.saturating_add(chunk_frames as u64);
     for segment in segments {
-        if event_map.contains_key(&clips[segment.clip_index].music_event) {
+        if event_map.contains_key(&segment.music_event) {
             continue;
         }
         let source_end = segment
@@ -487,6 +638,7 @@ fn mix_captured_bgm_chunk(
 }
 
 fn mix_bgm_tracks(
+    sidecar: &Path,
     mixed_pcm: &Path,
     clips: &[FinalizeClip],
     event_map: &HashMap<String, PathBuf>,
@@ -497,10 +649,9 @@ fn mix_bgm_tracks(
         .write(true)
         .open(mixed_pcm)
         .map_err(|source| io_error(mixed_pcm, source))?;
-    let segments = post_mix_segments(clips, spec.sample_rate)?;
+    let segments = journal_segments(sidecar, clips, spec.sample_rate)?;
     for segment in segments {
-        let clip = &clips[segment.clip_index];
-        if let Some(path) = event_map.get(&clip.music_event) {
+        if let Some(path) = event_map.get(&segment.music_event) {
             mix_bgm_segment(
                 &mut mixed,
                 path,
@@ -801,17 +952,54 @@ fn read_chunk(
     reader
         .read_exact(&mut bytes)
         .map_err(|source| io_error(path, source))?;
-    let samples = bytes
+    let samples: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
         .collect();
+    // FMOD standard speaker order is not FFmpeg's default channel-count layout.
+    // Preserve raw sidecars and public PCM callbacks; downmix only for the stereo export.
+    let samples = downmix_fmod(&samples, channels)?;
     Ok(Some(SidecarChunk {
         media_time_nanos,
         sample_rate,
-        channels,
+        channels: 2,
         bus_id,
         samples,
     }))
+}
+
+fn downmix_fmod(samples: &[f32], channels: u16) -> Result<Vec<f32>, AudioFinalizeError> {
+    if !matches!(channels, 1 | 2 | 4 | 5 | 6 | 8) {
+        return Err(AudioFinalizeError::Channels { channels });
+    }
+    let mut stereo = Vec::with_capacity(samples.len() / channels as usize * 2);
+    let surround = std::f32::consts::FRAC_1_SQRT_2;
+    for frame in samples.chunks_exact(channels as usize) {
+        let finite = |i: usize| if frame[i].is_finite() { frame[i] } else { 0.0 };
+        let (mut left, mut right) = (finite(0), finite(if channels == 1 { 0 } else { 1 }));
+        match channels {
+            4 => {
+                left += surround * finite(2);
+                right += surround * finite(3);
+            }
+            5 => {
+                left += surround * (finite(2) + finite(3));
+                right += surround * (finite(2) + finite(4));
+            }
+            6 | 8 => {
+                // FL FR FC LFE SL SR [BL BR]. LFE is intentionally excluded from stereo.
+                left += surround * (finite(2) + finite(4));
+                right += surround * (finite(2) + finite(5));
+                if channels == 8 {
+                    left += 0.5 * finite(6);
+                    right += 0.5 * finite(7);
+                }
+            }
+            _ => {}
+        }
+        stereo.extend([left, right]);
+    }
+    Ok(stereo)
 }
 
 fn encode_aac(
@@ -1112,6 +1300,156 @@ mod tests {
     use super::*;
     use crate::{AudioChunk, write_audio_chunk};
     use std::io::{BufWriter, Write};
+
+    #[test]
+    fn fmod_surround_downmix_preserves_speaker_sides_and_excludes_lfe() {
+        for channels in [1, 2, 4, 5, 6, 8] {
+            let mut pcm = vec![0.0; channels];
+            pcm[0] = 0.25;
+            let stereo = downmix_fmod(&pcm, channels as u16).unwrap();
+            assert_eq!(stereo[0], 0.25);
+            assert_eq!(stereo[1], if channels == 1 { 0.25 } else { 0.0 });
+        }
+        for (channel, left, right) in [
+            (2, 0.70710677, 0.70710677),
+            (3, 0.0, 0.0),
+            (4, 0.70710677, 0.0),
+            (5, 0.0, 0.70710677),
+            (6, 0.5, 0.0),
+            (7, 0.0, 0.5),
+        ] {
+            let mut pcm = vec![0.0; 8];
+            pcm[channel] = 1.0;
+            assert_eq!(downmix_fmod(&pcm, 8).unwrap(), vec![left, right]);
+        }
+        assert!(downmix_fmod(&[0.0; 7], 7).is_err());
+        assert_eq!(
+            downmix_fmod(&[f32::NAN, f32::INFINITY], 2).unwrap(),
+            vec![0.0, 0.0]
+        );
+    }
+
+    fn journal(path: &Path, extra: &[(u64, &str, &str)]) {
+        let mut lines = vec![r#"{"type":"header","version":1}"#.to_string()];
+        for &(time, kind, event) in std::iter::once(&(0, "snapshot", "music/a")).chain(extra) {
+            lines.push(
+                serde_json::json!({"type":"event","time_nanos":time,"kind":kind,"track":"main",
+                "event":event,"timeline_milliseconds":0})
+                .to_string(),
+            );
+        }
+        lines.push(r#"{"type":"end","complete":true}"#.to_string());
+        fs::write(path.with_extension("music.jsonl"), lines.join("\n")).unwrap();
+    }
+    fn clip(start: f64, duration: f64) -> FinalizeClip {
+        FinalizeClip {
+            source: "run.mkv".into(),
+            start_seconds: start,
+            duration_seconds: duration,
+            music_event: "wrong-per-clip-metadata".into(),
+            music_timeline_milliseconds: 99999,
+            seamless_from_previous: true,
+        }
+    }
+
+    #[test]
+    fn journal_bgm_does_not_jump_at_video_cuts_or_metadata_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.mkv.bgmchunks");
+        journal(&path, &[]);
+        let result = journal_segments(
+            &path,
+            &[clip(0.0, 1.0), clip(2.0, 0.5), clip(2.5, 0.5)],
+            8000,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|s| s.captured_source_start_frames)
+                .collect::<Vec<_>>(),
+            [0, 8000, 12000]
+        );
+        assert_eq!(result[1].music_event, "music/a");
+    }
+
+    #[test]
+    fn journal_preserves_in_clip_switches_and_same_song_restart_inside_removed_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.mkv.bgmchunks");
+        journal(
+            &path,
+            &[
+                (1_500_000_000, "start", "music/a"),
+                (2_500_000_000, "switch", "music/b"),
+            ],
+        );
+        let result = journal_segments(&path, &[clip(0.0, 1.0), clip(2.0, 1.0)], 8000).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[1].captured_source_start_frames, 16000); // not old take at 1s
+        assert_eq!(result[2].output_start_frames, 12000);
+        assert_eq!(result[2].captured_source_start_frames, 20000);
+        assert_eq!(result[2].music_event, "music/b");
+    }
+
+    #[test]
+    fn incomplete_music_journal_is_never_used_for_reconstruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.mkv.bgmchunks");
+        fs::write(
+            path.with_extension("music.jsonl"),
+            "{\"type\":\"header\",\"version\":1}\n",
+        )
+        .unwrap();
+        assert!(journal_segments(&path, &[clip(0.0, 1.0)], 8000).is_err());
+    }
+
+    #[test]
+    fn rendered_bgm_samples_remain_continuous_while_sfx_are_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.mkv.bgmchunks");
+        let mixed = dir.path().join("mixed.f32");
+        journal(&path, &[]);
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        writer.write_all(SIDECAR_MAGIC).unwrap();
+        for second in 0..4 {
+            let samples: Vec<f32> = (0..8000)
+                .flat_map(|i| [((second * 8000 + i) as f32) / 100000.0; 2])
+                .collect();
+            write_audio_chunk(
+                &mut writer,
+                &AudioChunk {
+                    media_time_nanos: second * 1_000_000_000,
+                    sample_rate: 8000,
+                    channels: 2,
+                    bus_id: 3,
+                    samples,
+                },
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+        let clips = [clip(0.0, 1.0), clip(3.0, 1.0)];
+        let spec = AudioSpec {
+            sample_rate: 8000,
+            channels: 2,
+            total_frames: 16000,
+        };
+        create_empty_mix(&mixed, spec).unwrap();
+        mix_captured_bgm(&path, &mixed, &clips, &HashMap::new(), spec).unwrap();
+        let bytes = fs::read(&mixed).unwrap();
+        for frame in [7999, 8000, 8001, 15999] {
+            let sample = f32::from_le_bytes(bytes[frame * 8..frame * 8 + 4].try_into().unwrap());
+            assert!((sample - frame as f32 / 100000.0).abs() < 1e-6);
+        }
+        create_empty_mix(&mixed, spec).unwrap();
+        mix_separate_bgm_with_video(&path, &mixed, &clips, spec).unwrap();
+        let bytes = fs::read(&mixed).unwrap();
+        assert_eq!(
+            f32::from_le_bytes(bytes[8000 * 8..8000 * 8 + 4].try_into().unwrap()),
+            0.24
+        );
+    }
 
     #[test]
     fn post_mix_bgm_stays_continuous_across_an_edit_cut() {

@@ -3,7 +3,7 @@ using Monocle;
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 internal static class MaterialUiSmoke {
-    private const string CaptureSmokeVariable = "MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT";
+    private const string CaptureSmokeVariable = "MICROBLOCKS_QOL_MATERIAL_UI_SMOKE";
     private static bool armed;
     private static bool started;
     private static bool passed;

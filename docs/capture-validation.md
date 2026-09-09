@@ -1,64 +1,61 @@
-# Capture refactor validation — 2026-09-09
+# Capture validation — 2026-09-09 follow-up
 
-## Passed locally (Windows x64)
+## 实测结论
 
-| Check | Result |
-|---|---|
-| `cargo fmt --manifest-path Native/Cargo.toml -- --check` | Passed |
-| `cargo test --workspace --locked` | 17 passed |
-| `MQOL_TEST_FFMPEG=1 cargo test --workspace --features ffmpeg --locked` | 33 passed, including actual encoder/finalizer file fixtures |
-| `dotnet run --project Tests/Capture/Capture.csproj -c Release` | Passed: bounded queues, slow/throwing isolation, cancellation/drain, self-unsubscribe, pre-registration frame rejection, DSP jitter/reset/stall/rate-change clocks |
-| `dotnet build Source/MicroblocksQolUtils.csproj -c Release` (.NET 8 SDK) | 0 warnings, 0 errors |
-| `Tests/Capture.Integration` with release native DLL and `MQOL_TEST_ENCODER=auto` | 238 pixel callbacks, 201 non-silent audio callbacks; 0 pixel/order errors; slow consumer dropped 199 frames without interrupting normal consumers |
-| Real SDL / FMOD integration scenarios | Two simultaneous recordings; first disposed while second continued; drawable resize; correctly oriented red/blue BGRA; shared 3-bus DSP source; source unload/reload; non-GL video rejected while audio-only still worked |
-| FFmpeg decode of both source MKVs and finalized MP4 | No decode errors |
-| ffprobe final MP4 | H.264 160×90, 1.500 s video; AAC 1.514 s audio (AAC frame padding) |
+测试机器：Windows / Intel Graphics，Celeste 1.4.0.0 + Everest 6487-ultra，原生默认 D3D11。
 
-The release test used the real SDL2, FMOD, MonoMod and reference assemblies from the installed
-Celeste/Everest environment, plus its Master/UI banks. It created a hidden SDL window rather
-than booting the game. An earlier software-encoder run also passed (238 frames, 202 non-silent
-PCM callbacks). On this machine automatic encoder probing reported unavailable NVIDIA CUDA
-and successfully fell back to another encoder; this is expected, not a capture failure.
+已用独立游戏目录 `G:\MicroblocksQolUtils\.work\Celeste-test` 对照：
+- OpenGL + 模组 + 录制：纯色画面。
+- OpenGL + 模组，不录制：仍纯色。
+- OpenGL，禁用本模组：仍纯色。
+- D3D11 + 模组，不录制：正常标题画面。
+- D3D11 + 新版延迟 native Present shim + 双录制消费者：正常画面、音频、最终 MP4。
 
-Native fake-GL tests additionally assert zero-timeout fence polling, no mapping of pending
-GPU work, bounded PBO capacity, pack/framebuffer/read-buffer state restoration and resize
-cleanup. Native sync tests cover first-video gating, dropped audio block duration, clock
-reset, independent sink disposal and FPS sampling without cumulative jitter.
+因此不能通过强制 OpenGL 解决这台机器的兼容性。早期 prototype 的 DXGI prologue hook
+以及在 mod load 阶段安装的 hook 都在真实 Steam 游戏中失败，最终方案使用延迟 vtable shim。
+这些失败不计为通过。旧 smoke 仅检查文件/帧数会把纯色视频判成功，现已要求至少十帧有可见像素差异。
+UI smoke 现在有自己的 `MICROBLOCKS_QOL_MATERIAL_UI_SMOKE` 开关，不再与录制 smoke 共用环境变量。
 
-## Cross-target checks (not runtime tests)
+## 已通过
 
-All passed with `cargo check --workspace --locked --target <target>`:
+- C# Release 构建：零警告、零错误。
+- C# 单元测试：有界队列、慢/异常 callback 隔离、取消与 drain、自注销、FMOD sample clock；
+  新增音乐事件溢出检测、完整排空、per-sink 原点/初始快照/日志完整性测试。
+- Rust FFmpeg 测试：40 项，通过；包含真实 D3D11 staging/query/pixels/resize/release，
+  DXGI shim 原函数调用及卸载，GL PBO 状态恢复、混音/编码、音乐日志与样本级连续性测试。
+- 真实 SDL/OpenGL + FMOD 银行集成：238 帧、417 个非静音 PCM callback，像素方向/通道错误 0；
+  实际触发游戏 8 声道音效和 stereo 音乐，两个录制器、慢消费者、resize、卸载重载、finalize。
+  验证 BGM 独立文件及 pause/resume/seek/同实例 stop/start 日志，并导出连续 BGM 剪辑。
+- 真实 Celeste/D3D11 smoke：232 像素 callback、548 PCM callback，慢消费者独立丢弃 209 帧；
+  第一录制器关闭后第二个继续。无音频丢块。输出已用 FFmpeg 解码和检查画面。
+  MP4：H.264 1280x720，AAC stereo 48kHz；视频 2.800s / 音频 2.773s（小于一帧尾长差）。
+  这次机器的自动编码器明显跟不上输入，第一录制器 84 帧接收/49 帧编码队列丢弃；
+  测试证明时间线/隔离，并不宣称所有编码器、分辨率都能满帧。
 
-- `x86_64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `aarch64-linux-android`
+另外通过用户现有 Mods 的全量启动（162 modules，存档使用独立副本）：429 像素 callback / 506 PCM callback，MP4 解码画面正常。该高负载双编码测试中第一 sink 接收 84 帧、编码队列丢 57 帧、音频丢 3 块；不隐瞒负载下的数据丢弃，也不把它视为无损/满帧验证。
 
-These checks cover the native source **without FFmpeg linking**. Linux/macOS devices were
-not available for actual SDL/driver/FMOD execution here. Existing platform CI builds continue
-to compile/link each desktop target on its own runner; CI was updated but not remotely run
-or pushed in this task. Android is an extension point, not a shipped runtime claim.
+数据和日志在 `.work/capture-followup/.work/`，测试游戏不改用户存档。
 
-## Game launch limitation
+## 复现测试
 
-An isolated copy under `.work/Celeste-test` was attempted without modifying the user's saves
-or mod selection. Celeste exited with `Steam not found!` before mod loading. Therefore no
-in-level/full-game smoke pass is claimed. The opt-in in-game smoke runner remains available
-via `MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT` once Steam startup works.
+设置本机 `CELESTE_ROOT`、`FFMPEG_DIR`、`LIBCLANG_PATH`、Rust/.NET PATH，TEMP/TMP 指到 `.work`：
 
-## Local build / installation
+```powershell
+$env:MQOL_TEST_FFMPEG = '1'
+$env:MQOL_TEST_D3D11 = '1'
+cargo test -p microblocks-qol-native --features ffmpeg --lib -- --test-threads=1
+dotnet run --project Tests/Capture/Capture.csproj -c Release
+# 集成测试另外设置 MQOL_NATIVE_PATH 到 release DLL，MQOL_TEST_OUTPUT 到 .work 目录
+# 并确保 SDL/FMOD/FFmpeg DLL 可加载。
+dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Release
+```
 
-- Worktree: `.work/capture-refactor`, branch `codex/capture-refactor`.
-- Local FFmpeg SDK: BtbN shared **LGPL** FFmpeg 8.1, passed through `QOL_FFMPEG_DIR`.
-  Download archive SHA256: `B74C95A1976622F93F9C3CE73551683F4167646B155D9BFE9F2E132E5503E7EB`.
-  The repository's default minimal FFmpeg build is unchanged; the supplied SDK is opt-in.
-- Installed to `C:\SteamLibrary\steamapps\common\Celeste\Mods\MicroblocksQolUtils.zip`.
-  The requested game directory did not exist, so it is a directory junction to the actual
-  installation at `E:\SteamLibrary\steamapps\common\Celeste`. No game content was duplicated.
-- Installer added `--graphics OpenGL` to `everest-launch.txt`; prior configuration is backed
-  up at `.work/capture-refactor/.work/everest-launch-before-1788952261644.txt`.
-- Package and installed file SHA256 matched:
-  `4859515B732D0F7289181D23AD254E1D59ED34D06BA31276EEDAD39029B18B39`.
-- Runtime/frame outputs and temporary tools are under `.work`; they are not committed.
+真实游戏 smoke：仅为该次启动设置 `MICROBLOCKS_QOL_CAPTURE_SMOKE_OUTPUT` 到 `.work/*.mkv`。
+等 Overworld/Level 加载后开始，写 `.passed` 或 `.failed`；不要把这个环境变量永久写入 Steam/系统。
 
-One pre-existing C# null-conditional assignment in `MaterialModOptions.cs` was rewritten as
-an equivalent explicit null check so the repository's configured .NET 8 SDK can compile it.
+## 未证明的部分
+
+最新版 native 已通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。
+Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。
+游戏之外直接 native FMOD 命令的一帧内中间状态可能不能被 managed observer 看见。
+静态 BGM 映射不能重放动态 FMOD 音乐；新独立 PCM/事件路径应作为保真来源。

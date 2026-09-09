@@ -89,8 +89,35 @@ struct Frame {
     height: u32,
     timestamp: u64,
     sequence: u64,
+    bottom_up: bool,
+    rgba: bool,
 }
 static FRAMES: Mutex<VecDeque<Frame>> = Mutex::new(VecDeque::new());
+
+#[cfg(windows)]
+pub(crate) fn enqueue_d3d(
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    timestamp: u64,
+    sequence: u64,
+    rgba: bool,
+) {
+    if let Ok(mut frames) = FRAMES.try_lock() {
+        if frames.len() == RING_SIZE {
+            frames.pop_front();
+        }
+        frames.push_back(Frame {
+            bytes,
+            width,
+            height,
+            timestamp,
+            sequence,
+            bottom_up: false,
+            rgba,
+        });
+    }
+}
 
 impl Readback {
     // Only call while this context is current. Context destruction otherwise owns cleanup.
@@ -209,6 +236,8 @@ impl Readback {
                         height,
                         timestamp: slot.timestamp,
                         sequence: slot.sequence,
+                        bottom_up: true,
+                        rgba: true,
                     });
                 }
             }
@@ -320,12 +349,14 @@ pub struct FrameResult {
 fn convert_rgba(frame: &mut Frame) {
     let stride = frame.width as usize * 4;
     let height = frame.height as usize;
-    for y in 0..height / 2 {
+    for y in 0..if frame.bottom_up { height / 2 } else { 0 } {
         let (before, after) = frame.bytes.split_at_mut((height - 1 - y) * stride);
         before[y * stride..(y + 1) * stride].swap_with_slice(&mut after[..stride]);
     }
     for pixel in frame.bytes.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+        if frame.rgba {
+            pixel.swap(0, 2);
+        }
         pixel[3] = 255;
     }
 }
@@ -386,6 +417,8 @@ mod tests {
             height: 2,
             timestamp: 5,
             sequence: 9,
+            bottom_up: true,
+            rgba: true,
         };
         convert_rgba(&mut frame);
         assert_eq!(

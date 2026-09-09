@@ -184,19 +184,19 @@ if (process.argv.includes("--install")) {
   mkdirSync(modsRoot, { recursive: true });
   rmSync(installedDirectory, { recursive: true, force: true });
   copyFileSync(archive, installedArchive);
-  // FNA creates its SDL window before Everest loads mods: renderer selection must
-  // happen at process launch, not in a module initializer. Preserve explicit overrides.
+  // Never change the user's graphics backend when installing a capture consumer.
+  // Remove only the exact block added by ABI 5's installer, preserving user overrides.
   const launchPath = resolve(celesteRoot, "everest-launch.txt");
-  const launch = existsSync(launchPath) ? readFileSync(launchPath, "utf8") : "";
-  const active = launch.split(/\r?\n/u).filter((line) => !line.trimStart().startsWith("#")).join(" ");
-  if (!/(?:^|\s)--graphics(?:\s|=)/u.test(active)) {
-    const backup = resolve(root, ".work", `everest-launch-before-${Date.now()}.txt`);
-    mkdirSync(dirname(backup), { recursive: true });
-    writeFileSync(backup, launch);
-    writeFileSync(launchPath, launch + "\n# MicroblocksQolUtils shared SDL capture requires OpenGL.\n--graphics OpenGL\n");
-    console.log(`Configured OpenGL for SDL capture; previous launch config: ${backup}`);
-  } else {
-    console.log("Preserved existing --graphics override; SDL capture requires OpenGL.");
+  if (existsSync(launchPath)) {
+    const launch = readFileSync(launchPath, "utf8");
+    const restored = launch.replace(/\r?\n# MicroblocksQolUtils shared SDL capture requires OpenGL\.\r?\n--graphics OpenGL\r?\n/gu, "\n");
+    if (restored !== launch) {
+      const backup = resolve(root, ".work", `everest-launch-before-restore-${Date.now()}.txt`);
+      mkdirSync(dirname(backup), { recursive: true });
+      writeFileSync(backup, launch);
+      writeFileSync(launchPath, restored);
+      console.log(`Removed the old capture-only OpenGL override; backed up ${backup}`);
+    }
   }
   console.log(`Installed ${installedArchive}`);
 }

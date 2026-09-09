@@ -64,15 +64,15 @@ Windows 下，关注的玩家换房间且 Celeste 不在前台时，会发送系
 
 ### 录制与死亡回放
 
-录制统一使用 Windows / Linux / macOS 的 SDL OpenGL native hook，不再依赖
-桌面录屏 API、权限选择器或屏幕位置。需要在 `everest-launch.txt` 中设置
-`--graphics OpenGL` 并重启（或在启动前设置 `FNA3D_FORCE_DRIVER=OpenGL`）。
-安装脚本会为没有显式 renderer 配置的游戏添加该启动参数，并备份原配置到 `.work`；
-已有显式覆盖会保留。普通 ZIP 安装需手动配置。需要 OpenGL 3.2（未来 Android 对应 GLES 3）。
+录制按实际 renderer 选择 native 取帧：Windows 支持 D3D11 与 OpenGL；Linux/macOS
+保留 OpenGL 3.2+ 路径。不再依赖桌面录屏 API、权限选择器或屏幕位置。
+**不要为录制强制改成 OpenGL**。安装器会备份并撤销上一版自动添加的 OpenGL 参数，
+保留用户自行配置的参数。Metal/Vulkan/SDL_GPU 尚未实现；Linux/macOS/Android 未真机验证。
 
 在 `SDL_GL_SwapWindow` **之前**提交每帧 PBO 异步读回；后续帧零等待检查 GPU fence，
 后台线程转成 BGRA 并分发，不在游戏线程编码或调用消费者。尺寸变化会重建 PBO；
-没有订阅时停止读回。无需 macOS 屏幕录制授权或 Linux 桌面门户。
+没有订阅时停止读回。D3D11 对应 native DXGI Present shim、staging texture 与非阻塞 query/map。
+读回与编码解耦，消费者可以分别注册像素、FMOD PCM、音乐事件 callback。
 详见 [采集架构及测试](docs/capture-architecture.md)。
 
 - 自动录制策略：每个房间都录制，或只录制携带金草莓的 run。
@@ -92,8 +92,9 @@ Windows 下，关注的玩家换房间且 Celeste 不在前台时，会发送系
   MP4 中的 MPEG-4 Part 2。音频使用 AAC。可以选择录制 UI 音效、帧率、码率和编码器，
   并设置完整录像/死亡回放的保留数量或立即清理旧录像。
 - 音频通过唯一一套 FMOD DSP tap 采集 gameplay_sfx、music 和 ui_sfx（各消费者独立筛选 UI 音效）。
-  音频块分总线写入 .sfxchunks sidecar，最终化时再分别处理 SFX 剪辑和 BGM 后期
-  时间线，不把整段音频堆在内存中。因此 `.working` 里的 MKV 是无音轨的中间文件；
+  SFX/UI 写入 `.sfxchunks`，BGM 单独写入 `.bgmchunks`；`.music.jsonl` 独立保存切歌、
+  重启、停止、暂停、seek、参数和播放位置等信息。同曲重启不当作旧曲连续播放。
+  最终化时分别处理 SFX 剪辑和 BGM 后期时间线。因此 `.working` 里的 MKV 是无音轨的中间文件；
   应播放 `full` 或 `deaths` 目录下完成最终化的 MP4。
 - BGM 可以直接使用捕获的游戏混音，也可以使用 SfxOnlyWithPostMix：
   普通地图在该模式下只按视频时间线剪辑 SFX/UI，music 总线作为独立后期音源，
