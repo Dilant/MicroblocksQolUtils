@@ -33,8 +33,10 @@
 同步完成恢复，避免切回用户槽后旧 wipe 回调读取错误的 `StateManager.Instance`。
 已有手动 SL 标记不清除；用户手动存读档的原有标记和行为不变。
 
-缺失/禁用 SRT、TAS 运行中或选中 TAS 存档时跳过。反射签名或 IL 模式不匹配则撤销全部 hook，
-记录日志，不回退到覆盖用户槽或有标记的自动保存。
+缺失/禁用 SRT、TAS 运行中或选中 TAS 存档时跳过。反射签名不匹配则撤销 hook；IL 模式不匹配
+则记录具体方法并禁用整套内部恢复，已安装的补丁保持原有 SRT 行为，不回退到覆盖用户槽或有标记的自动保存。
+同时匹配原始 DLL 的 `call` 和 Everest 重链接后的 `callvirt`。在 Everest Ultra 延迟/并行安装 hook 时，
+必须等标记、保存、加载三个 IL 补丁全部应用成功后才允许内部操作；不兼容分支不会向启动事务抛出异常。
 
 ## 自动化验证
 
@@ -44,6 +46,7 @@
 dotnet build Source/MicroblocksQolUtils.csproj -c Release
 dotnet run --project Tests/Recording -c Release
 dotnet run --project Tests/Recording.Interop -c Release -- C:/SteamLibrary/steamapps/common/Celeste .work/interop
+dotnet run --project Tests/Recording.Interop -c Release -- C:/SteamLibrary/steamapps/common/Celeste .work/interop --cached
 dotnet run --project Tests/Capture -c Release
 ```
 
@@ -53,7 +56,10 @@ dotnet run --project Tests/Capture -c Release
 
 `Recording.Interop` 从本机 `SpeedrunTool.zip` 解出 DLL 到临时目录，检查生产设置默认值，
 并对**真实安装的 DLL** 安装/卸载内部槽及无标记存读档 hook，不启动游戏、不操作玩家存档。
-已验证本机 SpeedrunTool 3.27.21 的接口/IL 兼容。
+`--cached` 改用游戏实际加载的 `Mods/Cache/SpeedrunTool.SpeedrunTool.dll`（需先启动过游戏生成缓存），
+避免只验证原始程序集、漏掉重链接指令变化。两种 DLL 都测试立即安装、Ultra 延迟并行提交、
+存/读分支不匹配时安全禁用、失败后重新加载及取消尚未应用的 hook。
+已验证本机 SpeedrunTool 3.27.21 与 Everest 6487 Ultra 的原始和重链接 IL 兼容。
 
 自动化测试不等于实际游戏内完整切面→死亡→手动 SL→清槽→死亡→导出视频验收。
 游戏内还应检查开启/关闭开关、金草莓重开章节不受影响，并试听导出视频的衔接。

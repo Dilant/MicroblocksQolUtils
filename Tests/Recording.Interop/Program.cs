@@ -5,7 +5,8 @@ using Celeste.Mod.MicroblocksQolUtils;
 
 // Checks the real installed assembly, without starting Celeste or touching saves.
 // Run from the worktree with an explicit .work scratch directory.
-if (args.Length != 2) throw new ArgumentException("Usage: Recording.Interop <CelesteRoot> <scratch-directory>");
+if (args.Length is < 2 or > 3 || (args.Length == 3 && args[2] != "--cached"))
+    throw new ArgumentException("Usage: Recording.Interop <CelesteRoot> <scratch-directory> [--cached]");
 string root = Path.GetFullPath(args[0]);
 string scratch = Path.GetFullPath(args[1]);
 Directory.CreateDirectory(scratch);
@@ -20,7 +21,10 @@ using (ZipArchive zip = ZipFile.OpenRead(Path.Combine(root, "Mods", "SpeedrunToo
     foreach (ZipArchiveEntry entry in zip.Entries.Where(entry => entry.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
         entry.ExtractToFile(Path.Combine(scratch, entry.Name), overwrite: true);
 }
-Assembly srt = AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.Combine(scratch, "SpeedrunTool.dll"));
+Assembly srt = AssemblyLoadContext.Default.LoadFromAssemblyPath(args.Length == 3 && args[2] == "--cached"
+    ? Path.Combine(root, "Mods", "Cache", "SpeedrunTool.SpeedrunTool.dll")
+    : Path.Combine(scratch, "SpeedrunTool.dll"));
+Console.WriteLine($"Testing {srt.Location}");
 VerifyDefaultSetting();
 SpeedrunToolAutoSave.Load(srt);
 try {
@@ -40,6 +44,7 @@ try {
 } finally {
     SpeedrunToolAutoSave.Unload();
 }
+HookCompatibility.Verify(srt);
 
 [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
 static void VerifyDefaultSetting() {

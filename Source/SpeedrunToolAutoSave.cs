@@ -22,15 +22,26 @@ internal static class SpeedrunToolAutoSave {
     private static PropertyInfo? enabled;
     private static PropertyInfo? tasRunning;
     private static Func<bool>? allFree;
+    private static HookStatus? hookStatus;
+
+    // Everest Ultra may apply these manipulators later, on startup workers.
+    // Hook objects alone do not mean the adapter is ready. A failed generation
+    // stays disabled until Load, including when another mod rebuilds the chain.
+    private sealed class HookStatus {
+        internal volatile bool SaveReady, LoadReady, MarkReady, Initialized, Failed;
+        internal bool Ready => Initialized && SaveReady && LoadReady && MarkReady && !Failed;
+    }
 
     internal static bool SavingSilently { get; private set; }
     internal static bool LoadingSilently { get; private set; }
     private static bool suppressMarking;
-    internal static bool Available => saveHook is not null && markHook is not null && loadHook is not null;
+    internal static bool Available => hookStatus?.Ready is true;
     internal static bool HasState => Available && SpeedrunToolRecoverySlot.HasState;
 
     internal static void Load(Assembly assembly) {
         Unload();
+        HookStatus status = new();
+        hookStatus = status;
         try {
             Type manager = RequiredType("SaveLoad.StateManager");
             Type slots = RequiredType("SaveLoad.SaveSlotsManager");
@@ -51,34 +62,46 @@ internal static class SpeedrunToolAutoSave {
                 [typeof(Dictionary<Type, Dictionary<string, object>>), typeof(Level)])
                 ?? throw new MissingMethodException(marks.FullName, "ReColor");
 
-            // Install all hooks or none. An unknown implementation must not fall back
-            // to an ordinary save, which would unexpectedly mark/freeze gameplay.
+            // Activate only when ALL manipulators have succeeded. Unknown IL must
+            // disable recovery, never fall back to an ordinary save or throw out of
+            // a deferred startup transaction (outside this method's try/catch).
             markHook = new ILHook(recolor, il => {
+                status.MarkReady = false;
                 ILCursor cursor = new(il);
                 ILLabel original = cursor.DefineLabel();
-                cursor.EmitDelegate(() => suppressMarking);
+                cursor.EmitDelegate(() => status.Ready && suppressMarking);
                 cursor.Emit(OpCodes.Brfalse, original);
                 cursor.Emit(OpCodes.Ret);
                 cursor.MarkLabel(original);
+                status.MarkReady = true;
             });
-            saveHook = new ILHook(save, SkipInternalWait);
-            loadHook = new ILHook(load, SkipInternalWait);
+            saveHook = new ILHook(save, il => SkipInternalWait(il, loading: false));
+            loadHook = new ILHook(load, il => SkipInternalWait(il, loading: true));
             SpeedrunToolRecoverySlot.Initialize(assembly);
-            Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "SpeedrunTool private recording recovery slot enabled");
+            status.Initialized = true;
+            Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "SpeedrunTool private recovery hooks registered; activation requires all IL hooks to succeed");
 
-            void SkipInternalWait(ILContext il) {
+            void SkipInternalWait(ILContext il, bool loading) {
+                if (loading) status.LoadReady = false;
+                else status.SaveReady = false;
                 ILCursor cursor = new(il);
                 if (!cursor.TryGotoNext(MoveType.After,
-                        instruction => instruction.MatchCall(manager, "PreCloneSavedEntities"),
+                        // Everest's relinker can turn the original call into callvirt.
+                        instruction => instruction.MatchCallOrCallvirt(manager, "PreCloneSavedEntities"),
                         instruction => instruction.MatchLdarg(1))
-                    || cursor.Next?.OpCode.FlowControl != FlowControl.Cond_Branch) {
-                    throw new InvalidOperationException("Unrecognized SpeedrunTool save/load-completion branch");
+                    || cursor.Next?.OpCode.Code is not (Code.Brfalse or Code.Brfalse_S or Code.Brtrue or Code.Brtrue_S)) {
+                    status.Failed = true;
+                    Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool",
+                        $"Silent recovery disabled: unrecognized completion branch in {il.Method.FullName}");
+                    return; // No IL has been modified; ordinary SRT behavior is intact.
                 }
                 // Only skip the animation/wait. The original tas argument,
                 // validation, saved state, callbacks and load behavior remain normal.
                 // A private load completes synchronously too: no pending wipe may
                 // consult StateManager.Instance after we restore the user's slot.
-                cursor.EmitDelegate((bool tas) => tas || SavingSilently || LoadingSilently);
+                cursor.EmitDelegate((bool tas) => tas || (status.Ready && (SavingSilently || LoadingSilently)));
+                if (loading) status.LoadReady = true;
+                else status.SaveReady = true;
             }
 
             Type RequiredType(string name) => assembly.GetType("Celeste.Mod.SpeedrunTool." + name, true)!;
@@ -129,6 +152,8 @@ internal static class SpeedrunToolAutoSave {
     }
 
     internal static void Unload() {
+        if (hookStatus is { } status) status.Failed = true;
+        hookStatus = null;
         SpeedrunToolRecoverySlot.Unload();
         saveHook?.Dispose();
         markHook?.Dispose();
