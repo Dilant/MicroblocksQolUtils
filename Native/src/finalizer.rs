@@ -743,6 +743,12 @@ impl TimelineOutput {
                 software::scaling::Flags::BILINEAR,
             );
         }
+        // QSV and other asynchronous encoders can still own the previous frame.
+        // This also preserves images retained in the crossfade queue.
+        let writable = unsafe { ffmpeg::ffi::av_frame_make_writable(self.converted.as_mut_ptr()) };
+        if writable < 0 {
+            return Err(FinalizeError::Convert(ffmpeg::Error::from(writable)));
+        }
         self.scaler
             .run(source, &mut self.converted)
             .map_err(FinalizeError::Convert)?;
@@ -1143,15 +1149,16 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let mut frame = CapturedFrame {
+            format: crate::CapturePixelFormat::Bgra,
             width: 64,
             height: 64,
             captured_at_unix_nanos: start,
-            bgra: vec![0; 64 * 64 * 4],
+            pixels: vec![0; 64 * 64 * 4],
         };
         let mut encoder = VideoFileEncoder::create(&config, &frame).unwrap();
         for index in 0..90_u64 {
             frame.captured_at_unix_nanos = start + index * 1_000_000_000 / 30;
-            for pixel in frame.bgra.chunks_exact_mut(4) {
+            for pixel in frame.pixels.chunks_exact_mut(4) {
                 pixel[0] = (index * 3) as u8;
                 pixel[1] = (index * 5) as u8;
                 pixel[2] = (index * 7) as u8;

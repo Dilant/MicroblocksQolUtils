@@ -7,6 +7,23 @@ CaptureFrame Frame(ulong n) => new(new byte[4], 1, 1, n * 16_666_667, n);
 CaptureAudio Audio(ulong n) => new(new float[2], 48000, 2, 1, "bus:/gameplay_sfx", n, n);
 
 int removed = 0;
+// Intentional high-refresh sampling happens before the callback queue, not by
+// overflowing it and hoping the native sink selects a usable frame afterwards.
+var sampledEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var sampledRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+List<ulong> sampledTimes = [];
+using (var sampled = new CaptureSubscription(frame => {
+    sampledTimes.Add(frame.TimestampNanos);
+    if(sampledTimes.Count==1) { sampledEntered.SetResult(); sampledRelease.Task.GetAwaiter().GetResult(); }
+}, null, _=>{}, maxFrameRate:60)) {
+    sampled.Offer(Frame(0)); await Timeout(sampledEntered.Task);
+    // 144-Hz producer, but only three subsequent 60-Hz ticks should enter the queue.
+    for(ulong i=1;i<=7;i++) sampled.Offer(new CaptureFrame(new byte[4],1,1,i*1_000_000_000/144,i));
+    Check(sampled.DroppedFrames==0,"redundant high-refresh frames overflowed recording callbacks");
+    sampled.Complete(); sampledRelease.SetResult(); await Timeout(sampled.Completion);
+}
+Check(sampledTimes.Count==4 && sampledTimes.SequenceEqual(new ulong[]{0,2_000_000_000/144,4_000_000_000/144,7_000_000_000/144}),
+    "recording sampling changed frame timestamps or selected wrong cadence");
 var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 int calls = 0;

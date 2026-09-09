@@ -109,4 +109,13 @@ var legacy = JsonSerializer.Deserialize<RecordingClip>("""
     {"Source":"run.mkv","StartSeconds":0,"DurationSeconds":1,"MusicEvent":"","MusicTimelineMilliseconds":0}
     """)!;
 Check(!legacy.BgmFollowsVideo, "legacy timelines must default to ordinary BGM reconstruction");
+// Reports must distinguish actual submitted/encoded cadence from configured FPS.
+var stats = new CaptureStatistics(false,2560,1506,0,601,381,220,0,0,10_000_000_000,0,0);
+var reportType = typeof(AutoRecorder).Assembly.GetType("Celeste.Mod.MicroblocksQolUtils.RecordingCaptureReport")!;
+var report = Activator.CreateInstance(reportType,60,stats,new CaptureDeliveryStatistics(0,0,0,0),0L,0L)!;
+using(var reportJson=JsonDocument.Parse(JsonSerializer.Serialize(report,reportType))) {
+    var r=reportJson.RootElement;
+    Check(r.GetProperty("SubmittedFps").GetDouble()==60 && r.GetProperty("EncoderInputFps").GetDouble()==38
+        && r.GetProperty("UnderTarget").GetBoolean(),"capture report hid encoder loss behind nominal FPS");
+}
 Console.WriteLine("PASS production AutoRecorder room policy, both sink branches, restore/short rooms, explicit mix mode, death trim, snapshots and legacy metadata");

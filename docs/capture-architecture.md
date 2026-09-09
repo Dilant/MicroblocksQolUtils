@@ -1,4 +1,4 @@
-# 共享采集架构（native ABI 7）
+# 共享采集架构（native ABI 8）
 
 ## 数据路径
 
@@ -56,11 +56,11 @@ await registration.Completion; // 在 callback 外等待正在执行的 callback
 ```
 
 三个 callback 可以独立省略，但不能全空。最多 16 个注册。每个注册独立排队：
-3 帧、256 PCM 块、256 音乐事件。callback 内不能直接操纵 game/GL/D3D/FMOD 对象，
+普通订阅 3 帧，内置录制订阅 5 帧；256 PCM 块、256 音乐事件。callback 内不能直接操纵 game/GL/D3D/FMOD 对象，
 也不能同步等待自身 Completion。慢消费者、抛异常的消费者不影响其他 callback。
 数组在发布后不复用，可保留；只读契约不允许通过 unsafe/MemoryMarshal 修改共享数据。
 
-性能敏感的逐帧处理（内置录制器也使用它）可改用 `CaptureSource.SubscribeBorrowed(...)`。
+性能敏感的逐帧处理可改用 `CaptureSource.SubscribeBorrowed(...)`。
 参数及取消方式相同，但像素仅在同步 callback 执行期间有效；要保留/交给异步代码必须先
 `CaptureFrame owned = frame.Snapshot()`。PCM/音乐事件仍为 owned，不受此限制。
 借用路径采用引用计数共享缓冲：入队持有，丢弃/取消/回调结束归还，绝不在正在执行 callback 时复用。
@@ -83,6 +83,7 @@ worker 完成 owned copy 后才归还 slot。普通读写竞争不再丢音频�
 - `run.mkv.sfxchunks`：游戏音效及可选 UI 音效，**不含 BGM**。
 - `run.mkv.bgmchunks`：独立 music bus 原始 PCM，包含 FMOD 实际混出的主/alt 音乐及过渡。
 - `run.mkv.music.jsonl`：版本头、初始主/alt 状态、时间戳事件、完成标记。
+- `run.mkv.capture.json`：排空后的目标/实际输入 FPS、native/订阅/source pool 丢失统计；导出后保存在 MP4 的 `.timeline.json` 的 `captureReports` 中。
 
 PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时将 FMOD 标准
 1/2/4/5/6/8 声道折叠为双声道。中心/环绕分配到左右，LFE 不加入 stereo。
@@ -118,24 +119,35 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 需要保留游戏实际动态音乐时使用采集到的 BGM，不配置静态替换映射。
 剪辑不能凭空生成未采到的音乐，PCM 丢块仍按时间戳表现为缺口。
 
-## 录制启动和过载
+## 录制启动、帧率与过载（ABI 8）
 
-- 每个 sink 的硬件编码器在首帧确定分辨率后创建。初始化选择/耗时写入日志。
-- 不再用 3 帧覆盖队列丢掉冷启动期间的画面。正常时保留少量 raw BGRA；队列积压时，
-  sink worker 做可逆空间差分 + Zstd level 1 无损压缩，encoder worker 按 FIFO 解压消费。
-- 每 sink 排队 payload 最多 **192 MiB**，数量最多 `queue_capacity + 5 * fps`；任一达到就拒绝新帧并计数。
-  不是无限 RAM，也不是承诺能缓存任意内容的 5 秒。上限不含正在处理的帧、压缩 scratch、codec/GPU 内存。
-  用完即释放；稳态不做这次压缩。日志报告峰值帧数/字节与 overflow。
-- 音频 sink 入队发生在 callback worker，不是 mixer，已移除两层旧的 try-lock 丢块逻辑。
-  音频磁盘写入在独立线程、锁外进行；native 和订阅缓冲各容纳 256 块，覆盖 source 三个
-  64-slot ring 恢复后的突发批次。native 每 sink 最多 16 MiB PCM buffer 容量，不是无限增长。
-- FPS 统一使用最近 tick 量化，避免 60-Hz 来源的微小抖动被向下取整误判成重复帧。
-  最大量化误差半个目标帧；原始采集时间戳、音频原点和 PCM 时钟不改写。
-- encoder 重用输入 AVFrame，并在覆盖 converted frame 前 make-writable，防止异步 codec 仍引用旧像素。
-- `NativeCaptureSession.DeliveryStatistics` 报告进入 native 之前的订阅丢帧/PCM/音乐事件/异常；
-  `Statistics` 报告 native 队列损失。不能仅看后者就宣称端到端无损。
-- 持续编码/磁盘速度低于输入速度时，任何有限缓冲最终都会满。后续可用相同配置共享编码、
-  更低分辨率/帧率或不同 encoder 减负；当前仍是单一采集、多 sink 独立编码，不伪称已经共享码流。
+- 内置录制通过 `SubscribeRecording(fps, ...)` 使用 borrowed 像素，并在订阅队列**之前**筛选目标 FPS。
+  普通 `Subscribe` / `SubscribeBorrowed` 不限帧率；不会为了录制把第三方 callback 一起限到 60。
+- 若所有像素消费者都是有限 FPS 录制器，GPU 只按最大请求 FPS 提交新的读回。
+  仍在每次 Present/Swap 轮询之前的 GPU 任务；120/144-Hz 游戏录 60 FPS 不再先取回所有冗余帧。
+  只要有一个不限速像素消费者，就恢复每次呈现提交。游戏 renderer、渲染帧率不被修改。
+- 每个 sink 的硬件编码器仍在首帧确定分辨率后独立创建，选择/初始化耗时写日志。
+  QSV 的 `async_depth` 从 1 改为 4；录制及导出重用 AVFrame 前均 make-writable，不能覆盖编码器/交叉淡化仍持有的像素。
+- 移除旧的 BGRA 空间差分 + Zstd 启动缓存。高 DPI 下压缩本身超过一帧预算，会让短暂启动积压变成持续丢帧；
+  只换成更快压缩参数仍不足以覆盖双编码、全画面滚动，因此最终方案不依赖画面可压缩性。
+- 稳态直接送 BGRA 给 encoder；积压时 callback worker 先做编码本来需要的 NV12 4:2:0 转换，
+  写入录制目录中的 `mqol-frames-*.tmp`，队列只保留尺寸、原始时间戳、偏移、长度和文件引用。
+  encoder worker FIFO 读出 NV12 后直接编码；不做 NV12→RGB→NV12 的有损往返，不补重复帧冒充 60 FPS。
+  SwsContext 按 sink 缓存且由 mutex 独占；直接在有 padding 的 owned buffer 间转换，不额外复制两份全分辨率 AVFrame。
+- 上限仍明确：共享 lease pool **128 MiB**；native 排队 RAM payload **192 MiB/sink**；
+  排队帧数最多 `queue_capacity + 5 * fps`；临时文件**每段 2 GiB**。达到帧数上限先拒绝，避免继续写盘。
+  队列赶上后切换/释放文件段，不会截断正在读取的旧文件；切换瞬间最多一个旧读任务段加一个新段。
+  正常 Stop/Dispose 排空并删除缓存。异常杀进程可能留下具名 `.tmp`，不能保证 crash 后也自动删除。
+  上述不是进程 RSS 上限：不含正在处理的帧、转换 scratch、OS 文件缓存、codec/GPU 内存。
+- 录制订阅队列为 5 帧（60 FPS 约 83ms），吸收启动/IO 的短突发；普通消费者仍是 3 帧。
+  没有扩大共享 pool 或 native RAM cap。慢 callback、慢磁盘、持续低于实时速度的编码器仍可能耗尽有限缓冲。
+  临时 IO 不在 render/FMOD 线程；这不是保证任何磁盘/任意分辨率都能满帧。
+- 音频 sink writer、各 bus 的预分配 ring、SFX/BGM/音乐事件分离、房间级 BGM 策略保持不变。
+  native 及订阅各容纳 256 PCM 块，native PCM 每 sink 最多 16 MiB；仍不阻塞 mixer。
+- FPS 使用最近 tick 量化；原始 GPU 提交时间、首帧音频原点、PCM 时钟不改写。
+  `NativeCaptureSession.DeliveryStatistics` 报告订阅损失，`Statistics` 报告 native 损失；排空后写 capture report。
+  `EncoderInputFps` 是送入编码器的帧率，不是声称最终 MP4 的独立画面帧率；后者必须实际解码核对。
+- 当前仍是单一采集、多 sink 独立编码，不声称已共享两条压缩码流。
 
 ## GPU / 平台边界
 

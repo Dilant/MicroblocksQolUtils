@@ -1,14 +1,20 @@
+using System.Text.Json;
+
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 internal sealed class NativeRoomRecording {
     private readonly NativeCaptureSession capture;
     private int stopped;
     private double lastMediaTime;
+    private readonly int targetFrameRate;
+    private readonly long initialSourcePoolDrops = CaptureSource.DroppedFrames;
+    private readonly long initialSourceAudioDrops = CaptureSource.DroppedAudioChunks;
 
     public string Path { get; }
     public string AudioPath => Path + ".sfxchunks";
     public string BgmPath => Path + ".bgmchunks";
     public string MusicEventsPath => Path + ".music.jsonl";
+    public string CaptureReportPath => Path + ".capture.json";
     public bool HasAudioTap => capture.HasAudioTap;
 
     public CaptureStatistics Statistics {
@@ -26,6 +32,7 @@ internal sealed class NativeRoomRecording {
     private NativeRoomRecording(NativeCaptureSession capture, string path) {
         this.capture = capture;
         Path = path;
+        targetFrameRate = MicroblocksQolUtilsModule.Settings.RecordingFrameRate;
     }
 
     public double MediaTimeSeconds {
@@ -76,8 +83,38 @@ internal sealed class NativeRoomRecording {
                 + $"dropped {statistics.AudioChunksDropped} chunk(s)."
             );
         }
-        return Task.Run(capture.Dispose);
+        return Task.Run(() => {
+            try {
+                // Read counters after draining, before destroying the native handle.
+                capture.Stop();
+                var report = new RecordingCaptureReport(targetFrameRate, capture.Statistics,
+                    capture.DeliveryStatistics, CaptureSource.DroppedFrames - initialSourcePoolDrops,
+                    CaptureSource.DroppedAudioChunks - initialSourceAudioDrops);
+                Logger.Log(report.UnderTarget ? LogLevel.Warn : LogLevel.Info,
+                    "MicroblocksQolUtils/Recorder",
+                    $"Video capture {report.Statistics.Width}x{report.Statistics.Height}: target={targetFrameRate}, "
+                    + $"submitted={report.SubmittedFps:F2}fps, encoder-input={report.EncoderInputFps:F2}fps; "
+                    + $"nativeDrops={report.Statistics.FramesDropped}, callbackDrops={report.Delivery.DroppedFrames}, "
+                    + $"sourcePoolDrops={report.SourcePoolDrops}. File: {Path}");
+                try {
+                    File.WriteAllText(CaptureReportPath, JsonSerializer.Serialize(report,
+                        new JsonSerializerOptions { WriteIndented = true }));
+                } catch (Exception exception) {
+                    // Diagnostics must not discard an otherwise usable recording.
+                    Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/CaptureReport");
+                }
+            } finally { capture.Dispose(); }
+        });
     }
+}
+
+internal sealed record RecordingCaptureReport(int TargetFps, CaptureStatistics Statistics,
+    CaptureDeliveryStatistics Delivery, long SourcePoolDrops, long SourceAudioDrops) {
+    public double SubmittedFps => Rate(Statistics.FramesCaptured);
+    public double EncoderInputFps => Rate(Statistics.FramesConsumed);
+    public bool UnderTarget => Statistics.MediaTimeSeconds >= 1 && EncoderInputFps < TargetFps * 0.98;
+    private double Rate(ulong frames) => frames > 1 && Statistics.MediaTimeSeconds > 0
+        ? (frames - 1) / Statistics.MediaTimeSeconds : 0;
 }
 
 public readonly record struct MusicPosition(string Event, int TimelineMilliseconds) {

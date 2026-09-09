@@ -243,6 +243,7 @@ struct Slot {
     sequence: u64,
 }
 struct Readback {
+    cadence: crate::frame_cadence::FrameCadence,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     width: u32,
@@ -284,6 +285,7 @@ impl Readback {
                 });
             }
             Ok(Self {
+                cadence: Default::default(),
                 device,
                 context,
                 width: desc.Width,
@@ -354,6 +356,9 @@ impl Readback {
                 );
             }
             if let Some(slot) = self.slots.iter_mut().find(|s| !s.pending) {
+                if !self.cadence.due(timestamp) {
+                    return Ok(());
+                }
                 self.context.CopyResource(&slot.texture, backbuffer);
                 self.context.End(&slot.query);
                 slot.pending = true;
@@ -444,6 +449,177 @@ mod tests {
         }
     }
     use crate::sdl_readback::{FrameResult, mqol_source_frame_free, mqol_source_poll};
+    #[test]
+    #[ignore = "full-resolution hardware regression: MQOL_TEST_BGRA and MQOL_TEST_OUTPUT, --release"]
+    #[cfg(feature = "ffmpeg")]
+    fn real_d3d11_full_resolution_recording_cadence() {
+        use crate::{CaptureConfig, CaptureSession, CapturedFrame};
+        use std::sync::{Arc, atomic::AtomicU64};
+        use std::time::{Duration, Instant};
+        let width = 2560u32;
+        let height = 1506u32;
+        let pixels = std::fs::read(std::env::var("MQOL_TEST_BGRA").unwrap()).unwrap();
+        assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        let session = Arc::new(CaptureSession::new(CaptureConfig {
+            fps: 60,
+            encoder: "auto".into(),
+            bitrate_kbps: 12000,
+            output_path: Some(std::env::var("MQOL_TEST_OUTPUT").unwrap()),
+            ..Default::default()
+        }));
+        session.start().unwrap();
+        crate::frame_cadence::mqol_source_set_frame_rate(60);
+        let running = Arc::new(AtomicBool::new(true));
+        let delivered = Arc::new(AtomicU64::new(0));
+        // Match production: acquisition and sink preparation are separate workers.
+        // Combining poll/conversion and encoding push here creates a bottleneck
+        // that the actual CaptureSource/Subscription pipeline does not have.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<CapturedFrame>(5);
+        let sink = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                for frame in receiver {
+                    session.push_frame(frame);
+                }
+            })
+        };
+        let consumer = {
+            let running = running.clone();
+            let delivered = delivered.clone();
+            std::thread::spawn(move || {
+                while running.load(Ordering::Acquire) {
+                    let mut frame = FrameResult::default();
+                    if unsafe { mqol_source_poll(&mut frame) } == 1 {
+                        delivered.fetch_add(1, Ordering::Relaxed);
+                        {
+                            let bgra =
+                                unsafe { std::slice::from_raw_parts(frame.pixels, frame.length) }
+                                    .to_vec();
+                            sender
+                                .try_send(CapturedFrame {
+                                    format: crate::CapturePixelFormat::Bgra,
+                                    width: frame.width,
+                                    height: frame.height,
+                                    captured_at_unix_nanos: frame.timestamp,
+                                    pixels: bgra,
+                                })
+                                .expect("bounded source-to-sink delivery overflowed");
+                        }
+                        unsafe {
+                            mqol_source_frame_free(frame.pixels, frame.length);
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            })
+        };
+        let watch = Instant::now();
+        unsafe {
+            let (window, chain) = probe().unwrap();
+            chain
+                .ResizeBuffers(
+                    2,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .unwrap();
+            let device: ID3D11Device = chain.GetDevice().unwrap();
+            let context = device.GetImmediateContext().unwrap();
+            let buffer: ID3D11Texture2D = chain.GetBuffer(0).unwrap();
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            buffer.GetDesc(&mut desc);
+            desc.BindFlags = 0;
+            desc.MiscFlags = 0;
+            let initial = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixels.as_ptr().cast(),
+                SysMemPitch: width * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut picture = None;
+            device
+                .CreateTexture2D(&desc, Some(&initial), Some(&mut picture))
+                .unwrap();
+            let picture = picture.unwrap();
+            let mut marker = vec![255u8; 512 * 32 * 4];
+            let marker_box = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: 512,
+                bottom: 32,
+                back: 1,
+            };
+            let start = Instant::now();
+            for i in 0..2400u64 {
+                let due = start + Duration::from_nanos(i * 1_000_000_000 / 120);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                context.CopyResource(&buffer, &picture);
+                for y in 0..32 {
+                    for x in 0..512 {
+                        marker[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3]
+                            .fill(if (i >> (x / 32)) & 1 == 0 { 0 } else { 255 });
+                    }
+                }
+                context.UpdateSubresource(
+                    &buffer,
+                    0,
+                    Some(&marker_box),
+                    marker.as_ptr().cast(),
+                    512 * 4,
+                    0,
+                );
+                assert_eq!(
+                    mqol_source_d3d11_frame(
+                        chain.as_raw(),
+                        window.0.0,
+                        1,
+                        crate::sdl_readback::mqol_source_clock_nanos(),
+                        i + 1
+                    ),
+                    1
+                );
+                context.Flush();
+                let _ = chain.Present(0, DXGI_PRESENT(0));
+                if i % 240 == 239 {
+                    eprintln!(
+                        "d3d cadence wall={:?} delivered={} {:?}",
+                        start.elapsed(),
+                        delivered.load(Ordering::Relaxed),
+                        session.stats()
+                    );
+                }
+            }
+            assert!(
+                start.elapsed().as_secs_f64() < 21.0,
+                "renderer below 120 FPS"
+            );
+            mqol_source_d3d11_release();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        running.store(false, Ordering::Release);
+        consumer.join().unwrap();
+        sink.join().unwrap();
+        session.stop().unwrap();
+        crate::frame_cadence::mqol_source_set_frame_rate(0);
+        let stats = session.stats();
+        eprintln!(
+            "d3d cadence final wall={:?} delivered={} {stats:?}",
+            watch.elapsed(),
+            delivered.load(Ordering::Relaxed)
+        );
+        assert_eq!(stats.frames_dropped, 0);
+        assert_eq!(stats.frames_consumed, stats.frames_captured);
+        assert!(
+            stats.frames_captured as f64 > stats.media_time_nanos as f64 / 1e9 * 60.0 * 0.995,
+            "readback/encoder path below 60 FPS"
+        );
+    }
+
     #[test]
     fn real_d3d11_staging_query_pixels_resize_and_release() {
         if std::env::var_os("MQOL_TEST_D3D11").is_none() {

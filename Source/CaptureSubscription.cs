@@ -35,12 +35,17 @@ public sealed class CaptureSubscription : IDisposable {
     private readonly Action<CaptureMusic>? music;
     private readonly Action<CaptureSubscription> unregister;
     private readonly ulong subscribedAt;
+    private readonly uint maxFrameRate;
+    private readonly int frameCapacity;
+    private ulong? frameOrigin;
+    private UInt128 lastFrameTick;
     private int disposed;
     private long droppedFrames, droppedAudio, droppedMusic, callbackErrors;
     internal bool WantsPixels => pixels is not null;
     internal bool WantsAudio => fmod is not null;
     internal bool WantsMusic => music is not null;
     internal bool BorrowsPixels { get; }
+    internal uint MaxFrameRate => maxFrameRate;
     public long DroppedFrames => Interlocked.Read(ref droppedFrames);
     public long DroppedAudioChunks => Interlocked.Read(ref droppedAudio);
     public long CallbackErrors => Interlocked.Read(ref callbackErrors);
@@ -48,7 +53,11 @@ public sealed class CaptureSubscription : IDisposable {
     public long DroppedMusicEvents => Interlocked.Read(ref droppedMusic);
     public Task Completion { get; }
 
-    internal CaptureSubscription(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureSubscription> unregister, ulong subscribedAt = 0, Action<CaptureMusic>? music = null, bool borrowsPixels = false) {
+    internal CaptureSubscription(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureSubscription> unregister, ulong subscribedAt = 0, Action<CaptureMusic>? music = null, bool borrowsPixels = false, uint maxFrameRate = 0) {
+        this.maxFrameRate = maxFrameRate;
+        // Recorder delivery tolerates ~83ms at 60Hz for codec startup / IO bursts.
+        // The shared 128-MiB lease pool still bounds memory, including held frames.
+        frameCapacity = maxFrameRate == 0 ? 3 : 5;
         BorrowsPixels = borrowsPixels;
         this.subscribedAt = subscribedAt;
         this.pixels = pixels; this.fmod = fmod; this.unregister = unregister;
@@ -68,8 +77,19 @@ public sealed class CaptureSubscription : IDisposable {
         if (value.TimestampNanos < subscribedAt || pixels is null || Volatile.Read(ref disposed) != 0) return;
         lock (gate) {
             if (disposed != 0) return;
+            // Select recording frames BEFORE the bounded callback queue. A 60-fps
+            // recorder must not compete with redundant 120/144-Hz presentations.
+            // Ordinary subscribers (rate=0) still receive every acquired frame.
+            if (maxFrameRate != 0) {
+                if (frameOrigin is ulong origin) {
+                    if (value.TimestampNanos < origin) return;
+                    UInt128 tick = ((UInt128)(value.TimestampNanos - origin) * maxFrameRate + 500_000_000) / 1_000_000_000;
+                    if (tick <= lastFrameTick) return;
+                    lastFrameTick = tick;
+                } else { frameOrigin = value.TimestampNanos; lastFrameTick = 0; }
+            }
             value.Lease?.Retain();
-            if (frames.Count == 3) { frames.Dequeue().Lease?.Release(); Interlocked.Increment(ref droppedFrames); }
+            if (frames.Count == frameCapacity) { frames.Dequeue().Lease?.Release(); Interlocked.Increment(ref droppedFrames); }
             frames.Enqueue(value); Signal();
         }
     }

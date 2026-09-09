@@ -25,6 +25,17 @@ public static class CaptureSource {
     public static long DroppedAudioChunks => Interlocked.Read(ref sourceAudioDrops);
     public static long DroppedFrames => Interlocked.Read(ref sourceFrameDrops);
     internal static bool WantsPixels => Volatile.Read(ref subscriptions).Any(s => s.WantsPixels);
+    internal static uint RequestedFrameRate {
+        get {
+            uint rate = 0;
+            foreach (var s in Volatile.Read(ref subscriptions)) {
+                if (!s.WantsPixels) continue;
+                if (s.MaxFrameRate == 0) return 0; // a public subscriber requests every frame
+                rate = Math.Max(rate, s.MaxFrameRate);
+            }
+            return rate;
+        }
+    }
 
     /// <summary>Register any combination of pixel and FMOD callbacks. Dispose the returned registration to unsubscribe.</summary>
     public static CaptureSubscription Subscribe(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
@@ -36,13 +47,15 @@ public static class CaptureSource {
     public static CaptureSubscription SubscribeBorrowed(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
         return SubscribeCore(pixels, fmod, music, true);
     }
-    private static CaptureSubscription SubscribeCore(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureMusic>? music, bool borrowed) {
+    internal static CaptureSubscription SubscribeRecording(uint fps, Action<CaptureFrame> pixels, Action<CaptureAudio>? fmod, Action<CaptureMusic>? music) =>
+        SubscribeCore(pixels, fmod, music, true, fps);
+    private static CaptureSubscription SubscribeCore(Action<CaptureFrame>? pixels, Action<CaptureAudio>? fmod, Action<CaptureMusic>? music, bool borrowed, uint maxFrameRate = 0) {
         if (pixels is null && fmod is null && music is null) throw new ArgumentException("At least one callback is required");
         lock (gate) {
             if (!loaded) throw new InvalidOperationException("Capture source has not been loaded");
             if (pixels is not null && VideoError is { } error) throw new NotSupportedException(error);
             if (subscriptions.Length >= 16) throw new InvalidOperationException("At most 16 capture subscribers are supported");
-            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music, borrowed);
+            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music, borrowed, maxFrameRate);
             foreach (var snapshot in musicSnapshots) subscription.Offer(snapshot with { Kind = "snapshot" });
             Volatile.Write(ref subscriptions, [.. subscriptions, subscription]);
             return subscription;

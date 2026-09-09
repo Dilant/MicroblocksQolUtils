@@ -10,6 +10,7 @@ internal static class SdlFrameSource {
     private static bool dxgiHooked;
     private static bool dxgiPending;
     private static int tracePresents;
+    private static uint appliedFrameRate = uint.MaxValue;
     private static nint window;
     private static nint library;
     private static bool wasCapturing;
@@ -44,6 +45,7 @@ internal static class SdlFrameSource {
 
     internal static void Load() {
         tracePresents = 0;
+        appliedFrameRate = uint.MaxValue;
         try {
             // Stock Everest loads mods after SDL window creation. Changing an environment
             // variable here is too late to change the selected FNA3D driver/window flags.
@@ -82,6 +84,11 @@ internal static class SdlFrameSource {
 
     internal static void Update() {
         if (!CaptureSource.WantsPixels) { awaitingSince = 0; return; }
+        uint requestedRate = CaptureSource.RequestedFrameRate;
+        if (requestedRate != appliedFrameRate) {
+            if (SetFrameRate(requestedRate) != 0) failure = NativeCaptureBridge.LastError();
+            else appliedFrameRate = requestedRate;
+        }
         if (dxgiPending) {
             dxgiPending = false;
             try {
@@ -166,6 +173,7 @@ internal static class SdlFrameSource {
         dxgiPending = false;
     }
     [DllImport(Library, EntryPoint = "mqol_source_clock_nanos", CallingConvention = CallingConvention.Cdecl)] internal static extern ulong ClockNanos();
+    [DllImport(Library, EntryPoint = "mqol_source_set_frame_rate", CallingConvention = CallingConvention.Cdecl)] private static extern int SetFrameRate(uint fps);
     [DllImport(Library, EntryPoint = "mqol_source_gl_frame", CallingConvention = CallingConvention.Cdecl)] private static extern int Frame(Resolve resolve, nint context, uint width, uint height, ulong timestamp, ulong sequence);
     [DllImport(Library, EntryPoint = "mqol_source_gl_release", CallingConvention = CallingConvention.Cdecl)] private static extern int Release(nint context);
     [DllImport(Library, EntryPoint = "mqol_source_dxgi_install", CallingConvention = CallingConvention.Cdecl)] private static extern int InstallDxgi(PresentCallback callback);

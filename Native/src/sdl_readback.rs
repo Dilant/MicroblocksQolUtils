@@ -76,6 +76,7 @@ struct Slot {
     sequence: u64,
 }
 struct Readback {
+    cadence: crate::frame_cadence::FrameCadence,
     context: usize,
     gl: Gl,
     slots: Vec<Slot>,
@@ -245,6 +246,9 @@ impl Readback {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.fence.is_null()) else {
             return Ok(());
         };
+        if !self.cadence.due(timestamp) {
+            return Ok(());
+        }
         unsafe {
             (gl.bind)(PACK_BUFFER, slot.buffer);
             (gl.framebuffer)(READ_FRAMEBUFFER, 0);
@@ -297,6 +301,7 @@ pub unsafe extern "C" fn mqol_source_gl_frame(
                     ERR_CAPTURE
                 })?;
                 *state = Some(Readback {
+                    cadence: Default::default(),
                     context,
                     gl,
                     slots: Vec::new(),
@@ -557,6 +562,7 @@ mod fake_gl_tests {
             delete_sync,
         };
         let mut r = Readback {
+            cadence: Default::default(),
             context: 1,
             gl,
             slots: vec![],

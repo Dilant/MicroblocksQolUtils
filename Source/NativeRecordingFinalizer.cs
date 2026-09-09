@@ -29,7 +29,8 @@ internal static class NativeRecordingFinalizer {
             ).ConfigureAwait(false);
             await File.WriteAllTextAsync(
                 output + ".timeline.json",
-                JsonSerializer.Serialize(new { clips, reconstructBgm, removeFreezeFrames },
+                JsonSerializer.Serialize(new { clips, reconstructBgm, removeFreezeFrames,
+                    captureReports = ReadCaptureReports(clips) },
                     new JsonSerializerOptions { WriteIndented = true })
             ).ConfigureAwait(false);
             progress?.Invoke(1d);
@@ -39,5 +40,18 @@ internal static class NativeRecordingFinalizer {
             Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder");
             return false;
         }
+    }
+
+    private static JsonElement[] ReadCaptureReports(IReadOnlyList<RecordingClip> clips) {
+        List<JsonElement> reports = [];
+        foreach (string source in clips.Select(clip => clip.Source).Distinct()) {
+            try {
+                string path = source + ".capture.json";
+                if (File.Exists(path)) reports.Add(JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(path)));
+            } catch (Exception exception) {
+                Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/CaptureReport");
+            }
+        }
+        return reports.ToArray();
     }
 }

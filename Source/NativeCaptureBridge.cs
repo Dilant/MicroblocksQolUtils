@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 7;
+    private const uint ExpectedAbiVersion = 8;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -70,7 +70,7 @@ public static class NativeCaptureBridge {
         ThrowIfFailed(status, "create");
         try {
             ThrowIfFailed(CaptureStart(handle), "start");
-            return new NativeCaptureSession(handle, includeUiSfx, outputPath);
+            return new NativeCaptureSession(handle, includeUiSfx, outputPath, (uint)fps);
         } catch {
             CaptureDestroy(handle);
             throw;
@@ -269,11 +269,11 @@ public sealed class NativeCaptureSession : IDisposable {
     private ulong origin;
     private readonly MusicJournal? musicJournal;
     private int stopped;
-    internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath) {
+    internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath, uint fps) {
         this.handle = handle;
         musicJournal = outputPath is null ? null : new MusicJournal(outputPath + ".music.jsonl");
         try {
-            subscription = CaptureSource.SubscribeBorrowed(PushFrame, outputPath is not null ? chunk => {
+            subscription = CaptureSource.SubscribeRecording(fps, PushFrame, outputPath is not null ? chunk => {
                 if (includeUiSfx || chunk.BusId != 2) PushAudio(chunk);
             } : null, musicJournal is null ? null : musicJournal.Accept);
         } catch { musicJournal?.Dispose(); throw; }

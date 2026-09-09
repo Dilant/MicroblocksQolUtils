@@ -1,5 +1,76 @@
 # Capture validation — 2026-09-09 follow-up
 
+## ABI 8：2560×1506 实际帧率修复（codex/frame-cadence）
+
+### 用户文件证据
+
+`20260909-215504-Celeste_1-ForsakenCity.mp4`：2560×1506，106.316667 秒，4082 帧。
+`r_frame_rate=60/1` 但 `avg_frame_rate=244920/6379`，实际约 **38.4 FPS**。
+前 10 秒约 60，此后多为 35–39；60-Hz tick 间隔计数为 1:1871、2:2123、3:87。
+画面 HUD 显示 physics60/render120–124；不是只因为游戏自身跑到 38 FPS。
+原始 MKV 已在旧导出后清理，不能从现有 MP4 追溯每一级准确丢弃数，也不能恢复未采到的画面。
+
+### 定位与最终方案
+
+- 同分辨率 paced native producer 复现旧压缩缓存：本应 20 秒提交 1200 帧，实际耗时约 50.53 秒，1144 编码 / 56 队列丢弃。
+- QSV async4、SIMD predictor、快 Zstd、NV12 缓存等中间方案改善吞吐，但完整 FNA 测试仍有启动丢帧。
+  temporal delta 在静止图片上可通过；**双路＋整幅滚动仍失败**，没有把该结果当最终通过。
+- 最终移除 Zstd/差分压缩，采用有界 NV12 临时文件启动缓冲；采样提前到 GPU 提交及订阅入队前；
+  录制 callback 5 槽吸收短突发，共享 128-MiB pool/native 192-MiB RAM cap 不扩大。
+  每段文件限制 2 GiB，队列仍限制 `capacity+fps*5`；IO 在 worker，不在 render/FMOD。
+  在录制和导出的 AVFrame 复用点处理异步编码器引用。
+
+### 实际 FNA/D3D11 完整链路长测
+
+同机 Intel Graphics / h264_qsv，真实 FNA Game / SDL / DXGI，**2560×1506，120-Hz 呈现，两路各 60-FPS 编码，持续 120 秒**。
+使用用户视频截图整幅横向滚动＋每个呈现帧的二进制可见编号，不是纯色、静止画面或只测 native push。
+走生产 managed source、subscription worker、native encoder 和 FMOD music bus；不启动 Steam、不操作用户存档/图形设置。
+
+| 输出 | 实际视频帧数 | 最后视频 PTS | 实测帧率 | 编号重复/倒序 |
+|---|---:|---:|---:|---:|
+| 第一原始 MKV | 7186 | 119.750s | 60.000 | 0 / 0 |
+| 第二原始 MKV | 7189 | 119.800s | 60.000 | 0 / 0 |
+| 第一轨经过生产 finalizer 的 MP4 | 7186 | 119.750s | 60.000 | 0 / 0 |
+
+两路 native/订阅视频丢弃、PCM 丢块、音乐事件丢失、callback exception 均为 **0**。
+所有相邻视频 PTS 都相差一个 60-Hz tick；导出完整解码，并检查 top 512×32 区域的画面编号，未用重复帧补齐。
+两条轨尾部相差 3 帧来自顺序停止时第二条仍运行，不能把 120 秒墙钟直接当作每条视频的首帧原点。
+启动后缓存排空；两路峰值分别 56/111 帧，RAM 排队各 15,421,504 bytes，spool 排队 318,067,200 / 636,134,400 bytes。
+正常结束后测试目录无 `mqol-frames-*.tmp` 残留。
+最终构建又做了 20 秒双路滚动复验：1185/1188 帧，各级视频/音频丢失、source pool/PCM 丢失及 callback 错误均为 0。
+构建包与安装到 `C:\SteamLibrary\steamapps\common\Celeste\Mods\MicroblocksQolUtils.zip` 的文件 SHA256 一致：
+`BF7B5F80A7CC48A7D9EA7F08BFFD755FE19126BE143554532BF73E7E55DF27D5`。
+这是完整采集管线测试，不冒充用户真实游戏重新通关的测试；其他 GPU、慢磁盘、长期过载仍需实际测量。
+
+证据：`.work/frame-cadence/.work/fna-final.log`、`fna-final/report.txt`、两个 MKV 的 `.cadence.json`、
+`export-final/cadence-final.mp4.cadence.json`、`export-frame.png`。
+早期失败的 native、GL 吞吐 prototype 及压缩实验日志保留在同目录；GL prototype 渲染自身达不到 120 FPS，未用来宣称游戏 OpenGL 后端吞吐失败。
+
+### 回归与复现
+
+- Rust FFmpeg：50 passed，2 个硬件吞吐用例默认 ignored；含 NV12 奇偶/非对齐尺寸与原 swscale 逐平面精确对照、
+  spool 顺序/拒绝/resize/空间上限/最后 reader 清理、真实 D3D11 staging/resize/shim、音频与房间级 BGM 样本测试。
+- 两个默认 ignored 的 release 吞吐用例也单独运行通过：native producer 1200/1200（19.988 秒提交）；D3D11 分离 poll/sink worker 的读回链路 1200/1200，均无队列丢弃。早期串行 poll+push prototype 曾失败，现测试按实际双 worker 拓扑修正，不降低帧率断言。
+- 无 FFmpeg Rust：25 passed；managed Capture / Recording.Policy 均通过。
+- 当前源码通过 Linux x64、macOS x64、Android arm64 的 **无 FFmpeg cargo check**；这不是三平台 FFmpeg 打包、GPU 或音频真机测试。
+- SDL OpenGL + FMOD 原有集成：238 像素 / 419 非静音 PCM callback，方向/通道/顺序错误 0；两个 sink 62/178 帧、native 丢弃 0。
+  验证慢消费者隔离、resize、重载、独立 BGM/事件、普通/连续/房间策略导出；末尾不支持 renderer 的错误是预期负向测试。
+
+高分辨率 FNA 测试在原 `Capture.Integration` 环境之外设置：
+
+```powershell
+$env:MQOL_TEST_D3D_GAME='1'
+$env:MQOL_TEST_BGRA='<2560x1506 BGRA fixture under .work>'
+$env:MQOL_TEST_ENCODER='auto'
+$env:MQOL_TEST_DUAL='1'
+$env:MQOL_TEST_SCROLL='1'
+$env:MQOL_TEST_SECONDS='120'
+# MQOL_TEST_OUTPUT 必须指向 .work 内的输出目录。
+dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Release
+```
+
+下面均为历史阶段的结果，尤其旧 720p/Zstd 验证不能替代上面的高 DPI 长测。
+
 ## 第二轮：吞吐/丢块修复（同日，codex/capture-throughput）
 
 下面较早记录中的“高负载丢帧”不是可接受的正常结论。加上长时间与分阶段统计后，发现：
@@ -145,7 +216,7 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
 
 ## 未证明的部分
 
-第一轮 ABI 6 在添加本轮 Zstd 之前通过 Linux x64、macOS x64、Android arm64 的无 FFmpeg cargo check；不等于真实窗口、驱动、音频、FFmpeg 打包测试。本轮仅在 Windows 构建运行，未重跑三端交叉检查；Zstd C 库由 Cargo 构建，三平台 CI 构建矩阵保留。
+ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。
 Metal/Vulkan/SDL_GPU 没有实现。D3D11 HDR/MSAA swapchain、其他 GPU/overlay 组合没有普遍兼容性保证。
 游戏之外直接 native FMOD 命令的一帧内中间状态可能不能被 managed observer 看见。
 静态 BGM 映射不能重放动态 FMOD 音乐；新独立 PCM/事件路径应作为保真来源。

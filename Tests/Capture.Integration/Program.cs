@@ -9,7 +9,7 @@ string output = Path.GetFullPath(Environment.GetEnvironmentVariable("MQOL_TEST_O
 Directory.CreateDirectory(output);
 nint Resolve(string name, Assembly assembly, DllImportSearchPath? paths) {
     if (name == "microblocks_qol_native") return NativeLibrary.Load(native);
-    string file = name switch {"fmod" or "fmod64" => "fmod64.dll", "fmodstudio" => "fmodstudio.dll", "SDL2" => "SDL2.dll", _ => name};
+    string file = name switch {"fmod" or "fmod64" => "fmod64.dll", "fmodstudio" => "fmodstudio.dll", "SDL2" => "SDL2.dll", "FNA3D" => "FNA3D.dll", "FAudio" => "FAudio.dll", _ => name};
     string path = Path.Combine(root, "lib64-win-x64", file);
     return File.Exists(path) ? NativeLibrary.Load(path) : 0;
 }
@@ -18,6 +18,19 @@ NativeLibrary.SetDllImportResolver(typeof(Celeste.Audio).Assembly, Resolve);
 NativeLibrary.SetDllImportResolver(typeof(Microsoft.Xna.Framework.Game).Assembly, Resolve);
 // DynDll resolves through the assembly loader, and the native module must be available by name too.
 NativeLibrary.Load(Path.Combine(root,"lib64-win-x64","SDL2.dll"));
+if (Environment.GetEnvironmentVariable("MQOL_TEST_D3D_GAME") == "1") {
+    using var game = new CadenceGame(root,output,encoder);
+    game.Run();
+    return;
+}
+if (Environment.GetEnvironmentVariable("MQOL_TEST_FINALIZE_SOURCE") is string sourceVideo) {
+    NativeCaptureBridge.Initialize(null);
+    double duration=double.Parse(Environment.GetEnvironmentVariable("MQOL_TEST_FINALIZE_SECONDS")!,System.Globalization.CultureInfo.InvariantCulture);
+    NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(sourceVideo,0,duration,"",0)],
+        Path.Combine(output,"cadence-final.mp4"),encoder,12000,60,false,false,"").GetAwaiter().GetResult();
+    Console.WriteLine("PASS full-resolution native finalizer");
+    return;
+}
 void Check(bool condition,string text) {if (!condition) throw new Exception(text);}
 void Fmod(FMOD.RESULT value) {Check(value==FMOD.RESULT.OK,$"FMOD {value}");}
 Check(Sdl.Init(0x20)==0,"SDL init failed");

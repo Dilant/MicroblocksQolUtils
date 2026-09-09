@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
@@ -28,7 +28,7 @@ mod finalizer;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_audio;
 
-const ABI_VERSION: u32 = 7;
+const ABI_VERSION: u32 = 8;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
@@ -121,10 +121,27 @@ pub struct CaptureStats {
 
 #[derive(Debug)]
 struct CapturedFrame {
+    format: CapturePixelFormat,
     width: u32,
     height: u32,
     captured_at_unix_nanos: u64,
-    bgra: Vec<u8>,
+    pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapturePixelFormat {
+    Bgra,
+    Nv12,
+}
+
+impl CapturedFrame {
+    fn pixel_bytes(&self) -> usize {
+        let area = self.width as usize * self.height as usize;
+        match self.format {
+            CapturePixelFormat::Bgra => area * 4,
+            CapturePixelFormat::Nv12 => area * 3 / 2,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +149,8 @@ struct QueueState {
     frames: VecDeque<QueuedFrame>,
     bytes: usize,
     peak_bytes: usize,
+    spool_bytes: usize,
+    peak_spool_bytes: usize,
     peak_frames: usize,
     overflow_logged: bool,
     closed: bool,
@@ -140,21 +159,56 @@ struct QueueState {
 #[derive(Debug)]
 struct QueuedFrame {
     frame: CapturedFrame,
-    compressed: bool,
+    spooled: Option<(Arc<FrameSpool>, u64, usize)>,
 }
 
-// Spatial byte predictor makes smooth BGRA gradients/dither compressible too,
-// not just identical adjacent pixels. Wrapping arithmetic is exactly reversible.
-fn predict_bgra(bytes: &mut [u8]) {
-    for i in (4..bytes.len()).rev() {
-        bytes[i] = bytes[i].wrapping_sub(bytes[i - 4]);
+// A bounded disk-backed startup burst avoids making live delivery compete with
+// expensive lossless compression of scrolling/dithered high-DPI frames.
+#[derive(Debug)]
+struct FrameSpool {
+    reader: Mutex<File>, // drop the reopened handle before NamedTempFile unlinks (Windows)
+    writer: Mutex<tempfile::NamedTempFile>,
+    limit: u64,
+}
+impl FrameSpool {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    fn new(directory: &std::path::Path) -> std::io::Result<Self> {
+        let file = tempfile::Builder::new()
+            .prefix("mqol-frames-")
+            .suffix(".tmp")
+            .tempfile_in(directory)?;
+        Ok(Self {
+            reader: Mutex::new(file.reopen()?),
+            writer: Mutex::new(file),
+            limit: Self::MAX_BYTES,
+        })
+    }
+    fn append(&self, bytes: &[u8]) -> std::io::Result<Option<u64>> {
+        let mut file = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let offset = file.stream_position()?;
+        if offset + bytes.len() as u64 > self.limit {
+            return Ok(None);
+        }
+        file.write_all(bytes)?;
+        Ok(Some(offset))
+    }
+    fn read(&self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        let mut file = self.reader.lock().unwrap_or_else(|p| p.into_inner());
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 }
-fn restore_bgra(bytes: &mut [u8]) {
-    for i in 4..bytes.len() {
-        bytes[i] = bytes[i].wrapping_add(bytes[i - 4]);
-    }
+
+#[derive(Debug, Default)]
+struct FramePreparation {
+    #[cfg(feature = "ffmpeg")]
+    preparation: Option<encoder::Nv12Preparation>,
+    spool: Option<Arc<FrameSpool>>,
 }
+
+mod frame_cadence;
 
 pub(crate) fn video_tick(timestamp: u64, origin: u64, fps: u32) -> u128 {
     // Nearest tick, not floor: render timestamps jitter around nominal 60 Hz.
@@ -165,6 +219,8 @@ pub(crate) fn video_tick(timestamp: u64, origin: u64, fps: u32) -> u128 {
 
 #[derive(Debug)]
 struct LatestFrameQueue {
+    spool_directory: Option<PathBuf>,
+    preparation: Mutex<FramePreparation>,
     capacity: usize,
     burst_capacity: usize,
     state: Mutex<QueueState>,
@@ -333,12 +389,16 @@ impl LatestFrameQueue {
     const BURST_BYTES: usize = 192 * 1024 * 1024;
     fn new(capacity: usize) -> Self {
         Self {
+            spool_directory: None,
+            preparation: Mutex::new(FramePreparation::default()),
             capacity,
             burst_capacity: 0,
             state: Mutex::new(QueueState {
                 frames: VecDeque::with_capacity(capacity),
                 bytes: 0,
                 peak_bytes: 0,
+                spool_bytes: 0,
+                peak_spool_bytes: 0,
                 peak_frames: 0,
                 overflow_logged: false,
                 closed: false,
@@ -350,58 +410,94 @@ impl LatestFrameQueue {
     fn recording(capacity: usize, fps: u32) -> Self {
         Self {
             burst_capacity: capacity + fps as usize * 5,
+            spool_directory: Some(std::env::temp_dir()),
             ..Self::new(capacity)
         }
     }
 
     fn push_latest(&self, mut frame: CapturedFrame) -> bool {
-        // The usual three raw frames are sufficient at steady state, but hardware
-        // codec cold-start can take seconds. Retain a bounded lossless Zstd burst
-        // instead of throwing away the start of the recording. Compression runs
-        // on the sink worker; never under the queue lock or on the render thread.
-        let compressed = self.burst_capacity != 0 && {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state.frames.len() >= self.capacity
-                || state.bytes + frame.bgra.capacity() > Self::BURST_BYTES
+        // Serialize preparation across producers, but never hold the queue lock
+        // during conversion or IO. Renderer/mixer threads never enter this path.
+        let mut preparation = self.preparation.lock().unwrap_or_else(|p| p.into_inner());
+        let spill = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.closed {
+                return true;
+            }
+            if self.burst_capacity != 0 && state.frames.len() >= self.burst_capacity {
+                if !state.overflow_logged {
+                    eprintln!(
+                        "[mqol-encoder] frame backlog count limit reached: {}",
+                        self.burst_capacity
+                    );
+                    state.overflow_logged = true;
+                }
+                return true; // reject BEFORE writing more temporary data
+            }
+            self.burst_capacity != 0
+                && (!state.frames.is_empty()
+                    || state.bytes + frame.pixels.capacity() > Self::BURST_BYTES)
         };
-        if compressed {
-            predict_bgra(&mut frame.bgra);
-            frame.bgra =
-                zstd::bulk::compress(&frame.bgra, 1).expect("in-memory Zstd compression failed");
-            frame.bgra.shrink_to_fit();
-        }
-        let queued = QueuedFrame { frame, compressed };
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let spooled = if spill {
+            // Store the representation the encoder needs, never convert it back
+            // to BGRA. No content-dependent compression cost on the live worker.
+            #[cfg(feature = "ffmpeg")]
+            {
+                frame = encoder::prepare_nv12(&mut preparation.preparation, frame)
+                    .expect("BGRA to recording NV12 conversion failed");
+            }
+            let spool = preparation.spool.get_or_insert_with(|| {
+                Arc::new(
+                    FrameSpool::new(
+                        self.spool_directory
+                            .as_ref()
+                            .expect("recording spool directory"),
+                    )
+                    .expect("cannot create recording frame spool"),
+                )
+            });
+            let Some(offset) = spool
+                .append(&frame.pixels)
+                .expect("cannot write recording frame spool")
+            else {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if !state.overflow_logged {
+                    eprintln!("[mqol-encoder] frame spool reached its 2-GiB segment limit");
+                    state.overflow_logged = true;
+                }
+                return true;
+            };
+            let stored = Some((spool.clone(), offset, frame.pixels.len()));
+            frame.pixels = Vec::new();
+            stored
+        } else {
+            // Never truncate a file an in-flight reader still owns. Its Arc
+            // removes the previous segment after that read finishes.
+            preparation.spool = None;
+            None
+        };
+        let queued = QueuedFrame { frame, spooled };
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.closed {
             return true;
         }
         if self.burst_capacity != 0
-            && (state.frames.len() >= self.burst_capacity
-                || state.bytes + queued.frame.bgra.capacity() > Self::BURST_BYTES)
+            && state.bytes + queued.frame.pixels.capacity() > Self::BURST_BYTES
         {
-            if !state.overflow_logged {
-                eprintln!(
-                    "[mqol-encoder] burst capacity exceeded: queued={} bytes={} incoming={} compressed={}",
-                    state.frames.len(),
-                    state.bytes,
-                    queued.frame.bgra.len(),
-                    queued.compressed
-                );
-                state.overflow_logged = true;
-            }
-            return true; // Explicit overflow: preserve timestamps and count the loss.
+            return true;
         }
         let dropped = if self.burst_capacity == 0 && state.frames.len() == self.capacity {
             let old = state.frames.pop_front().unwrap();
-            state.bytes -= old.frame.bgra.capacity();
+            state.bytes -= old.frame.pixels.capacity();
             true
         } else {
             false
         };
-        state.bytes += queued.frame.bgra.capacity();
+        state.bytes += queued.frame.pixels.capacity();
+        if let Some((_, _, length)) = &queued.spooled {
+            state.spool_bytes += length;
+        }
+        state.peak_spool_bytes = state.peak_spool_bytes.max(state.spool_bytes);
         state.frames.push_back(queued);
         state.peak_bytes = state.peak_bytes.max(state.bytes);
         state.peak_frames = state.peak_frames.max(state.frames.len());
@@ -410,21 +506,18 @@ impl LatestFrameQueue {
     }
 
     fn pop(&self) -> Option<CapturedFrame> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if let Some(mut queued) = state.frames.pop_front() {
-                state.bytes -= queued.frame.bgra.capacity();
+                state.bytes -= queued.frame.pixels.capacity();
+                if let Some((_, _, length)) = &queued.spooled {
+                    state.spool_bytes -= length;
+                }
                 drop(state);
-                if queued.compressed {
-                    queued.frame.bgra = zstd::bulk::decompress(
-                        &queued.frame.bgra,
-                        queued.frame.width as usize * queued.frame.height as usize * 4,
-                    )
-                    .expect("internally generated Zstd frame must decode");
-                    restore_bgra(&mut queued.frame.bgra);
+                if let Some((spool, offset, length)) = queued.spooled {
+                    queued.frame.pixels = spool
+                        .read(offset, length)
+                        .expect("cannot read recording frame spool");
                 }
                 return Some(queued.frame);
             }
@@ -434,7 +527,7 @@ impl LatestFrameQueue {
             state = self
                 .available
                 .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(|p| p.into_inner());
         }
     }
 
@@ -489,12 +582,20 @@ struct CaptureSession {
 
 impl CaptureSession {
     fn new(config: CaptureConfig) -> Self {
+        let queue = if let Some(output) = &config.output_path {
+            let mut queue = LatestFrameQueue::recording(config.queue_capacity, config.fps);
+            // The output directory is created by the bridge before subscribing.
+            queue.spool_directory = std::path::Path::new(output).parent().map(ToOwned::to_owned);
+            queue
+        } else {
+            LatestFrameQueue::new(config.queue_capacity)
+        };
+        if let Some(directory) = &queue.spool_directory {
+            // An unusable directory is reported by the encoder or spool writer.
+            let _ = std::fs::create_dir_all(directory);
+        }
         Self {
-            queue: Arc::new(if config.output_path.is_some() {
-                LatestFrameQueue::recording(config.queue_capacity, config.fps)
-            } else {
-                LatestFrameQueue::new(config.queue_capacity)
-            }),
+            queue: Arc::new(queue),
             audio_queue: Arc::new(AudioChunkQueue::new()),
             audio_clocks: [
                 AudioBusClock::new(),
@@ -587,6 +688,11 @@ impl CaptureSession {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
         self.fail();
         self.join_threads();
+        self.queue
+            .preparation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spool = None;
         Ok(())
     }
 
@@ -629,7 +735,7 @@ impl CaptureSession {
         self.stats.frames_captured.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_captured
-            .fetch_add(frame.bgra.len() as u64, Ordering::Relaxed);
+            .fetch_add(frame.pixels.len() as u64, Ordering::Relaxed);
         self.stats
             .last_frame_unix_nanos
             .store(timestamp, Ordering::Relaxed);
@@ -705,9 +811,10 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         eprintln!(
-            "[mqol-encoder] {path}: burst peak={} frames / {} bytes; consumed={} dropped={}",
+            "[mqol-encoder] {path}: burst peak={} frames / {} RAM bytes / {} queued spool bytes; consumed={} dropped={}",
             state.peak_frames,
             state.peak_bytes,
+            state.peak_spool_bytes,
             session.stats.frames_consumed.load(Ordering::Relaxed),
             session.stats.frames_dropped.load(Ordering::Relaxed)
         );
@@ -959,12 +1066,14 @@ pub unsafe extern "C" fn mqol_capture_push_frame(
             return Ok(OK);
         }
         // SAFETY: caller provides length readable bytes; dimensions and size were checked.
-        let bgra = unsafe { std::slice::from_raw_parts(pixels, length) }.to_vec();
+        let mut bgra = Vec::with_capacity(length + 64);
+        bgra.extend_from_slice(unsafe { std::slice::from_raw_parts(pixels, length) });
         session.push_frame(CapturedFrame {
+            format: crate::CapturePixelFormat::Bgra,
             width,
             height,
             captured_at_unix_nanos: timestamp,
-            bgra,
+            pixels: bgra,
         });
         Ok(OK)
     })
@@ -1248,10 +1357,11 @@ mod tests {
 
     fn frame(id: u8) -> CapturedFrame {
         CapturedFrame {
+            format: crate::CapturePixelFormat::Bgra,
             width: 1,
             height: 1,
             captured_at_unix_nanos: id as u64,
-            bgra: vec![id; 4],
+            pixels: vec![id; 4],
         }
     }
 
@@ -1302,9 +1412,80 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware throughput: set MQOL_TEST_BGRA, MQOL_TEST_OUTPUT; run with --release"]
+    #[cfg(feature = "ffmpeg")]
+    fn full_resolution_recording_recovers_after_encoder_startup() {
+        use std::time::{Duration, Instant};
+        let pixels = std::fs::read(std::env::var("MQOL_TEST_BGRA").unwrap()).unwrap();
+        let output = std::env::var("MQOL_TEST_OUTPUT").unwrap();
+        let width = 2560;
+        let height = 1506;
+        assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        let session = Arc::new(CaptureSession::new(CaptureConfig {
+            fps: 60,
+            encoder: "auto".into(),
+            output_path: Some(output),
+            bitrate_kbps: 12000,
+            ..Default::default()
+        }));
+        session.start().unwrap();
+        let started = Instant::now();
+        let mut push_time = Duration::ZERO;
+        let frames = 1200u64;
+        for i in 0..frames {
+            let deadline = started + Duration::from_nanos(i * 1_000_000_000 / 60);
+            if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+            let mut bgra = pixels.clone();
+            // A visible frame id avoids using identical encoded pictures as a success criterion.
+            for bit in 0..16 {
+                for x in 0..32 {
+                    for y in 0..32 {
+                        let offset = (y * width as usize + bit * 32 + x) * 4;
+                        bgra[offset..offset + 3].fill(if (i >> bit) & 1 == 0 { 0 } else { 255 });
+                    }
+                }
+            }
+            let before = Instant::now();
+            session.push_frame(CapturedFrame {
+                format: crate::CapturePixelFormat::Bgra,
+                width,
+                height,
+                pixels: bgra,
+                captured_at_unix_nanos: 1_000_000_000 + i * 1_000_000_000 / 60,
+            });
+            push_time += before.elapsed();
+            if i % 120 == 119 {
+                eprintln!(
+                    "cadence t={:.2}s push_ms={:.2} stats={:?}",
+                    started.elapsed().as_secs_f64(),
+                    push_time.as_secs_f64() * 1000.0 / (i + 1) as f64,
+                    session.stats()
+                );
+            }
+        }
+        let elapsed = started.elapsed();
+        let depth = session.stats().queue_depth;
+        session.stop().unwrap();
+        let stats = session.stats();
+        eprintln!(
+            "cadence final wall={elapsed:?} drain={:?} {stats:?}",
+            started.elapsed() - elapsed
+        );
+        assert!(
+            elapsed.as_secs_f64() < 21.0,
+            "producer could not sustain real time"
+        );
+        assert_eq!(stats.frames_dropped, 0);
+        assert_eq!(stats.frames_consumed, frames);
+        assert!(depth < 60, "encoder never recovered its startup backlog");
+    }
+
+    #[test]
     fn recording_burst_is_lossless_ordered_and_bounded() {
         let mut queue = LatestFrameQueue::recording(1, 1);
-        // One raw slot plus five compressed burst slots.
+        // One raw slot plus five disk-backed burst slots.
         for i in 0..6u64 {
             let mut value = frame(i as u8);
             value.captured_at_unix_nanos = i;
@@ -1315,13 +1496,17 @@ mod tests {
         for i in 0..6u64 {
             let value = queue.pop().unwrap();
             assert_eq!(value.captured_at_unix_nanos, i);
-            assert_eq!(value.bgra, frame(i as u8).bgra);
+            assert_eq!(value.pixels, frame(i as u8).pixels);
         }
         assert_eq!(queue.state.lock().unwrap().bytes, 0);
-        // A byte limit applies independently of the compressed-frame count.
+        // A full RAM budget spills to disk instead of retaining another payload.
         queue.state.get_mut().unwrap().bytes = LatestFrameQueue::BURST_BYTES;
-        assert!(queue.push_latest(frame(8)));
-        assert_eq!(queue.depth(), 0);
+        assert!(!queue.push_latest(frame(8)));
+        assert_eq!(
+            queue.state.lock().unwrap().bytes,
+            LatestFrameQueue::BURST_BYTES
+        );
+        assert_eq!(queue.pop().unwrap().pixels, frame(8).pixels);
         queue.close();
     }
 
@@ -1435,17 +1620,6 @@ mod tests {
     }
 
     #[test]
-    fn bgra_predictor_roundtrips_arbitrary_bytes() {
-        let mut bytes: Vec<u8> = (0..65537).map(|n| ((n * 31) ^ (n >> 3)) as u8).collect();
-        let original = bytes.clone();
-        predict_bgra(&mut bytes);
-        let compressed = zstd::bulk::compress(&bytes, 1).unwrap();
-        let mut decoded = zstd::bulk::decompress(&compressed, bytes.len()).unwrap();
-        restore_bgra(&mut decoded);
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
     fn stopping_one_sink_leaves_other_running_and_restart_is_rejected() {
         let a = Arc::new(CaptureSession::new(CaptureConfig::default()));
         let b = Arc::new(CaptureSession::new(CaptureConfig::default()));
@@ -1497,5 +1671,63 @@ mod tests {
         assert_eq!(unsafe { mqol_capture_get_stats(handle, &mut stats) }, OK);
         assert_eq!(stats.abi_version, ABI_VERSION);
         assert_eq!(mqol_capture_destroy(handle), OK);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    #[test]
+    fn frame_spool_bounds_preserves_offsets_and_cleans_up_after_last_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = FrameSpool::new(dir.path()).unwrap();
+        spool.limit = 8;
+        assert_eq!(spool.append(&[1, 2, 3, 4]).unwrap(), Some(0));
+        assert_eq!(spool.append(&[5, 6, 7, 8]).unwrap(), Some(4));
+        assert_eq!(spool.append(&[9]).unwrap(), None);
+        assert_eq!(spool.read(4, 4).unwrap(), [5, 6, 7, 8]);
+        assert_eq!(spool.read(0, 4).unwrap(), [1, 2, 3, 4]);
+        let owner = Arc::new(spool);
+        let reader = owner.clone();
+        drop(owner);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(reader.read(0, 8).unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        drop(reader);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn backlog_spooling_survives_rejected_frames_raw_gaps_and_resize() {
+        let mut queue = LatestFrameQueue::recording(3, 60);
+        queue.burst_capacity = 3;
+        let make = |id: u8, width: u32| CapturedFrame {
+            format: CapturePixelFormat::Nv12,
+            width,
+            height: 8,
+            captured_at_unix_nanos: id as u64,
+            pixels: vec![id; width as usize * 8 * 3 / 2],
+        };
+        let check = |id: u8, width: u32, value: CapturedFrame| {
+            assert_eq!(value.captured_at_unix_nanos, id as u64);
+            assert_eq!(value.width, width);
+            assert_eq!(value.pixels, make(id, width).pixels);
+        };
+        for id in 1..=3 {
+            assert!(!queue.push_latest(make(id, 16)));
+        }
+        assert!(queue.push_latest(make(4, 16))); // rejected before writing
+        check(1, 16, queue.pop().unwrap());
+        assert!(!queue.push_latest(make(5, 16)));
+        for id in [2, 3, 5] {
+            check(id, 16, queue.pop().unwrap());
+        }
+        assert!(!queue.push_latest(make(6, 16))); // start a fresh burst
+        assert!(!queue.push_latest(make(7, 16)));
+        assert!(!queue.push_latest(make(8, 32))); // resized frame
+        for (id, width) in [(6, 16), (7, 16), (8, 32)] {
+            check(id, width, queue.pop().unwrap());
+        }
+        queue.close();
+        assert!(queue.pop().is_none());
     }
 }
