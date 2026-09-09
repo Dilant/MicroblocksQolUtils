@@ -1,4 +1,4 @@
-# 共享采集架构（native ABI 8）
+# 共享采集架构（native ABI 9）
 
 ## 数据路径
 
@@ -152,7 +152,7 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 ### 死亡回放快速最终化
 
 - 只有死亡回放任务设置 `prefer_video_copy`；旧 JSON 默认为 false，完整录像仍走原剪辑器。
-  managed bridge 保留旧公开方法签名，native C ABI 不变。
+    managed bridge 保留旧公开方法签名。ABI 9 新增按源时间戳请求关键帧的内部入口。
 - 连续、无冻结帧编辑的 H.264 范围可直接复制视频包；相邻 room/music metadata 片段只对音频保留分段。
   通过 MKV 索引向前一个关键帧 seek，最多缓存 32 MiB 预滚；MP4 edit list 隐藏负时间戳的解码依赖，
   最终音视频 remux 保留 edit list。可见帧不会回退到关键帧，时间量化误差不超过一帧。

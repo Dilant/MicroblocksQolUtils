@@ -79,6 +79,8 @@ Check(ReferenceEquals(SaveSlotsManager.Slot, originalSlot) && !RecordingPauseAud
 RecordingSavePause.Presented(300);
 Check(RecordingSavePause.Active, "resumed before clean presentation guard");
 RecordingSavePause.Presented(400);
+Check(RecordingSavePause.Active, "resumed simulation before the keyframe was delivered");
+RecordingSavePause.Presented(500);
 Check(!RecordingSavePause.Active && AutoRecorder.Resumes == resumes + 1, "clean frame failed to resume exactly once");
 var delayedStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
 Check(RecordingSavePause.BeforeEngineUpdate(ref delayedStep) && delayedStep.ElapsedGameTime == normalStep.ElapsedGameTime,

@@ -49,6 +49,10 @@ internal sealed class NativeRoomRecording {
 
     internal double TimelineTimeSeconds => capture.TimelineTimeSeconds ?? MediaTimeSeconds;
     internal double TimeAt(ulong timestamp) => capture.TimeAt(timestamp) ?? MediaTimeSeconds;
+    internal void RequestResumeFrame(ulong timestamp) => capture.RequestKeyframe(timestamp);
+    internal ulong ResumeFrameTimestamp => capture.KeyframeAcceptedAt;
+    internal double EncodedFrameTimeAt(ulong timestamp) => targetFrameRate <= 0 ? TimeAt(timestamp)
+        : Math.Floor(TimeAt(timestamp) * targetFrameRate + 0.5d) / targetFrameRate;
     internal double FrameTimeAt(ulong timestamp, bool roundUp) {
         double time = TimeAt(timestamp);
         if (targetFrameRate <= 0) return time;
@@ -94,7 +98,12 @@ internal sealed class NativeRoomRecording {
                 + $"dropped {statistics.AudioChunksDropped} chunk(s)."
             );
         }
-        return Task.Run(() => {
+        Task drain = capture.CompleteInput();
+        return FinishAsync();
+
+        async Task FinishAsync() {
+            await drain.ConfigureAwait(false);
+            await Task.Run(() => {
             try {
                 // Read counters after draining, before destroying the native handle.
                 capture.Stop();
@@ -115,7 +124,8 @@ internal sealed class NativeRoomRecording {
                     Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/CaptureReport");
                 }
             } finally { capture.Dispose(); }
-        });
+            }).ConfigureAwait(false);
+        }
     }
 }
 

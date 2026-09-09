@@ -38,6 +38,7 @@ public static class AutoRecorder {
     private static string areaSid = "";
     private static bool branchActive;
     private static bool waitingForStablePlayer;
+    private static bool resumeFromSavedState;
     private static bool pauseSuspended;
     private static NativeRoomRecording? saveSuspendedFull, saveSuspendedDeath;
     private static bool transitioningRoom;
@@ -199,7 +200,7 @@ public static class AutoRecorder {
         if (pauseSuspended && PlayerIsRecordable(level, player) && PauseOverlayCleared(level)) {
             ResumeFullRecordingAfterPause(recording);
         } else if (waitingForStablePlayer && PlayerIsRecordable(level, player)) {
-            StartBranchAtCurrentTime();
+            StartBranchAtCurrentTime(seamlessFromPrevious: resumeFromSavedState);
         }
 
         if (branchActive && reconstructBgm)
@@ -342,6 +343,7 @@ public static class AutoRecorder {
         waitingForStablePlayer = true;
         pauseSuspended = false;
         transitioningRoom = false;
+        resumeFromSavedState = true;
         observedRespawnPoint = level.Session.RespawnPoint;
     }
 
@@ -380,6 +382,7 @@ public static class AutoRecorder {
             return body;
         }
         ActivePrefix.Clear();
+        resumeFromSavedState = false;
         if (respawnAnchor is not null) ActivePrefix.AddRange(respawnAnchor.Clips);
         branchActive = false;
         branchSeamlessFromPrevious = false;
@@ -508,6 +511,7 @@ public static class AutoRecorder {
         branchBgmFollowsVideo = recordingRoomBgmFollowsVideo;
         branchActive = true;
         waitingForStablePlayer = false;
+        resumeFromSavedState = false;
     }
 
     private static void StartDeathReplayBranchAtCurrentTime(bool seamlessFromPrevious = false) {
@@ -539,13 +543,30 @@ public static class AutoRecorder {
     }
 
     internal static void ResumeAfterInternalSave(ulong timestamp) {
+        ResumeAfterInternalSaveFrames(timestamp, timestamp);
+    }
+
+    internal static void PrepareInternalSaveResume(ulong timestamp) {
+        saveSuspendedFull?.RequestResumeFrame(timestamp);
+        saveSuspendedDeath?.RequestResumeFrame(timestamp);
+    }
+
+    internal static bool TryResumeAfterInternalSave() {
+        ulong full = saveSuspendedFull?.ResumeFrameTimestamp ?? 0;
+        ulong death = saveSuspendedDeath?.ResumeFrameTimestamp ?? 0;
+        if (saveSuspendedFull is not null && full == 0 || saveSuspendedDeath is not null && death == 0) return false;
+        ResumeAfterInternalSaveFrames(full, death);
+        return true;
+    }
+
+    private static void ResumeAfterInternalSaveFrames(ulong timestamp, ulong deathTimestamp) {
         if (saveSuspendedFull is { } full && ReferenceEquals(full, current) && !waitingForStablePlayer) {
             StartBranchAtCurrentTime(seamlessFromPrevious: true);
-            branchStartSeconds = full.FrameTimeAt(timestamp, roundUp: true);
+            branchStartSeconds = full.EncodedFrameTimeAt(timestamp);
         }
         if (saveSuspendedDeath is { } death && ReferenceEquals(death, deathReplayCurrent) && !deathReplayWaitingForStablePlayer) {
             StartDeathReplayBranchAtCurrentTime(seamlessFromPrevious: true);
-            deathReplayBranchStartSeconds = death.FrameTimeAt(timestamp, roundUp: true);
+            deathReplayBranchStartSeconds = death.EncodedFrameTimeAt(deathTimestamp);
         }
         saveSuspendedFull = saveSuspendedDeath = null;
     }
@@ -1021,6 +1042,7 @@ public static class AutoRecorder {
     }
 
     private static void ResetFullRecordingState() {
+        resumeFromSavedState = false;
         RecordingTransitionAutoSave.Reset();
         ActivePrefix.Clear();
         respawnAnchor = null;

@@ -12,7 +12,6 @@ use crate::encoder::{
 };
 use crate::finalizer_audio;
 
-const CROSSFADE_SECONDS: f64 = 0.25;
 pub(crate) const CUT_GAP_SECONDS: f64 = 0.10;
 
 #[derive(Debug, Deserialize)]
@@ -97,22 +96,12 @@ pub(crate) fn timeline_layout(clips: &[FinalizeClip]) -> Vec<TimelineClipLayout>
 }
 
 fn transition_duration(clips: &[FinalizeClip], index: usize) -> f64 {
-    let Some(current) = clips.get(index) else {
-        return 0.0;
-    };
-    let Some(next) = clips.get(index + 1) else {
-        return 0.0;
-    };
-    if next.seamless_from_previous {
-        return 0.0;
-    }
-    let source_gap = next.start_seconds - (current.start_seconds + current.duration_seconds);
-    if source_gap <= CUT_GAP_SECONDS {
-        return 0.0;
-    }
-    CROSSFADE_SECONDS
-        .min(current.duration_seconds * 0.5)
-        .min(next.duration_seconds * 0.5)
+    // Every edit is a hard cut.  A saved pause, room change, death recovery, or
+    // music re-sync must never blend two unrelated gameplay frames together.
+    // Keep the gap constant for callers that use it as an edit threshold, but
+    // do not turn that gap into a visual transition.
+    let _ = (clips, index);
+    0.0
 }
 
 #[derive(Debug, Error)]
@@ -923,7 +912,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn timeline_selection_concatenates_disjoint_ranges() {
+    fn timeline_selection_hard_cuts_disjoint_ranges() {
         let clips = vec![
             FinalizeClip {
                 source: "room.mkv".to_owned(),
@@ -955,19 +944,19 @@ mod tests {
         );
         let outgoing = selection.map(2.8).unwrap();
         assert!((outgoing.output_seconds - 1.8).abs() < 1e-9);
-        assert_eq!(outgoing.blend, TimelineBlend::Outgoing);
+        assert_eq!(outgoing.blend, TimelineBlend::Normal);
         assert_eq!(selection.map(4.0), None);
         assert_eq!(
             selection.map(5.125),
             Some(MappedFrame {
-                output_seconds: 1.875,
-                blend: TimelineBlend::Incoming { progress: 0.5 },
+                output_seconds: 2.125,
+                blend: TimelineBlend::Normal,
             })
         );
         assert_eq!(
             selection.map(5.25),
             Some(MappedFrame {
-                output_seconds: 2.0,
+                output_seconds: 2.25,
                 blend: TimelineBlend::Normal,
             })
         );
@@ -1093,17 +1082,30 @@ mod tests {
     }
 
     #[test]
-    fn video_frame_blending_interpolates_the_transition() {
-        let mut outgoing = frame::Video::new(ffmpeg::format::Pixel::YUV420P, 2, 2);
-        let mut incoming = frame::Video::new(ffmpeg::format::Pixel::YUV420P, 2, 2);
-        for plane in 0..outgoing.planes() {
-            outgoing.data_mut(plane).fill(20);
-            incoming.data_mut(plane).fill(220);
-        }
-        blend_video_frames(&outgoing, &mut incoming, 0.5);
-        for plane in 0..incoming.planes() {
-            assert!(incoming.data(plane).iter().all(|value| *value == 120));
-        }
+    fn disjoint_ranges_never_request_a_video_blend() {
+        let clips = vec![
+            FinalizeClip {
+                source: "room.mkv".to_owned(),
+                start_seconds: 0.0,
+                duration_seconds: 1.0,
+                music_event: String::new(),
+                music_timeline_milliseconds: 0,
+                seamless_from_previous: false,
+                bgm_follows_video: false,
+            },
+            FinalizeClip {
+                source: "room.mkv".to_owned(),
+                start_seconds: 3.0,
+                duration_seconds: 1.0,
+                music_event: String::new(),
+                music_timeline_milliseconds: 0,
+                seamless_from_previous: false,
+                bgm_follows_video: false,
+            },
+        ];
+        let mut selection = TimelineSelection::new(&clips);
+        assert_eq!(selection.map(0.99).unwrap().blend, TimelineBlend::Normal);
+        assert_eq!(selection.map(3.0).unwrap().blend, TimelineBlend::Normal);
     }
 
     #[test]
@@ -1165,15 +1167,19 @@ mod tests {
         }
         let video_duration = last_timestamp as f64 * f64::from(time_base);
         assert!(
-            (0.60..0.75).contains(&video_duration),
-            "unexpected crossfaded video duration {video_duration}"
+            (0.90..1.05).contains(&video_duration),
+            "unexpected hard-cut video duration {video_duration}"
         );
-        assert!((0.60..0.75).contains(&video_stream_duration));
-        assert!((0.70..0.82).contains(&audio_duration));
+        assert!((0.90..1.05).contains(&video_stream_duration));
+        assert!((0.95..1.10).contains(&audio_duration));
         assert!((audio_duration - video_stream_duration).abs() < 0.15);
     }
 
     fn write_continuous_source(path: &Path) {
+        write_source_with_keys(path, &[]);
+    }
+
+    fn write_source_with_keys(path: &Path, keyframes: &[u64]) {
         let config = CaptureConfig {
             output_path: Some(path.to_string_lossy().into_owned()),
             encoder: "libopenh264".to_owned(),
@@ -1201,9 +1207,98 @@ mod tests {
                 pixel[2] = (index * 7) as u8;
                 pixel[3] = 255;
             }
+            if keyframes.contains(&index) {
+                encoder.request_keyframe();
+            }
             encoder.encode(&frame).unwrap();
         }
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn saved_pause_hard_cuts_copy_packets_without_fades_or_ui_preroll() {
+        if std::env::var_os("MQOL_TEST_FFMPEG").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-pauses.mkv");
+        write_source_with_keys(&source, &[45, 70]);
+        write_continuous_audio(&source);
+        let intervals = [(0.25, 0.75), (1.5, 2.0), (70. / 30., 85. / 30.)];
+        let clips: Vec<FinalizeClip> = intervals
+            .iter()
+            .map(|&(start, end)| FinalizeClip {
+                source: source.to_string_lossy().into_owned(),
+                start_seconds: start,
+                duration_seconds: end - start,
+                music_event: String::new(),
+                music_timeline_milliseconds: 0,
+                seamless_from_previous: true,
+                bgm_follows_video: false,
+            })
+            .collect();
+        let video = directory.path().join("copy.mp4");
+        assert!(
+            crate::finalizer_copy::copy_video(&clips, &video).unwrap(),
+            "save pauses fell back to full encoding"
+        );
+        let expected: Vec<_> = encoded_samples(&source)
+            .into_iter()
+            .filter(|(t, _)| {
+                intervals
+                    .iter()
+                    .any(|&(start, end)| *t >= start - 0.0005 && *t < end - 0.0005)
+            })
+            .map(|(_, bytes)| bytes)
+            .collect();
+        let output = directory.path().join("with-audio.mp4");
+        finalize(&FinalizePlan {
+            clips: clips.clone(),
+            output_path: output.to_string_lossy().into_owned(),
+            prefer_video_copy: true,
+            fps: 30,
+            ..FinalizePlan::default()
+        })
+        .unwrap();
+        let actual: Vec<_> = encoded_samples(&output)
+            .into_iter()
+            .filter(|(t, _)| *t >= 0.)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "saved pause export re-encoded or retained excluded packets"
+        );
+        let expected_pixels: Vec<_> = decoded_samples(&source)
+            .into_iter()
+            .filter(|(t, _)| {
+                intervals
+                    .iter()
+                    .any(|&(start, end)| *t >= start - 0.0005 && *t < end - 0.0005)
+            })
+            .map(|(_, pixel)| pixel)
+            .collect();
+        let actual_pixels: Vec<_> = decoded_samples(&output)
+            .into_iter()
+            .map(|(_, pixel)| pixel)
+            .collect();
+        assert_eq!(
+            actual_pixels, expected_pixels,
+            "save UI leaked or resumed GOP lost its references"
+        );
+        let mut unsafe_cut = clips.clone();
+        unsafe_cut[1].start_seconds += 0.1;
+        unsafe_cut[1].duration_seconds -= 0.1;
+        assert!(
+            !crate::finalizer_copy::copy_video(&unsafe_cut, &video).unwrap(),
+            "non-keyframe internal cut was copied unsafely"
+        );
+        let mut fading = clips;
+        fading[1].seamless_from_previous = false;
+        assert!(
+            !crate::finalizer_copy::copy_video(&fading, &video).unwrap(),
+            "crossfade request silently discarded"
+        );
     }
 
     #[test]

@@ -86,6 +86,16 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
 }
 
 // Default manual/chapter editing still removes failed branches.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(3);
+    var saved = AutoRecorder.CaptureTimeline(l)!;
+    Advance(4); On.Celeste.Player.Raise(p); Tick(l);
+    p.Dead=false; AutoRecorder.RestoreTimeline(l,saved); Tick(l); Advance(2);
+    AutoRecorder.StopManual(l,true); Tick(l);
+    var clips=NativeRecordingFinalizer.Jobs.Single().Clips;
+    Check(clips.Count==2 && clips[1].SeamlessFromPrevious,"validated saved-state recovery still crossfades");
+    Check(clips.Sum(c=>c.DurationSeconds)==5,"seamless recovery kept failed gameplay");
+}
 foreach(var mode in new[]{AutoRecordingMode.Off,AutoRecordingMode.Chapter}) {
     var(l,p,b)=Begin(mode);if(mode==AutoRecordingMode.Off)AutoRecorder.StartManual();Tick(l);Advance(5);
     On.Celeste.Player.Raise(p);Tick(l);p.Dead=false;Tick(l);Advance(2);AutoRecorder.StopManual(l,true);Tick(l);

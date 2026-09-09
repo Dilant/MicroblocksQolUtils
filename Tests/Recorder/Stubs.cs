@@ -97,6 +97,9 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public double TimelineTimeSeconds => MediaTimeSeconds;
         public double TimeAt(ulong timestamp) => MediaTimeSeconds;
         public double FrameTimeAt(ulong timestamp, bool roundUp) => MediaTimeSeconds;
+        public double EncodedFrameTimeAt(ulong timestamp) => MediaTimeSeconds;
+        public void RequestResumeFrame(ulong timestamp) { }
+        public ulong ResumeFrameTimestamp => 1;
         public (ulong AudioFramesCaptured, ulong AudioChunksDropped) Statistics => (0,0);
         public bool Stopped;
         public static NativeRoomRecording? Start(string path) {

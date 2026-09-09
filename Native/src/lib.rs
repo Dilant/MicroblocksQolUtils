@@ -30,7 +30,7 @@ mod finalizer_audio;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_copy;
 
-const ABI_VERSION: u32 = 8;
+const ABI_VERSION: u32 = 9;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
@@ -572,6 +572,7 @@ struct CaptureSession {
     started: AtomicBool,
     origin_nanos: AtomicU64,
     last_video_nanos: AtomicU64,
+    keyframes: Mutex<VecDeque<u64>>,
     lifecycle: Mutex<()>,
     queue: Arc<LatestFrameQueue>,
     audio_queue: Arc<AudioChunkQueue>,
@@ -609,6 +610,7 @@ impl CaptureSession {
             started: AtomicBool::new(false),
             origin_nanos: AtomicU64::new(u64::MAX),
             last_video_nanos: AtomicU64::new(0),
+            keyframes: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(()),
             stats: Arc::new(AtomicStats::default()),
 
@@ -791,6 +793,16 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
                 .as_mut()
                 .unwrap()
                 .set_origin(session.origin_nanos.load(Ordering::Acquire));
+            {
+                let mut requests = session.keyframes.lock().unwrap_or_else(|p| p.into_inner());
+                while requests
+                    .front()
+                    .is_some_and(|time| *time <= frame.captured_at_unix_nanos)
+                {
+                    requests.pop_front();
+                    encoder.as_mut().unwrap().request_keyframe();
+                }
+            }
             encoder
                 .as_mut()
                 .expect("encoder initialized above")
@@ -1008,6 +1020,29 @@ pub extern "C" fn mqol_capture_stop(handle: u64) -> i32 {
             .cloned()
             .ok_or(ERR_NOT_FOUND)?;
         session.stop()?;
+        Ok(OK)
+    })
+}
+
+/// Force the first accepted frame at/after this source-clock boundary to start
+/// a new GOP. Timestamped requests cannot accidentally target an old backlog frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn mqol_capture_request_keyframe(handle: u64, timestamp: u64) -> i32 {
+    ffi_status(|| {
+        let session = sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&handle)
+            .cloned()
+            .ok_or(ERR_NOT_FOUND)?;
+        let mut requests = session.keyframes.lock().unwrap_or_else(|p| p.into_inner());
+        if requests
+            .back()
+            .is_some_and(|previous| timestamp <= *previous)
+        {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        requests.push_back(timestamp);
         Ok(OK)
     })
 }

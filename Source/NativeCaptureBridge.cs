@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 8;
+    private const uint ExpectedAbiVersion = 9;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -203,6 +203,12 @@ public static class NativeCaptureBridge {
         if (status != 0 && status != -4) ThrowIfFailed(status, "stop");
     }
 
+    internal static void RequestKeyframe(ulong handle, ulong timestamp) =>
+        ThrowIfFailed(CaptureRequestKeyframe(handle, timestamp), "request keyframe");
+
+    [DllImport(LibraryName, EntryPoint = "mqol_capture_request_keyframe", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int CaptureRequestKeyframe(ulong handle, ulong timestamp);
+
     internal static void Destroy(ulong handle) {
         int status = CaptureDestroy(handle);
         if (status != 0 && status != -2) ThrowIfFailed(status, "destroy");
@@ -282,6 +288,15 @@ public sealed class NativeCaptureSession : IDisposable {
     private readonly Queue<CaptureAudio> preroll = new(32);
     private bool videoStarted;
     private ulong origin;
+    private ulong keyframeRequestedAt, keyframeAcceptedAt;
+    internal ulong KeyframeAcceptedAt => Volatile.Read(ref keyframeAcceptedAt);
+    internal void RequestKeyframe(ulong timestamp) {
+        lock (gate) {
+            NativeCaptureBridge.RequestKeyframe(handle, timestamp);
+            Volatile.Write(ref keyframeAcceptedAt, 0);
+            Volatile.Write(ref keyframeRequestedAt, timestamp);
+        }
+    }
     // Publish only after the first frame is accepted. Delivery stats lag the
     // game thread by GPU readback + subscriber queues and are not an edit clock.
     internal double? TimeAt(ulong timestamp) {
@@ -304,6 +319,12 @@ public sealed class NativeCaptureSession : IDisposable {
     public CaptureDeliveryStatistics DeliveryStatistics => new(subscription.DroppedFrames,
         subscription.DroppedAudioChunks, subscription.DroppedMusicEvents, subscription.CallbackErrors);
     public bool HasAudioTap => CaptureSource.AudioAvailable;
+    internal Task CompleteInput() {
+        // Detach immediately at the stop boundary, not when a busy thread pool
+        // eventually schedules encoder teardown. Drain callbacks asynchronously.
+        subscription.Complete();
+        return subscription.Completion;
+    }
     public void Stop() {
         // Concurrent Stop/Dispose callers must all wait for the drain, not destroy a
         // handle while the first caller is still waiting for its callback worker.
@@ -336,6 +357,9 @@ public sealed class NativeCaptureSession : IDisposable {
             while (preroll.TryDequeue(out var chunk))
                 if (chunk.TimestampNanos >= frame.TimestampNanos) PushAudio(chunk);
         }
+        ulong requested = Volatile.Read(ref keyframeRequestedAt);
+        if (requested != 0 && frame.TimestampNanos >= requested)
+            Interlocked.CompareExchange(ref keyframeAcceptedAt, frame.TimestampNanos, 0);
     }
     private unsafe void PushAudio(CaptureAudio chunk) {
         if (!videoStarted) {

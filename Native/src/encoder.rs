@@ -77,6 +77,7 @@ pub struct VideoFileEncoder {
     origin_unix_nanos: Option<u64>,
     last_pts: i64,
     finished: bool,
+    keyframe_requested: bool,
 }
 
 impl VideoFileEncoder {
@@ -237,6 +238,7 @@ impl VideoFileEncoder {
             origin_unix_nanos: None,
             last_pts: -1,
             finished: false,
+            keyframe_requested: false,
         })
     }
 
@@ -296,6 +298,12 @@ impl VideoFileEncoder {
 
         self.last_pts = timestamp;
         self.converted.set_pts(Some(timestamp));
+        self.converted.set_kind(if self.keyframe_requested {
+            ffmpeg::picture::Type::I
+        } else {
+            ffmpeg::picture::Type::None
+        });
+        self.keyframe_requested = false;
         self.encoder
             .send_frame(&self.converted)
             .map_err(EncoderError::SendFrame)?;
@@ -311,6 +319,10 @@ impl VideoFileEncoder {
         self.output.write_trailer().map_err(EncoderError::Trailer)?;
         self.finished = true;
         Ok(())
+    }
+
+    pub fn request_keyframe(&mut self) {
+        self.keyframe_requested = true;
     }
 
     fn write_available_packets(&mut self) -> Result<(), EncoderError> {
@@ -558,10 +570,12 @@ pub(crate) fn encoder_options(name: &str) -> Dictionary<'static> {
     let mut options = Dictionary::new();
     match name {
         "h264_nvenc" => {
+            options.set("forced-idr", "1");
             options.set("preset", "p4");
             options.set("tune", "ll");
         }
         "h264_qsv" => {
+            options.set("forced_idr", "1");
             options.set("preset", "veryfast");
             // Recording can tolerate a few frames of encoder latency. Serializing
             // every QSV submission needlessly limits throughput at native DPI sizes.

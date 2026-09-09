@@ -1647,10 +1647,10 @@ mod tests {
         let segments = post_mix_segments(&clips, 1_000).unwrap();
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].output_start_frames, 0);
-        assert_eq!(segments[0].frames, 750);
-        assert_eq!(segments[1].output_start_frames, 750);
-        assert_eq!(segments[1].captured_source_start_frames, 750);
-        assert!((segments[1].mapped_source_start_seconds - 0.75).abs() < 1e-9);
+        assert_eq!(segments[0].frames, 1_000);
+        assert_eq!(segments[1].output_start_frames, 1_000);
+        assert_eq!(segments[1].captured_source_start_frames, 1_000);
+        assert!((segments[1].mapped_source_start_seconds - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1703,8 +1703,8 @@ mod tests {
             },
         ];
         let segments = post_mix_segments(&clips, 1_000).unwrap();
-        assert_eq!(segments[1].captured_source_start_frames, 3_000);
-        assert!((segments[1].mapped_source_start_seconds - 0.75).abs() < 1e-9);
+        assert_eq!(segments[1].captured_source_start_frames, 3_250);
+        assert!((segments[1].mapped_source_start_seconds - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1756,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_clips_crossfade_audio_on_the_same_timeline_as_video() {
+    fn disjoint_clips_hard_cut_audio_on_the_same_timeline_as_video() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join("room.mkv.sfxchunks");
         let mixed = directory.path().join("mixed.f32");
@@ -1800,14 +1800,14 @@ mod tests {
         let spec = render_mix(&sidecar, &clips, &mixed, false)
             .unwrap()
             .unwrap();
-        assert_eq!(spec.total_frames, 14_000);
+        assert_eq!(spec.total_frames, 16_000);
         let values: Vec<f32> = fs::read(mixed)
             .unwrap()
             .chunks_exact(8)
             .map(|frame| f32::from_le_bytes(frame[0..4].try_into().unwrap()))
             .collect();
         assert!((values[6_000] - 0.8).abs() < 1e-6);
-        assert!(values[7_000].abs() < 1e-6);
+        assert!((values[7_000] - 0.8).abs() < 1e-6);
         assert!((values[8_000] + 0.8).abs() < 1e-6);
     }
 

@@ -103,6 +103,7 @@ for(int i=0;i<240;i++) {
     }
     if(i==90) {
         RecordingPauseAudio.Resume();
+        first.RequestKeyframe(SdlFrameSource.ClockNanos());
         Fmod(studio.flushCommands());
         Fmod(song.getPaused(out bool paused));
         Check(!paused && !Celeste.Audio.BusPaused("bus:/gameplay_sfx"), "save wait leaked an audio pause");
@@ -138,6 +139,17 @@ foreach(var name in new[]{"first.mkv","second.mkv"}) {
 }
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,1.5,"",0)],
     Path.Combine(output,"final.mp4"),encoder,1000,30,false,false,"").GetAwaiter().GetResult();
+Check(first.KeyframeAcceptedAt != 0, "resumed keyframe request was never accepted");
+double resumed = Math.Floor(first.TimeAt(first.KeyframeAcceptedAt)!.Value * 30 + .5) / 30;
+List<double> seamProgress = [];
+var seamTimer = System.Diagnostics.Stopwatch.StartNew();
+NativeCaptureBridge.FinalizeRecordingAsync([
+    new RecordingClip(Path.Combine(output,"first.mkv"),.25,.4,"",0),
+    new RecordingClip(Path.Combine(output,"first.mkv"),resumed,.25,"",0,true)],
+    Path.Combine(output,"saved-pause-fast.mp4"),encoder,1000,30,true,false,"",
+    preferVideoCopy:true,progress:p=>seamProgress.Add(p)).GetAwaiter().GetResult();
+Check(!seamProgress.Any(p=>p>0 && p<.84), "real source keyframe/save pause fell back to full transcode");
+Console.WriteLine($"PASS saved-pause GOP request + hard-cut packet copy: {seamTimer.Elapsed.TotalMilliseconds:F1} ms");
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,0.4,"",0),
     new RecordingClip(Path.Combine(output,"first.mkv"),0.8,0.4,"",0)],
     Path.Combine(output,"continuous-bgm.mp4"),encoder,1000,30,true,false,"").GetAwaiter().GetResult();

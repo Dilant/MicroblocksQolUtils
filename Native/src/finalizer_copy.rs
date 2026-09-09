@@ -10,24 +10,35 @@ use crate::finalizer::{FinalizeClip, FinalizeError};
 
 const MAX_PREROLL_BYTES: usize = 32 * 1024 * 1024;
 
-fn continuous_range(clips: &[FinalizeClip]) -> Option<(f64, f64)> {
+fn copy_ranges(clips: &[FinalizeClip]) -> Option<Vec<(f64, f64)>> {
     let first = clips.first()?;
+    let mut ranges = Vec::new();
+    let mut start = first.start_seconds;
     let mut end = first.start_seconds + first.duration_seconds;
     for clip in &clips[1..] {
-        // Room/music metadata boundaries are not edits. Pauses, cuts and overlaps
-        // require the exact renderer (including its existing transition policy).
-        if clip.source != first.source || (clip.start_seconds - end).abs() > 1e-7 {
+        if clip.source != first.source || clip.start_seconds < end - 1e-7 {
             return None;
+        }
+        if (clip.start_seconds - end).abs() > 1e-7 {
+            // Hard cuts can copy only if the actual resumed packet is an IDR.
+            // Never bypass a requested crossfade just to enter the fast path.
+            if !clip.seamless_from_previous {
+                return None;
+            }
+            ranges.push((start, end));
+            start = clip.start_seconds;
         }
         end = clip.start_seconds + clip.duration_seconds;
     }
-    Some((first.start_seconds, end))
+    ranges.push((start, end));
+    Some(ranges)
 }
 
 pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, FinalizeError> {
-    let Some((start, end)) = continuous_range(clips) else {
+    let Some(ranges) = copy_ranges(clips) else {
         return Ok(false);
     };
+    let (start, end) = ranges[0];
     let source_path = Path::new(&clips[0].source);
     let mut input = format::input(source_path).map_err(|source| FinalizeError::OpenInput {
         path: source_path.to_owned(),
@@ -52,8 +63,11 @@ pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, Fi
         return Ok(false);
     }
     let tick = f64::from(time_base);
-    let origin = (start / tick).round() as i64;
-    let end_tick = (end / tick).round() as i64;
+    let mut origin = (start / tick).round() as i64;
+    let mut end_tick = (end / tick).round() as i64;
+    let mut range_index = 0;
+    let mut output_start = 0.0;
+    let mut output_offset = origin;
     let mut output = format::output(destination).map_err(|source| FinalizeError::CreateOutput {
         path: destination.to_owned(),
         source,
@@ -98,7 +112,48 @@ pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, Fi
         }
         last_timestamp = Some(dts);
         if pts >= end_tick {
-            break;
+            if !started {
+                return Ok(false);
+            }
+            loop {
+                output_start += ranges[range_index].1 - ranges[range_index].0;
+                range_index += 1;
+                if range_index == ranges.len() {
+                    break;
+                }
+                origin = (ranges[range_index].0 / tick).round() as i64;
+                end_tick = (ranges[range_index].1 / tick).round() as i64;
+                output_offset = origin - (output_start / tick).round() as i64;
+                started = false;
+                if pts < end_tick {
+                    break;
+                }
+                // No video for an entire requested segment: don't shorten it.
+                return Ok(false);
+            }
+            if range_index == ranges.len() {
+                break;
+            }
+        }
+        if range_index > 0 {
+            if pts < origin {
+                continue;
+            }
+            if !started {
+                if !packet.is_key() {
+                    return Ok(false);
+                }
+                started = true;
+            }
+            write_packet(
+                &mut packet,
+                output_offset,
+                end_tick,
+                time_base,
+                output_time_base,
+                &mut output,
+            )?;
+            continue;
         }
         if !started {
             if packet.is_key() {
@@ -121,7 +176,7 @@ pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, Fi
             for mut packet in preroll.drain(..) {
                 write_packet(
                     &mut packet,
-                    origin,
+                    output_offset,
                     end_tick,
                     time_base,
                     output_time_base,
@@ -131,7 +186,7 @@ pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, Fi
         } else {
             write_packet(
                 &mut packet,
-                origin,
+                output_offset,
                 end_tick,
                 time_base,
                 output_time_base,
@@ -139,7 +194,7 @@ pub fn copy_video(clips: &[FinalizeClip], destination: &Path) -> Result<bool, Fi
             )?;
         }
     }
-    if !started {
+    if !started || range_index < ranges.len() - 1 {
         return Ok(false);
     }
     output.write_trailer().map_err(FinalizeError::Trailer)?;
@@ -181,16 +236,22 @@ mod tests {
 
     #[test]
     fn only_continuous_ranges_can_reuse_packets() {
-        assert_eq!(continuous_range(&[]), None);
-        assert_eq!(continuous_range(&[clip(12.3, 10.)]), Some((12.3, 22.3)));
+        assert_eq!(copy_ranges(&[]), None);
+        assert_eq!(copy_ranges(&[clip(12.3, 10.)]), Some(vec![(12.3, 22.3)]));
         let mut room = clip(13., 2.);
         room.bgm_follows_video = true;
         room.seamless_from_previous = true;
-        assert_eq!(continuous_range(&[clip(12., 1.), room]), Some((12., 15.)));
-        assert_eq!(continuous_range(&[clip(0., 1.), clip(1.001, 1.)]), None);
-        assert_eq!(continuous_range(&[clip(0., 1.), clip(0.999, 1.)]), None);
+        assert_eq!(copy_ranges(&[clip(12., 1.), room]), Some(vec![(12., 15.)]));
+        assert_eq!(copy_ranges(&[clip(0., 1.), clip(1.001, 1.)]), None);
+        assert_eq!(copy_ranges(&[clip(0., 1.), clip(0.999, 1.)]), None);
+        let mut resume = clip(1.2, 1.0);
+        resume.seamless_from_previous = true;
+        assert_eq!(
+            copy_ranges(&[clip(0., 1.), resume]),
+            Some(vec![(0., 1.), (1.2, 2.2)])
+        );
         let mut other = clip(1., 1.);
         other.source = "other.mkv".into();
-        assert_eq!(continuous_range(&[clip(0., 1.), other]), None);
+        assert_eq!(copy_ranges(&[clip(0., 1.), other]), None);
     }
 }

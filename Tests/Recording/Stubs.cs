@@ -104,6 +104,8 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static int Suspends, Resumes;
         public static void SuspendForInternalSave(ulong time) => Suspends++;
         public static void ResumeAfterInternalSave(ulong time) => Resumes++;
+        public static void PrepareInternalSaveResume(ulong time) { }
+        public static bool TryResumeAfterInternalSave() { Resumes++; return true; }
         public static void CancelInternalSave() { }
         public static bool IsRecording = true, CanSaveTransitionTimeline = true;
         public static string CurrentPath = "run.mkv";

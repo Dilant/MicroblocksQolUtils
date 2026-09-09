@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 // Render/presentation driven, not a timer: the save cannot start until the
 // indicator was presented, and gameplay cannot resume onto an indicator frame.
 internal static class RecordingSavePause {
-    private enum Phase { None, Indicator, Save, Cloning, Clean }
+    private enum Phase { None, Indicator, Save, Cloning, Clean, ResumeFrame }
     private static Phase phase;
     private static Level? level;
     private static Action<RecoveryResult>? completed;
@@ -73,7 +73,12 @@ internal static class RecordingSavePause {
             AutoRecorder.SuspendForInternalSave(timestamp);
             phase = Phase.Save;
         } else if (phase == Phase.Clean && ++cleanFrames >= 2) {
-            AutoRecorder.ResumeAfterInternalSave(timestamp);
+            // Request on the source clock, before this clean presentation enters
+            // the GPU queue. Keep simulation frozen until BOTH sinks accept their
+            // actual first resumed frame; callback lag cannot select an old P frame.
+            AutoRecorder.PrepareInternalSaveResume(timestamp);
+            phase = Phase.ResumeFrame;
+        } else if (phase == Phase.ResumeFrame && AutoRecorder.TryResumeAfterInternalSave()) {
             resumeStep = true;
             phase = Phase.None;
             level = null;
