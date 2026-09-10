@@ -14,17 +14,30 @@ internal static class RecordingSavePause {
     private static long beganAt;
     private static TimeSpan lastStep = TimeSpan.FromSeconds(1d / 60);
     private static bool resumeStep;
+    private static bool resumeUpdateAwaitingPresentation;
+    private static bool resumeDisplayPinned;
     internal static bool Active => phase != Phase.None;
     internal static bool ShowIndicator => phase is Phase.Indicator or Phase.Save or Phase.Cloning;
 
     internal static bool BeforeEngineUpdate(ref GameTime time) {
         if (Active) return false;
+        if (resumeUpdateAwaitingPresentation) {
+            // Outer smoothing hooks may reset their "updated" flag even for a
+            // skipped catch-up tick. Keep the one accepted physics step visible.
+            if (!resumeDisplayPinned) {
+                RecordingMotionSmoothing.FreezePresentation();
+                resumeDisplayPinned = true;
+            }
+            return false;
+        }
         // The clean presentation gate drains fixed-step catch-up updates while
         // frozen. Also prevent a variable-step backend from applying the save's
         // elapsed wall time as a single giant physics step on resume.
         if (resumeStep) {
             if (time.ElapsedGameTime > lastStep) time = new GameTime(time.TotalGameTime, lastStep, time.IsRunningSlowly);
             resumeStep = false;
+            resumeUpdateAwaitingPresentation = true;
+            resumeDisplayPinned = false;
         }
         if (time.ElapsedGameTime > TimeSpan.Zero)
             lastStep = time.ElapsedGameTime < TimeSpan.FromSeconds(1d / 60)
@@ -41,6 +54,7 @@ internal static class RecordingSavePause {
         // Present the exact frozen state once before drawing any save UI. This
         // is the end-exclusive timeline boundary AND the state cloned by SRT.
         phase = Phase.Boundary;
+        RecordingMotionSmoothing.FreezePresentation();
         RecordingPauseAudio.Pause();
     }
 
@@ -93,6 +107,9 @@ internal static class RecordingSavePause {
     }
 
     internal static void Presented(ulong timestamp) {
+        // A fixed-step loop may call Engine.Update repeatedly after a stall.
+        // Allow only one recovery step until its result was actually presented.
+        resumeUpdateAwaitingPresentation = false;
         if (phase == Phase.Boundary) {
             // Exclude this saved pose here; include it exactly once at resume.
             // Earlier GPU deliveries cannot move the cut behind the state clone.
@@ -112,6 +129,10 @@ internal static class RecordingSavePause {
             level = null;
         }
     }
+
+    // Also release after an ordinary draw when capture has stopped or the source
+    // backend is unavailable. A video-only callback must never deadlock gameplay.
+    internal static void Drawn() => resumeUpdateAwaitingPresentation = false;
 
     internal static void Cancel() {
         if (!Active) return;

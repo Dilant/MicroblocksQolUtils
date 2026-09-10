@@ -88,6 +88,21 @@ Check(!RecordingSavePause.Active && AutoRecorder.Resumes == resumes + 1, "clean 
 var delayedStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
 Check(RecordingSavePause.BeforeEngineUpdate(ref delayedStep) && delayedStep.ElapsedGameTime == normalStep.ElapsedGameTime,
     "save wall-time became a giant physics step on resume");
+int resumeUpdates = 1;
+for (int i = 0; i < 30; i++) {
+    var catchup = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = normalStep.ElapsedGameTime };
+    if (RecordingSavePause.BeforeEngineUpdate(ref catchup)) resumeUpdates++;
+}
+Check(resumeUpdates == 1, "fixed-step catch-up advanced multiple physics steps before the first resumed presentation");
+RecordingSavePause.Presented(600);
+Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "first resumed presentation did not release normal updates");
+// A draw after capture stops must be sufficient too; no source callback exists.
+RecordingSavePause.Begin(level, _ => { });
+RecordingSavePause.Cancel();
+Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "cancel did not permit its first recovery step");
+Check(!RecordingSavePause.BeforeEngineUpdate(ref normalStep), "cancel did not guard recovery catch-up updates");
+RecordingSavePause.Drawn();
+Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "ordinary draw did not release recovery guard without capture");
 level = Reset();
 StateManager.FailClone = true; Queue(level); Tick(); StateManager.FailClone = false;
 Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused && !RecordingTransitionAutoSave.CanRecover(level)
@@ -172,21 +187,52 @@ RecordingDeathRecovery.AfterEngineUpdate();
 Engine.Scene = new Level(); RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "scene switch leaked the recovery gate");
 
-// Multiple manual SL branches followed by both clear-current and clear-all must
-// leave an independent, rebased recording recovery point.
+// Manual saves own gameplay, including SRT's own later-installed death hook.
+// Any saved user slot suppresses private saves; clearing the last one takes a
+// NEW snapshot at current state instead of reviving an abandoned private branch.
 level = Reset(); SaveHere(level); user = StateManager.Instance;
 level.Position = 15; user.SaveStateImpl(false, out _); user.State = State.None;
 Check(level.TimerMarked && level.GoldenMarked && user.Freezes == 1, "manual save behavior changed");
+int manualSuspends = AutoRecorder.ManualSuspends;
+Tick();
+Check(SpeedrunToolAutoSave.HasManualState && !RecordingTransitionAutoSave.CanRecover(level)
+    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active, "manual save did not retire private recovery");
 for (int i = 0; i < 3; i++) {
     level.Position = 99; user.LoadStateImpl(false, out _); user.State = State.None; Tick();
-    Check(level.Position == 15 && Private().Saves == i + 2, "manual load did not rebase private recovery");
+    Check(level.Position == 15 && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
+        "manual load queued another automatic save");
 }
-user.ClearStateImpl(false); Check(Private().IsSaved, "clearing user slot erased private state");
-SaveSlotsManager.ClearAll(); Check(Private().IsSaved, "clearing all user slots erased private state");
-level.Position = 50; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 15 && Private().Loads == 1 && !StateManager.Instance.IsSaved,
-    "recovery failed after repeated SL and clearing user slots");
-Check(level.TimerMarked && level.GoldenMarked, "recovery erased existing manual SL marks");
+Check(AutoRecorder.ManualSuspends == manualSuspends + 3, "manual load callbacks did not segment video");
+int delegatedDeaths = 0;
+On.Celeste.PlayerDeadBody.hook_End manualDeathHook = (orig, dead) => {
+    delegatedDeaths++;
+    StateManager.Instance.LoadStateImpl(false, out _);
+};
+On.Celeste.PlayerDeadBody.End += manualDeathHook;
+level.Position = 99; body = Die(level); body.CallEnd();
+Check(delegatedDeaths == 1 && level.Position == 15 && !body.Coroutine.Cancelled
+    && StateManager.Instance.State == State.Waiting && !RecordingSavePause.Active,
+    "private hook hijacked manual death recovery or SRT's wait behavior");
+On.Celeste.PlayerDeadBody.End -= manualDeathHook;
+StateManager.Instance.State = State.None;
+SaveSlotsManager.SwitchSlot("empty-user-slot"); Queue(level); Tick();
+Check(!SpeedrunToolRecoverySlot.HasState && SaveSlotsManager.SlotName == "empty-user-slot",
+    "empty selected slot overrode a manual save in another user slot");
+SaveSlotsManager.ClearAll(); level.Position = 50; Tick();
+Check(!SpeedrunToolAutoSave.HasManualState && RecordingTransitionAutoSave.CanRecover(level),
+    "clearing all user slots did not re-enable a fresh automatic anchor");
+level.Position = 75; body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 50 && Private().Loads == 1, "clear resurrected the pre-manual private snapshot");
+
+level = Reset(); user = StateManager.Instance;
+level.Position = 20; user.SaveStateImpl(false, out _); user.State = State.None;
+Queue(level); Tick();
+Check(!SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
+    "pre-existing manual save allowed an automatic recording-start save");
+user.ClearStateImpl(false); level.Position = 60; Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level), "clearing the last individual user slot did not establish a fresh anchor");
+level.Position = 80; body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 60, "individual clear recovered an old branch instead of the current-state anchor");
 
 level = Reset(); SaveHere(level); SaveSlotsManager.SwitchSlot("user-2");
 level.Position = 8; body = Die(level); body.CallEnd(); Tick();
@@ -285,7 +331,9 @@ public static class TestExports {
         Action<Dictionary<Type, Dictionary<string, object>>, Level>? save,
         Action<Dictionary<Type, Dictionary<string, object>>, Level>? load,
         Action? clear, Action<Level>? beforeSave, Action<Level>? beforeLoad, Action? preClone) {
-        SaveLoadAction.Save = save; SaveLoadAction.Load = load; return new SaveLoadAction();
+        SaveLoadAction.Save = save; SaveLoadAction.Load = load;
+        SaveLoadAction.BeforeSave = beforeSave; SaveLoadAction.BeforeLoad = beforeLoad;
+        return new SaveLoadAction();
     }
     public static void Unregister(object registration) => SaveLoadAction.Save = SaveLoadAction.Load = null;
 }

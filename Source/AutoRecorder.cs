@@ -39,6 +39,8 @@ public static class AutoRecorder {
     private static bool branchActive;
     private static bool waitingForStablePlayer;
     private static bool resumeFromSavedState;
+    private static bool manualSlSuspended;
+    private static bool manualSlSeamless;
     private static bool pauseSuspended;
     private static NativeRoomRecording? saveSuspendedFull, saveSuspendedDeath;
     private static bool transitioningRoom;
@@ -179,6 +181,17 @@ public static class AutoRecorder {
             // Finish the failed attempt before an internal load replaces its entities.
             FinalizeDeathReplayCapture();
         }
+        if (manualSlSuspended && MicroblocksQolUtilsModule.Settings.DeathReplayEnabled && deathReplayCurrent is null) {
+            StartDeathReplayRecording();
+            deathReplayBranchActive = false;
+        }
+        // The transition coroutine can finish after QolHud.Update. Arm the save
+        // on that SAME completed engine tick, not after another player update.
+        if (current is { } recording && transitioningRoom && Engine.Scene is Level level && !level.Transitioning) {
+            transitioningRoom = false;
+            respawnAnchor = new RecordingTimelineSnapshot(CaptureCurrentClips(recording));
+            observedRespawnPoint = level.Session.RespawnPoint;
+        }
         RecordingDeathRecovery.AfterEngineUpdate();
         RecordingTransitionAutoSave.AfterEngineUpdate();
     }
@@ -189,6 +202,7 @@ public static class AutoRecorder {
             if (current is not null) DiscardCurrentRecording();
             return;
         }
+        if (manualSlSuspended) return;
         if (level.Paused) {
             SuspendForPause();
             return;
@@ -227,6 +241,7 @@ public static class AutoRecorder {
                 DiscardDeathReplayRecording();
             return;
         }
+        if (manualSlSuspended) return;
         if (deathReplayFinalizeRequested) return;
         if (level.Paused) {
             SuspendDeathReplayForPause();
@@ -314,7 +329,7 @@ public static class AutoRecorder {
     public static RecordingTimelineSnapshot? CaptureTimeline(Level level) {
         NativeRoomRecording? recording = current;
         if (recording is null
-            || (!branchActive && !ReferenceEquals(recording, saveSuspendedFull))
+            || (!branchActive && !manualSlSuspended && !ReferenceEquals(recording, saveSuspendedFull))
             || !string.Equals(RunKey(level), runKey, StringComparison.Ordinal)) {
             return null;
         }
@@ -540,6 +555,41 @@ public static class AutoRecorder {
             saveSuspendedDeath = death;
             deathReplayBranchActive = false;
         }
+    }
+
+    internal static void SuspendForManualSl(bool loading = false) {
+        if (current is null && deathReplayCurrent is null) return;
+        manualSlSeamless = !loading;
+        if (manualSlSuspended) return;
+        if (current is { } full && CurrentClip(full.TimelineTimeSeconds, 0) is { } clip)
+            ActivePrefix.Add(clip);
+        if (deathReplayCurrent is { } death && CurrentDeathReplayClip(death.TimelineTimeSeconds, 0) is { } deathClip)
+            DeathReplayPrefix.Add(deathClip);
+        branchActive = deathReplayBranchActive = false;
+        manualSlSuspended = true;
+    }
+
+    internal static void ManualSlPresented(ulong timestamp) {
+        if (!manualSlSuspended || SpeedrunToolAutoSave.ManualOperationActive
+            || Engine.Scene is not Level level || level.Paused
+            || level.Tracker.GetEntity<Player>() is not { } player || !PlayerIsRecordable(level, player)) return;
+        // Observe SRT, never unfreeze it. Resume video at its first clean presented
+        // frame, without waiting for a QolHud update or pausing the game ourselves.
+        ObserveRoom(level);
+        RecordingDeathAudio.StopRemainder();
+        if (current is { } full) {
+            full.RequestResumeFrame(timestamp);
+            StartBranchAtCurrentTime(seamlessFromPrevious: manualSlSeamless || resumeFromSavedState);
+            branchStartSeconds = full.EncodedFrameTimeAt(timestamp);
+            pauseSuspended = false;
+        }
+        if (deathReplayCurrent is { } death) {
+            death.RequestResumeFrame(timestamp);
+            StartDeathReplayBranchAtCurrentTime(seamlessFromPrevious: true);
+            deathReplayBranchStartSeconds = death.EncodedFrameTimeAt(timestamp);
+            deathReplayPauseSuspended = false;
+        }
+        manualSlSuspended = false;
     }
 
     internal static void ResumeAfterInternalSave(ulong timestamp) {
@@ -1049,6 +1099,7 @@ public static class AutoRecorder {
     }
 
     private static void ResetTimelineState() {
+        manualSlSuspended = false;
         ResetFullRecordingState();
         runKey = "";
         areaSid = "";

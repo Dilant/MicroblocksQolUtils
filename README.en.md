@@ -159,11 +159,14 @@ The recording option **Auto-save on room transitions (video continuity)** is ena
 While full recording is active (including manual recording), it saves the game and recording
 timeline into a dedicated internal SpeedrunTool slot after each room transition. Normal same-room
 deaths load that slot automatically; golden chapter restarts and custom death actions are not
-intercepted. Recording start, respawn-point changes and manual loads also refresh the recovery point.
-The user's slots and selection are preserved, including after repeated SL and clearing one/all user slots.
-Internal SL adds no timer/golden-berry marks, popup or animation/freeze, preserves existing marks
-and normal death/time statistics, and does not require SRT's death-auto-load setting.
-Manual SL keeps its normal behavior. Stopping recording/disabling the feature releases the slot.
+intercepted. Recording start and respawn-point changes also refresh the recovery point.
+**Any saved user slot disables internal automatic saves and loads**, even when an empty slot is selected.
+SRT alone handles manual-slot death recovery; its waits, wipes and input behavior are unchanged.
+We only segment video and restore valid saved recording prefixes, preferring hard cuts for those joins.
+Clearing the last user save creates a fresh internal recovery point at the current state, never the old branch.
+Internal saving freezes gameplay with a saving indicator until clean resume frames reach the recordings.
+It preserves user slots/selection, existing marks and normal death/time statistics, adds no timer/golden-berry
+marks, and does not require SRT's death-auto-load setting. Stopping recording/disabling the feature releases the slot.
 Death-replay-only capture, disabled/missing/incompatible SRT, active TAS and TAS-owned selected
 slots are skipped safely.
 

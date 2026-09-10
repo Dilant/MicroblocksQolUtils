@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Collections;
+using Microsoft.Xna.Framework;
 using Monocle;
 using Mono.Cecil.Cil;
 using MonoMod.Cil;
@@ -68,6 +70,32 @@ internal static class RecordingMotionSmoothing {
             positionsUpdated!.SetValue(handler, false);
         } catch (Exception exception) {
             Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder", $"Cannot initialize restored smoothing history: {exception.GetBaseException().Message}");
+        }
+    }
+
+    internal static void FreezePresentation() {
+        try {
+            if (handlerInstance?.GetValue(null) is not { } handler) return;
+            Freeze(valueSmoother!.GetValue(handler)!);
+            Freeze(pushSmoother!.GetValue(handler)!);
+            positionsUpdated!.SetValue(handler, false);
+        } catch (Exception exception) {
+            Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder", $"Cannot freeze smoothing presentation: {exception.GetBaseException().Message}");
+        }
+
+        static void Freeze(object strategy) {
+            // Keep velocity history intact for the next real update. Only pin
+            // display coordinates to the latest physical sample: neither an old
+            // rendered sample nor extrapolation across the save's wall time.
+            var states = strategy.GetType().GetMethod("States", Members, [])!.Invoke(strategy, null) as IEnumerable;
+            foreach (object pair in states!) {
+                object state = pair.GetType().GetProperty("Value")!.GetValue(pair)!;
+                Type type = state.GetType();
+                PropertyInfo? original = type.GetProperty("OriginalRealPosition", Members);
+                PropertyInfo? smooth = type.GetProperty("SmoothedRealPosition", Members);
+                if (original?.PropertyType == typeof(Vector2) && smooth?.GetSetMethod(true) is { } set)
+                    set.Invoke(state, [original.GetValue(state)]);
+            }
         }
     }
 

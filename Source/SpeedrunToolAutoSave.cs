@@ -37,6 +37,8 @@ internal static class SpeedrunToolAutoSave {
     private static bool suppressMarking;
     internal static bool Available => hookStatus?.Ready is true;
     internal static bool HasState => Available && SpeedrunToolRecoverySlot.HasState;
+    internal static bool HasManualState => SpeedrunToolRecoverySlot.HasUserState;
+    internal static bool ManualOperationActive => SpeedrunToolRecoverySlot.UserOperationActive;
 
     internal static void Load(Assembly assembly) {
         Unload();
@@ -128,7 +130,7 @@ internal static class SpeedrunToolAutoSave {
 
     internal static bool ReadyToSave {
         get {
-            if (!CanUse || SpeedrunToolRecoverySlot.Completing) return false;
+            if (!CanUse || HasManualState || SpeedrunToolRecoverySlot.Completing) return false;
             object? manager = managerInstance!.GetValue(null);
             return manager is not null && savedByTas!.GetValue(manager) is not true
                 && allFree!() && managerState!.GetValue(manager)?.ToString() == "None";
@@ -138,7 +140,7 @@ internal static class SpeedrunToolAutoSave {
     private static RecoveryResult Run(bool loadState, bool preserveMarks, bool deferPreClone = false) {
         if (!Available) return RecoveryResult.Unavailable;
         try {
-            if (!CanUse) return RecoveryResult.Unavailable;
+            if (!CanUse || HasManualState) return RecoveryResult.Unavailable;
             object? manager = managerInstance!.GetValue(null);
             if (manager is null || savedByTas!.GetValue(manager) is true) return RecoveryResult.Unavailable;
             if (!allFree!() || managerState!.GetValue(manager)?.ToString() != "None") return RecoveryResult.Busy;

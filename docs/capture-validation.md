@@ -283,6 +283,26 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   Release 零警告/错误。证据在 `.work/background-recovery-seam/.work/`。
   本轮不修改 native 编码/剪辑路径，硬切与死亡回放快速路径保持原样。仍需重新录制做用户组合下的画面验收。
 
+### 2026-09-10：手动档优先与保存后补步
+
+- 检查用户 `20260910-020830-587` 录像、对应 timeline 和游戏日志：接缝已经标记 seamless，
+  但手动 Default Slot 保存后仍发生内部死亡读档，手动 load 后下一帧还会自动保存，证实是接管冲突，
+  不是简单打开/关闭 crossfade 的问题。原文件未修改。
+- 自动切面保存改在协程完成的同一次引擎更新末尾安排；恢复后的首次绘制前最多放行一个物理步，
+  MotionSmoothing 显示位置固定在当前物理样本，避免保存耗时外推和 catch-up 多步跳跃。
+- Recording **132 assertions**：30 次补步只放行一次、无采集回调时普通绘制解除恢复门、任意用户档优先、
+  连续手动 load 不创建内部档、SRT 自己的死亡 hook/Waiting/协程不被抢占、选中空槽仍尊重其他槽，
+  清全部及最后单独一槽后从当前状态重新保存。既有无标记、统计保留、失败回退等测试继续通过。
+- Recorder **113 checks**：手动 SL 只分段视频，排除等待和失败尝试，有效前缀硬切，
+  录制前的手动 save 不阻塞启动录制，切面晚于 HUD 结束也在同一 tick 安排保存。
+- 实际 MotionSmoothing Cache DLL **26 checks**：故意注入过时镜头显示坐标，冻结后匹配物理位置，
+  实体和速度历史不变；保留恢复首帧初始化和 UpdateAtDraw 暂停验证。
+  Recording.Policy、Capture、真实 Cache SRT interop 回归通过；Release 零 C# 警告/错误。
+- 实际 SDL/FMOD/FFmpeg 双录制集成 **238** 视频 / **441** 音频 callback；保存 gap 硬切复制 **29.3ms**，
+  1.5s 死亡回放快速最终化 **52.1ms**，输出 MP4 完整解码通过。此次不改 native 最终化路径。
+  这些是 160×90 小画面数据，不代表用户分辨率或游戏负载下的耗时。证据在 `.work/manual-sl-priority/.work/`。
+- 自动测试不替代用户模组组合下重新录制的实机验收；手动 SL 不采用内部冻结确认门，不承诺任意 GPU/队列负载下零丢帧。
+
 ## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。

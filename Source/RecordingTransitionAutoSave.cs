@@ -8,11 +8,13 @@ internal static class RecordingTransitionAutoSave {
     private static Session? pendingSession;
     private static string pendingRoom = "";
     private static RecoveryAnchor? anchor;
+    private static bool manualOwned;
 
     internal static bool Enabled => MicroblocksQolUtilsModule.Settings.Enabled
         && MicroblocksQolUtilsModule.Settings.RecordingAutoSaveOnTransition && AutoRecorder.IsRecording;
 
     internal static bool CanRecover(Level level) => Enabled && SpeedrunToolAutoSave.CanUse
+        && !SpeedrunToolAutoSave.HasManualState
         && SpeedrunToolAutoSave.HasState && anchor is { } saved
         && ReferenceEquals(saved.Level, level) && saved.Area == level.Session.Area
         && saved.Room == level.Session.Level && saved.Respawn == level.Session.RespawnPoint
@@ -22,7 +24,8 @@ internal static class RecordingTransitionAutoSave {
         Cancel();
         anchor = null;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        if (!settings.Enabled || !settings.RecordingAutoSaveOnTransition || !AutoRecorder.IsRecording) return;
+        if (!settings.Enabled || !settings.RecordingAutoSaveOnTransition || !AutoRecorder.IsRecording
+            || SpeedrunToolAutoSave.HasManualState) return;
         pendingLevel = level;
         pendingSession = level.Session;
         pendingRoom = room;
@@ -41,14 +44,29 @@ internal static class RecordingTransitionAutoSave {
     }
 
     internal static void AfterEngineUpdate() {
+        if (SpeedrunToolAutoSave.HasManualState) {
+            manualOwned = true;
+            Reset();
+            // Do not block/wait inside SRT's save/load callbacks. Once the user
+            // operation is idle, retire the now-obsolete private snapshot.
+            if (!SpeedrunToolAutoSave.ManualOperationActive) SpeedrunToolRecoverySlot.Release();
+            return;
+        }
         if (RecordingSavePause.Active) {
             RecordingSavePause.Update();
             return;
         }
         if (!Enabled || Engine.Scene is not Level) {
+            manualOwned = false;
             Reset();
             SpeedrunToolRecoverySlot.Release();
             return;
+        }
+        if (manualOwned && Engine.Scene is Level resumed) {
+            manualOwned = false;
+            // All user saves were cleared: take a fresh anchor at CURRENT state,
+            // never revive a private snapshot from before the manual SL branch.
+            Queue(resumed, resumed.Session.Level);
         }
         if (pendingLevel is not { } level) return;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;

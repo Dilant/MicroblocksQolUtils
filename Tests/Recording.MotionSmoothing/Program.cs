@@ -44,6 +44,16 @@ for (int load = 0; load < 3; load++) {
     Check(updated.GetValue(handler) is false, "frozen draw extrapolates from the abandoned attempt's clock");
     Check(camera.Position == new Vector2(410 + load, -95 - load) && actor.Position == new Vector2(450 + load, 30),
         "priming history advanced real camera/entities");
+    // Simulate a stale/extrapolated presentation while the latest physics sample
+    // is already updated. Freezing must not preserve this overshot display pose.
+    smooth.GetSetMethod(true)!.Invoke(cameraState, [new Vector2(900, 900)]);
+    Vector2[] history = (Vector2[])cameraState.GetType().GetProperty("RealPositionHistory")!.GetValue(cameraState)!;
+    Vector2[] before = history.ToArray();
+    updated.SetValue(handler, true);
+    RecordingMotionSmoothing.FreezePresentation();
+    Check((Vector2)smooth.GetValue(cameraState)! == camera.Position && updated.GetValue(handler) is false,
+        "save boundary retained extrapolated display coordinates");
+    Check(history.SequenceEqual(before), "freezing display erased movement history/velocity");
 }
 
 Type drawType = TypeOf("Utilities.UpdateAtDraw");

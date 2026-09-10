@@ -5,6 +5,7 @@ namespace Microsoft.Xna.Framework {
     public struct Vector2 { public static float DistanceSquared(Vector2 a, Vector2 b) => 0; }
 }
 namespace Monocle {
+    public static class Engine { public static Scene? Scene; }
     public class Scene { }
     public class Entity { public Scene? Scene { get; set; } }
     public class Tracker { public Celeste.Player? Player; public T? GetEntity<T>() where T:class => Player as T; }
@@ -85,6 +86,7 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public static class RecordingDeathAudio { public static void Load(){} public static void Unload(){} public static void StopRemainder(){} }
     public static class RecordingTransitionAutoSave { public static void Queue(Level l,string room){} public static void Cancel(){} public static void Reset(){} public static void AfterEngineUpdate(){} }
     public static class SpeedrunToolBridge { public static void Load(){} public static void Unload(){} }
+    public static class SpeedrunToolAutoSave { public static bool ManualOperationActive; }
     public static class RhythmMapDetector { public static bool IsRhythmSensitive(object map, string room) => false; }
     public class MaterialModOptions { }
     public static class QolSettingsOverlay { public static object? ActivePage => null; }

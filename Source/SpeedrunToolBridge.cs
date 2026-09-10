@@ -33,8 +33,8 @@ public static class SpeedrunToolBridge {
             Save,
             Load,
             null,
-            null,
-            null,
+            level => BeforeManualOperation(level, loading: false),
+            level => BeforeManualOperation(level, loading: true),
             null
         );
         SpeedrunToolImports.IgnoreSaveState?.Invoke(typeof(QolHud), false);
@@ -57,6 +57,13 @@ public static class SpeedrunToolBridge {
             values[typeof(AutoRecorder)] = own;
         }
         own[TimelineKey] = snapshot;
+        if (!SpeedrunToolAutoSave.SavingSilently) RecordingTransitionAutoSave.Reset();
+    }
+
+    private static void BeforeManualOperation(Level level, bool loading) {
+        if (SpeedrunToolAutoSave.SavingSilently || SpeedrunToolAutoSave.LoadingSilently) return;
+        RecordingTransitionAutoSave.Reset();
+        AutoRecorder.SuspendForManualSl(loading);
     }
 
     private static void Load(Dictionary<Type, Dictionary<string, object>> values, Level level) {
@@ -66,9 +73,7 @@ public static class SpeedrunToolBridge {
             && value is RecordingTimelineSnapshot snapshot) {
             AutoRecorder.RestoreTimeline(level, snapshot);
         }
-        // Rebase recovery on the loaded branch/room, not on a later room from the
-        // abandoned timeline. Clearing the user's slot afterwards is then harmless.
-        if (!SpeedrunToolAutoSave.LoadingSilently)
-            RecordingTransitionAutoSave.Queue(level, level.Session.Level);
+        // Manual SL owns gameplay, freezing, wipes and death recovery. Only the
+        // video prefix is restored here; do not queue an automatic save/load.
     }
 }

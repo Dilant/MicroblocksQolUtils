@@ -12,7 +12,8 @@ Directory.CreateDirectory(root);
     NativeRoomRecording.Started.Clear(); NativeRecordingFinalizer.Jobs.Clear();
     MicroblocksQolUtilsModule.Settings=new(){AutomaticRecording=mode,GoldenRecordingDeath=death,GoldenRecordingEnd=end,DeathReplayEnabled=replay,RecordingDirectory=root};
     AutoRecorder.Load("");
-    var level=new Level(); var player=new Player{Scene=level}; level.Tracker.Player=player;
+    var level=new Level(); Engine.Scene=level; SpeedrunToolAutoSave.ManualOperationActive=false;
+    var player=new Player{Scene=level}; level.Tracker.Player=player;
     var berry=new Strawberry{Golden=true,Scene=level}; berry.Follower.Entity=berry;
     return(level,player,berry);
 }
@@ -83,6 +84,47 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
         var nextBerry=new Strawberry{Golden=true,Scene=resumed};nextBerry.Follower.Entity=nextBerry;Pickup(respawned,nextBerry);Tick(resumed);
         Check(AutoRecorder.IsRecording,"next golden challenge starts after failure");
     }
+}
+
+// Manual SL only edits video: respect all of SRT's Waiting/wipe time, and open
+// on its first presented playable frame without our game-freeze/auto-save gate.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(3);
+    AutoRecorder.SuspendForManualSl();
+    var saved=AutoRecorder.CaptureTimeline(l)!;
+    Check(saved.Clips.Sum(c=>c.DurationSeconds)==3,"manual save snapshot did not retain the exact prefix");
+    SpeedrunToolAutoSave.ManualOperationActive=true;
+    Advance(10); Tick(l); AutoRecorder.ManualSlPresented(100);
+    Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"SRT save wait leaked into video");
+    SpeedrunToolAutoSave.ManualOperationActive=false;
+    AutoRecorder.ManualSlPresented(101); Advance(2); Tick(l);
+    var full=NativeRoomRecording.Started.First();
+    Check(full.RequestedFrame==101,"manual save resume did not request a boundary keyframe");
+    AutoRecorder.SuspendForManualSl(loading:true);
+    AutoRecorder.RestoreTimeline(l,saved);
+    SpeedrunToolAutoSave.ManualOperationActive=true; Advance(20); Tick(l); AutoRecorder.ManualSlPresented(200);
+    Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"manual load wait reopened the abandoned branch");
+    SpeedrunToolAutoSave.ManualOperationActive=false;
+    AutoRecorder.ManualSlPresented(201); Advance(2); AutoRecorder.StopManual(l,true); Tick(l);
+    var clips=NativeRecordingFinalizer.Jobs.Last().Clips;
+    Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==35
+        && clips[1].DurationSeconds==2 && clips[1].SeamlessFromPrevious,"manual SL retained waits, failed gameplay or crossfade");
+}
+
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Off); Tick(l);
+    AutoRecorder.SuspendForManualSl(); // A manual save made before recording.
+    AutoRecorder.StartManual(); Tick(l);
+    Check(AutoRecorder.IsRecording,"pre-existing manual SL blocked starting a recording with no capture callbacks");
+}
+
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(1);
+    l.Transitioning=true; On.Celeste.Level.Transition(l); AutoRecorder.Update(l);
+    Check(!AutoRecorder.CanSaveTransitionTimeline,"save armed before transition coroutine finished");
+    l.Transitioning=false; // Finishes AFTER the QolHud update in the same tick.
+    AutoRecorder.AfterEngineUpdate();
+    Check(AutoRecorder.CanSaveTransitionTimeline,"transition save waited for an unnecessary next physics update");
 }
 
 // Default manual/chapter editing still removes failed branches.

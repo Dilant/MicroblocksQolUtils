@@ -26,6 +26,15 @@ internal static class SpeedrunToolRecoverySlot {
     internal static bool HasState => ownedSlot is not null && ReferenceEquals(Slots[Name], ownedSlot)
         && isSaved!.GetValue(slotManager!.GetValue(ownedSlot)) is true;
 
+    // Any user slot takes precedence, even if an empty slot is currently selected.
+    // Never switch slots to inspect them, and never count our leased slot as manual.
+    internal static bool HasUserState => dictionary is not null && Slots.Values.Cast<object>()
+        .Any(slot => !ReferenceEquals(slot, ownedSlot) && isSaved!.GetValue(slotManager!.GetValue(slot)) is true);
+
+    internal static bool UserOperationActive => currentSlot?.GetValue(null) is { } slot
+        && !ReferenceEquals(slot, ownedSlot)
+        && state!.GetValue(slotManager!.GetValue(slot))?.ToString() is "Saving" or "Loading" or "Waiting";
+
     internal static void Initialize(Assembly assembly) {
         Type slots = assembly.GetType("Celeste.Mod.SpeedrunTool.SaveLoad.SaveSlotsManager", true)!;
         Type slot = assembly.GetType("Celeste.Mod.SpeedrunTool.SaveLoad.SaveSlot", true)

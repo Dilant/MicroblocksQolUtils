@@ -100,6 +100,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         try {
             orig(self, gameTime);
         } finally {
+            RecordingSavePause.Drawn();
             FrameProfiler.EndRender();
             FrameRateCounter.TickRender();
         }

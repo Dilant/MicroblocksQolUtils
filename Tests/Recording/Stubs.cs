@@ -98,6 +98,7 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public static class RecordingMotionSmoothing {
         public static void Prepare() { }
         public static void PrimeRestoredState() { }
+        public static void FreezePresentation() { }
     }
     public static class RecordingPauseAudio {
         public static bool Paused;
@@ -105,6 +106,8 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static void Resume() => Paused = false;
     }
     public static class AutoRecorder {
+        public static int ManualSuspends;
+        public static void SuspendForManualSl(bool loading = false) => ManualSuspends++;
         public static int Suspends, Resumes;
         public static void SuspendForInternalSave(ulong time) => Suspends++;
         public static void ResumeAfterInternalSave(ulong time) => Resumes++;
@@ -132,7 +135,10 @@ namespace Celeste.Mod.SpeedrunTool {
 namespace Celeste.Mod.SpeedrunTool.ModInterop { public static class TasUtils { public static bool Running { get; set; } } }
 namespace Celeste.Mod.SpeedrunTool.SaveLoad {
     public enum State { None, Saving, Loading, Waiting }
-    public class SaveLoadAction { public static Action<Dictionary<Type, Dictionary<string, object>>, Level>? Save, Load; }
+    public class SaveLoadAction {
+        public static Action<Dictionary<Type, Dictionary<string, object>>, Level>? Save, Load;
+        public static Action<Level>? BeforeSave, BeforeLoad;
+    }
     public class SaveSlot(string name) { public StateManager StateManager = new(); public string Name = name; }
     public static class SaveSlotsManager {
         public static bool Free = true;
@@ -174,6 +180,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             if (Throw) throw new InvalidOperationException("expected failure");
             Values.Clear();
             Level level = (Level)Monocle.Engine.Scene!;
+            SaveLoadAction.BeforeSave?.Invoke(level);
             savedSession = level.Session.Copy(); savedPosition = level.Position; savedGolden = level.GoldenMarked;
             savedCamera = level.CameraPosition; savedFrame = level.SceneFrame;
             IsSaved = true;
@@ -191,6 +198,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             State = State.Loading;
             if (Throw) throw new InvalidOperationException("expected failure");
             Level level = (Level)Monocle.Engine.Scene!;
+            SaveLoadAction.BeforeLoad?.Invoke(level);
             level.Session = savedSession!.Copy(); level.Position = savedPosition; level.GoldenMarked = savedGolden;
             level.CameraPosition = savedCamera; level.SceneFrame = savedFrame;
             level.Tracker.Player = new();

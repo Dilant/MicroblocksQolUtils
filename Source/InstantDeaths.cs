@@ -23,7 +23,7 @@ public static class InstantDeaths {
     }
 
     public static void AfterEngineUpdate() {
-        if (!MicroblocksQolUtilsModule.Settings.RemoveDeathAnimation
+        if (!MicroblocksQolUtilsModule.Settings.RemoveDeathAnimation || SpeedrunToolAutoSave.HasManualState
             || Engine.Scene is not Level level) {
             reloadedBody = null;
             return;

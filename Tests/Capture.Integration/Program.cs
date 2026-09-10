@@ -216,7 +216,7 @@ internal static class Sdl {
 }
 namespace Celeste.Mod.MicroblocksQolUtils {
     internal static class RecordingSavePause { internal static void Presented(ulong time) { } }
-    internal static class AutoRecorder { internal static bool IsRecording => true; }
+    internal static class AutoRecorder { internal static bool IsRecording => true; internal static void ManualSlPresented(ulong time) { } }
     internal enum LogLevel {Info,Warn,Error}
     internal static class Logger {
         internal static void Log(LogLevel level,string tag,string text)=>Console.WriteLine($"{level} {tag}: {text}");
