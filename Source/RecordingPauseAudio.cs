@@ -16,6 +16,7 @@ internal static class RecordingPauseAudio {
         Audio.BusPaused("bus:/music/stings", true);
         PauseMusic(Audio.CurrentMusicEventInstance);
         PauseMusic(Alt?.GetValue(null) as FMOD.Studio.EventInstance);
+        Audio.System?.flushCommands();
     }
 
     private static void PauseMusic(FMOD.Studio.EventInstance? instance) {
@@ -35,5 +36,6 @@ internal static class RecordingPauseAudio {
         foreach (var (instance, paused) in Music)
             if (instance.isValid()) instance.setPaused(paused);
         Music.Clear();
+        Audio.System?.flushCommands();
     }
 }

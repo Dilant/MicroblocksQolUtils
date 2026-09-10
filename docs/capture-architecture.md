@@ -1,4 +1,4 @@
-# 共享采集架构（native ABI 9）
+# 共享采集架构（native ABI 10）
 
 ## 数据路径
 
@@ -6,7 +6,8 @@
 SDL/FNA 呈现：按真实后端路由，不更改游戏 renderer
   OpenGL: SDL_GL_SwapWindow native hook → 3 个 PBO + GLsync
   Windows D3D11: DXGI Present vtable shim → 3 个 staging texture + event query
-        ↓ 后续帧非阻塞检查 GPU 完成；保持原始提交时间戳
+        ↓ 采集层按每种请求 FPS 选一次，记录接收者位图及配置版本
+        ↓ 后续帧非阻塞检查 GPU 完成；保持原始提交时间戳与接收者信息
         ↓ 有界 CPU 队列（3 帧）；worker 转为 top-down BGRA8
 
 FMOD: gameplay_sfx / ui_sfx / music 各一个 pass-through DSP
@@ -119,13 +120,16 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 需要保留游戏实际动态音乐时使用采集到的 BGM，不配置静态替换映射。
 剪辑不能凭空生成未采到的音乐，PCM 丢块仍按时间戳表现为缺口。
 
-## 录制启动、帧率与过载（ABI 8）
+## 录制启动、帧率与过载（ABI 10）
 
-- 内置录制通过 `SubscribeRecording(fps, ...)` 使用 borrowed 像素，并在订阅队列**之前**筛选目标 FPS。
-  普通 `Subscribe` / `SubscribeBorrowed` 不限帧率；不会为了录制把第三方 callback 一起限到 60。
-- 若所有像素消费者都是有限 FPS 录制器，GPU 只按最大请求 FPS 提交新的读回。
-  仍在每次 Present/Swap 轮询之前的 GPU 任务；120/144-Hz 游戏录 60 FPS 不再先取回所有冗余帧。
-  只要有一个不限速像素消费者，就恢复每次呈现提交。游戏 renderer、渲染帧率不被修改。
+- **只有采集层筛选帧**：`SubscribeRecording(fps, ...)` 注册目标速率，GL/D3D11 source 在 GPU 提交前，
+  每种速率只做一次选择，同速率消费者共享同一张图像。只有任一接收者需要画面才提交读回；
+  不同速率按各自所需呈现的并集采集。普通 `Subscribe` / `SubscribeBorrowed` 仍每次呈现接收。
+- 选定的接收者位图随 PBO/staging、native CPU 帧传到 source worker；worker 按位图分发，
+  `CaptureSubscription` 只负责有界队列与背压，`NativeCaptureSession` 不再按 FPS 二次筛帧。
+  录制器只拒绝重复/倒序递送，编码器发现违反递增 PTS 契约时明确报错，不静默吞帧。
+- 每帧也携带路由配置版本，复用订阅槽不能接收到旧接收者的在途 GPU 帧；其他槽变动不丢弃已有消费者的帧。
+  每次 Present/Swap 仍轮询未完成 GPU 任务；游戏 renderer、渲染帧率不被修改。
 - 每个 sink 的硬件编码器仍在首帧确定分辨率后独立创建，选择/初始化耗时写日志。
   QSV 的 `async_depth` 从 1 改为 4；录制及导出重用 AVFrame 前均 make-writable，不能覆盖编码器/交叉淡化仍持有的像素。
 - 移除旧的 BGRA 空间差分 + Zstd 启动缓存。高 DPI 下压缩本身超过一帧预算，会让短暂启动积压变成持续丢帧；
@@ -144,7 +148,8 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
   临时 IO 不在 render/FMOD 线程；这不是保证任何磁盘/任意分辨率都能满帧。
 - 音频 sink writer、各 bus 的预分配 ring、SFX/BGM/音乐事件分离、房间级 BGM 策略保持不变。
   native 及订阅各容纳 256 PCM 块，native PCM 每 sink 最多 16 MiB；仍不阻塞 mixer。
-- FPS 使用最近 tick 量化；原始 GPU 提交时间、首帧音频原点、PCM 时钟不改写。
+- 编码 PTS/剪辑边界使用与采集匹配的 tick 映射，这是时间换算，不是额外筛选。
+  原始 GPU 提交时间、首帧音频原点不改写。
   `NativeCaptureSession.DeliveryStatistics` 报告订阅损失，`Statistics` 报告 native 损失；排空后写 capture report。
   `EncoderInputFps` 是送入编码器的帧率，不是声称最终 MP4 的独立画面帧率；后者必须实际解码核对。
 - 当前仍是单一采集、多 sink 独立编码，不声称已共享两条压缩码流。
@@ -180,6 +185,17 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 - SRT 操作结束且玩家可录制后的第一次 source presentation 请求关键帧并重新打开录像分支，
   排除 SL 等待期间的片段，停止死亡音效尾音；有效存档恢复优先硬切，无有效录像前缀的 load 不冒充无缝恢复。
   此手动路径不等待 GPU/sink 接收确认，不为录像干预 SRT 游戏时序；与内部存读档的冻结确认门不同。
+
+### SFX 暂停、叠加与剪辑边界
+
+- FMOD 时间戳使用持续运行的 master mixer DSP clock，而不是随 gameplay bus 暂停的局部时钟。
+  后者会让恢复后的 SFX 时间戳提前，形成百毫秒级错位；不能靠 native 连续 PCM 计数补偿掉这个误差。
+- 内部保存到达视频 Boundary 时才暂停音效；保存/读档后的 Clean 等待不提前恢复音效，
+  请求第一张保留画面时才恢复。Studio pause/resume 命令会 flush，取消和失败路径仍解除暂停。
+- SFX/UI/BGM 叠加使用浮点余量，所有贡献相加后在送入 AAC 时限幅，避免逐次限幅破坏叠加/相消。
+  有效硬切处若存在异常波形阶跃，仅在两侧各最多 1ms 做 SFX 去爆音；不借用被删死亡区间的样本，
+  不改视频时长或加入画面 crossfade。正常连续波形、纯 metadata 分段不动，独立 BGM 在此步骤后混入。
+  旧的混合 BGM sidecar 无法分离时不做这项 SFX 去爆音，避免误伤音乐。
 
 ### 死亡回放快速最终化
 

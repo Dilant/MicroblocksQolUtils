@@ -239,7 +239,9 @@ fn render_mix(
         exclude_captured_bgm,
         sidecar,
     )?;
+    let mut contains_bgm = first.bus_id == 3;
     while let Some(chunk) = read_chunk(&mut reader, sidecar)? {
+        contains_bgm |= chunk.bus_id == 3;
         if chunk.sample_rate != first.sample_rate || chunk.channels != first.channels {
             return Err(invalid(
                 sidecar,
@@ -258,6 +260,17 @@ fn render_mix(
             first.channels,
             exclude_captured_bgm,
             sidecar,
+        )?;
+    }
+    // SFX-only de-click before adding the separate continuous music track.
+    // Never borrow samples from the excluded attempt/death range.
+    if exclude_captured_bgm || !contains_bgm {
+        smooth_sfx_seams(
+            &mut mixed,
+            clips,
+            &clip_layout,
+            first.sample_rate,
+            first.channels,
         )?;
     }
     mixed
@@ -920,8 +933,9 @@ fn add_samples(
         let existing = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         let local_frame = clip_local_start_frame + index as u64 / u64::from(channels);
         let gain = clip_layout.gain_at(local_frame);
-        bytes[offset..offset + 4]
-            .copy_from_slice(&(existing + sample * gain).clamp(-1.0, 1.0).to_le_bytes());
+        // Float headroom until ALL buses are mixed. Clamping per contribution
+        // makes overlap order-dependent (0.8 + 0.8 - 0.8 must still be 0.8).
+        bytes[offset..offset + 4].copy_from_slice(&(existing + sample * gain).to_le_bytes());
     }
     mixed
         .seek(SeekFrom::Start(byte_offset))
@@ -930,6 +944,78 @@ fn add_samples(
             path: PathBuf::from("mixed PCM workspace"),
             source,
         })
+}
+
+fn smooth_sfx_seams(
+    mixed: &mut File,
+    clips: &[FinalizeClip],
+    layout: &[AudioClipLayout],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(), AudioFinalizeError> {
+    let path = Path::new("mixed PCM workspace");
+    let channel_count = usize::from(channels);
+    for index in 1..clips.len() {
+        let previous = &clips[index - 1];
+        let next = &clips[index];
+        if !next.seamless_from_previous
+            || (next.source == previous.source
+                && (next.start_seconds - previous.start_seconds - previous.duration_seconds).abs()
+                    <= CUT_GAP_SECONDS)
+        {
+            continue; // Already faded or just a metadata split, not an audio cut.
+        }
+        let frames = (u64::from(sample_rate) / 1_000)
+            .min(layout[index - 1].clip_frames / 2)
+            .min(layout[index].clip_frames / 2) as usize;
+        if frames < 2 {
+            continue;
+        }
+        let boundary = layout[index].output_start_frames;
+        if boundary < frames as u64 {
+            continue;
+        }
+        let offset = (boundary - frames as u64) * u64::from(channels) * 4;
+        let mut bytes = vec![0; frames * 2 * channel_count * 4];
+        mixed
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| mixed.read_exact(&mut bytes))
+            .map_err(|e| io_error(path, e))?;
+        let sample = |frame: usize, channel: usize| {
+            let at = (frame * channel_count + channel) * 4;
+            f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        };
+        // Leave naturally continuous waveforms untouched. Only remove an edit's
+        // amplitude step, with at most 1 ms on either side (not a 160 ms fade).
+        let discontinuous = (0..channel_count).any(|channel| {
+            let left = sample(frames - 1, channel);
+            let right = sample(frames, channel);
+            let slope = (left - sample(frames - 2, channel))
+                .abs()
+                .max((sample(frames + 1, channel) - right).abs());
+            (right - left).abs() > slope * 4.0 + 0.01
+        });
+        if !discontinuous {
+            continue;
+        }
+        for frame in 0..frames * 2 {
+            let gain = if frame < frames {
+                (frames - 1 - frame) as f32
+            } else {
+                (frame - frames) as f32
+            } / (frames - 1) as f32;
+            for channel in 0..channel_count {
+                let at = (frame * channel_count + channel) * 4;
+                let value = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+                bytes[at..at + 4].copy_from_slice(&(value * gain).to_le_bytes());
+            }
+        }
+        mixed
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| mixed.write_all(&bytes))
+            .map_err(|e| io_error(path, e))?;
+    }
+    Ok(())
 }
 
 fn read_chunk(
@@ -1098,7 +1184,8 @@ fn encode_aac(
             for sample_index in 0..wanted_frames {
                 let offset = (sample_index * usize::from(spec.channels) + channel) * 4;
                 plane[sample_index] =
-                    f32::from_le_bytes(interleaved[offset..offset + 4].try_into().unwrap());
+                    f32::from_le_bytes(interleaved[offset..offset + 4].try_into().unwrap())
+                        .clamp(-1.0, 1.0);
             }
         }
         opened
@@ -1370,6 +1457,95 @@ mod tests {
             seamless_from_previous: true,
             bgm_follows_video: false,
         }
+    }
+
+    #[test]
+    fn overlapping_buses_keep_float_headroom_until_the_complete_mix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.f32");
+        let layout = AudioClipLayout {
+            output_start_frames: 0,
+            clip_frames: 64,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+        };
+        for values in [[0.8, 0.8, -0.8], [-0.8, 0.8, 0.8], [0.8, -0.8, 0.8]] {
+            fs::write(&path, vec![0; 64 * 2 * 4]).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            for value in values {
+                add_samples(&mut file, 0, &[value; 128], 2, layout, 0).unwrap();
+            }
+            drop(file);
+            for bytes in fs::read(&path).unwrap().chunks_exact(4) {
+                assert!((f32::from_le_bytes(bytes.try_into().unwrap()) - 0.8).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn sfx_declick_only_touches_one_ms_either_side_of_a_discontinuous_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.f32");
+        for continuous in [false, true] {
+            let clips = [
+                clip(0.0, 1.0),
+                clip(if continuous { 1.0 } else { 2.0 }, 1.0),
+            ];
+            let layout = audio_timeline_layout(&clips, 48000).unwrap();
+            let samples: Vec<f32> = (0..96000)
+                .map(|i| if i < 48000 { 0.8 } else { -0.8 })
+                .collect();
+            let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+            fs::write(&path, &bytes).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            smooth_sfx_seams(&mut file, &clips, &layout, 48000, 1).unwrap();
+            drop(file);
+            let edited: Vec<f32> = fs::read(&path)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            if continuous {
+                assert_eq!(edited, samples);
+            } else {
+                assert_eq!(edited.len(), 96000);
+                assert_eq!(&edited[..47952], &samples[..47952]);
+                assert_eq!(&edited[48048..], &samples[48048..]);
+                assert_eq!(edited[47999], 0.0);
+                assert_eq!(edited[48000], 0.0);
+                assert!(edited.windows(2).all(|p| (p[1] - p[0]).abs() < 0.02));
+            }
+        }
+        // A seamless waveform at a real cut must not get an unnecessary dip.
+        let clips = [clip(0.0, 1.0), clip(2.0, 1.0)];
+        let samples: Vec<f32> = (0..96000)
+            .map(|i| ((i as f32) * 0.02).sin() * 0.2)
+            .collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fs::write(&path, &bytes).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        smooth_sfx_seams(
+            &mut file,
+            &clips,
+            &audio_timeline_layout(&clips, 48000).unwrap(),
+            48000,
+            1,
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

@@ -72,6 +72,8 @@ Windows 下，关注的玩家换房间且 Celeste 不在前台时，会发送系
 在 `SDL_GL_SwapWindow` **之前**提交每帧 PBO 异步读回；后续帧零等待检查 GPU fence，
 后台线程转成 BGRA 并分发，不在游戏线程编码或调用消费者。尺寸变化会重建 PBO；
 没有订阅时停止读回。D3D11 对应 native DXGI Present shim、staging texture 与非阻塞 query/map。
+帧率筛选只在采集层执行，同帧率录像共享选定画面；后续队列、录制与编码不重复按 FPS 丢帧。
+音效使用持续运行的主混音时钟；内部存档的声音暂停/恢复与保留画面边界对齐。
 读回与编码解耦，消费者可以分别注册像素、FMOD PCM、音乐事件 callback。
 内置录制器使用借用式像素池，避免逐帧大数组分配；`Subscribe` 保持 owned 语义，
 低分配 `SubscribeBorrowed` 需要在回调内消费或调用 `Snapshot()` 保留像素。

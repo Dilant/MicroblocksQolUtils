@@ -30,7 +30,7 @@ mod finalizer_audio;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_copy;
 
-const ABI_VERSION: u32 = 9;
+const ABI_VERSION: u32 = 10;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
@@ -213,10 +213,11 @@ struct FramePreparation {
 mod frame_cadence;
 
 pub(crate) fn video_tick(timestamp: u64, origin: u64, fps: u32) -> u128 {
-    // Nearest tick, not floor: render timestamps jitter around nominal 60 Hz.
-    // Flooring can turn that jitter into duplicate buckets and discard ~1/4
-    // of a perfectly adequate 60-Hz source when the target is also 60 fps.
-    (u128::from(timestamp.saturating_sub(origin)) * u128::from(fps) + 500_000_000) / 1_000_000_000
+    // Acquisition selects frames. The encoder/editor use the same tick mapping
+    // only to assign PTS, NOT to select frames a second time. Subtract AFTER
+    // quantization; raw source timestamps/audio origins remain unchanged.
+    let tick = |time| (u128::from(time) * u128::from(fps) + 500_000_000) / 1_000_000_000;
+    tick(timestamp).saturating_sub(tick(origin))
 }
 
 #[derive(Debug)]
@@ -709,12 +710,10 @@ impl CaptureSession {
     }
 
     fn accepts_timestamp(&self, timestamp: u64) -> bool {
-        let origin = self.origin_nanos.load(Ordering::Acquire);
-        if origin == u64::MAX {
-            return true;
-        }
-        let bucket = |time: u64| video_tick(time, origin, self.config.fps);
-        bucket(timestamp) > bucket(self.last_video_nanos.load(Ordering::Acquire))
+        // Source already selected this frame for this sink. Only reject stale
+        // or duplicate delivery, never perform another frame-rate selection.
+        self.origin_nanos.load(Ordering::Acquire) == u64::MAX
+            || timestamp > self.last_video_nanos.load(Ordering::Acquire)
     }
 
     fn push_frame(&self, frame: CapturedFrame) {
@@ -1620,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_fps_buckets_do_not_accumulate_capture_jitter() {
+    fn recording_sink_never_resamples_source_selected_frames() {
         for fps in [30, 60, 120] {
             let session = CaptureSession::new(CaptureConfig {
                 fps,
@@ -1632,10 +1631,10 @@ mod tests {
                 input.captured_at_unix_nanos = 1_000_000_000 + n * 1_000_000_000 / 144;
                 session.push_frame(input);
             }
-            // Nearest-tick quantization may admit the next boundary up to half
-            // a target frame early; it must not accumulate clock error.
-            assert!(
-                (u64::from(fps)..=u64::from(fps) + 1).contains(&session.stats().frames_captured)
+            assert_eq!(
+                session.stats().frames_captured,
+                144,
+                "the recording sink must not select frames based on fps={fps}"
             );
         }
     }

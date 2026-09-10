@@ -10,7 +10,8 @@ internal static class SdlFrameSource {
     private static bool dxgiHooked;
     private static bool dxgiPending;
     private static int tracePresents;
-    private static uint appliedFrameRate = uint.MaxValue;
+    private static CaptureSubscription[]? appliedRoutes;
+    private static ulong routeVersion;
     private static nint window;
     private static nint library;
     private static bool wasCapturing;
@@ -45,7 +46,7 @@ internal static class SdlFrameSource {
 
     internal static void Load() {
         tracePresents = 0;
-        appliedFrameRate = uint.MaxValue;
+        appliedRoutes = null;
         try {
             // Stock Everest loads mods after SDL window creation. Changing an environment
             // variable here is too late to change the selected FNA3D driver/window flags.
@@ -84,11 +85,7 @@ internal static class SdlFrameSource {
 
     internal static void Update() {
         if (!CaptureSource.WantsPixels) { awaitingSince = 0; return; }
-        uint requestedRate = CaptureSource.RequestedFrameRate;
-        if (requestedRate != appliedFrameRate) {
-            if (SetFrameRate(requestedRate) != 0) failure = NativeCaptureBridge.LastError();
-            else appliedFrameRate = requestedRate;
-        }
+        ConfigureRoutes();
         if (dxgiPending) {
             dxgiPending = false;
             try {
@@ -117,6 +114,7 @@ internal static class SdlFrameSource {
                 if (!enabled && wasCapturing) _ = Release(SDL_GL_GetCurrentContext());
                 wasCapturing = enabled;
                 if (enabled) {
+                    ConfigureRoutes();
                     SDL_GL_GetDrawableSize(value, out int width, out int height);
                     if (width > 0 && height > 0) {
                         ulong timestamp = ClockNanos();
@@ -148,6 +146,7 @@ internal static class SdlFrameSource {
                 }
                 WmInfo info = new() { Major = 2, Minor = 0, Patch = 0 };
                 if (window != 0 && SDL_GetWindowWMInfo(window, ref info) != 0 && info.Subsystem == 1) {
+                    ConfigureRoutes();
                     if (trace) Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Capture", $"DXGI HWND={info.Handle:X}");
                     ulong timestamp = ClockNanos();
                     AutoRecorder.ManualSlPresented(timestamp);
@@ -179,7 +178,24 @@ internal static class SdlFrameSource {
         dxgiPending = false;
     }
     [DllImport(Library, EntryPoint = "mqol_source_clock_nanos", CallingConvention = CallingConvention.Cdecl)] internal static extern ulong ClockNanos();
-    [DllImport(Library, EntryPoint = "mqol_source_set_frame_rate", CallingConvention = CallingConvention.Cdecl)] private static extern int SetFrameRate(uint fps);
+    private static unsafe void ConfigureRoutes() {
+        var routes = CaptureSource.FrameRoutes;
+        if (ReferenceEquals(routes, appliedRoutes)) return;
+        uint* rates = stackalloc uint[16];
+        for (int i=0; i<16; i++) rates[i] = uint.MaxValue;
+        foreach (var route in routes) {
+            if (!route.WantsPixels) continue;
+            int index = System.Numerics.BitOperations.TrailingZeroCount(route.SourceMask);
+            rates[index] = route.MaxFrameRate;
+        }
+        ulong version = ++routeVersion;
+        if (SetFrameRoutes(rates, 16, version) != 0) failure = NativeCaptureBridge.LastError();
+        else {
+            foreach (var route in routes) route.ActivateSourceRoute(version);
+            appliedRoutes = routes;
+        }
+    }
+    [DllImport(Library, EntryPoint = "mqol_source_set_frame_routes", CallingConvention = CallingConvention.Cdecl)] private static extern unsafe int SetFrameRoutes(uint* rates, nuint count, ulong version);
     [DllImport(Library, EntryPoint = "mqol_source_gl_frame", CallingConvention = CallingConvention.Cdecl)] private static extern int Frame(Resolve resolve, nint context, uint width, uint height, ulong timestamp, ulong sequence);
     [DllImport(Library, EntryPoint = "mqol_source_gl_release", CallingConvention = CallingConvention.Cdecl)] private static extern int Release(nint context);
     [DllImport(Library, EntryPoint = "mqol_source_dxgi_install", CallingConvention = CallingConvention.Cdecl)] private static extern int InstallDxgi(PresentCallback callback);
@@ -190,5 +206,7 @@ internal static class SdlFrameSource {
     [DllImport(Library, EntryPoint = "mqol_source_frame_free", CallingConvention = CallingConvention.Cdecl)] internal static extern void Free(nint pixels, nuint length);
     [StructLayout(LayoutKind.Sequential)] internal struct NativeFrame {
         public nint Pixels; public nuint Length; public uint Width, Height; public ulong Timestamp, Sequence;
+        public uint RouteMask;
+        public ulong RouteVersion;
     }
 }

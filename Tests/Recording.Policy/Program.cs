@@ -114,6 +114,14 @@ var frameTime = full.GetType().GetMethod("FrameTimeAt", BindingFlags.Instance | 
 Check((double)frameTime.Invoke(full, [0UL, false])! == 12d
     && Math.Abs((double)frameTime.Invoke(full, [0UL, true])! - (12d + 1d / 60)) < 1e-9,
     "encoder PTS rounding can leak an indicator frame into a retained clip");
+SetField(clockCapture, "origin", 1_009_000_000UL);
+SetField(full, "capture", clockCapture);
+Check((double)frameTime.Invoke(full, [13_020_000_000UL, false])! == 12d
+    && Math.Abs((double)frameTime.Invoke(full, [13_020_000_000UL, true])! - (12d+1d/60)) < 1e-9,
+    "late source origin moved edit boundaries off the encoder PTS grid");
+var encodedTime = full.GetType().GetMethod("EncodedFrameTimeAt", BindingFlags.Instance | BindingFlags.NonPublic)!;
+Check((double)encodedTime.Invoke(full, [13_020_000_000UL])! == 12d,
+    "saved resume frame did not use its actual encoder PTS");
 SetState("current", null); SetState("deathReplayCurrent", null);
 Call("ResetTimelineState");
 

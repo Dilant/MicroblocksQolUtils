@@ -312,6 +312,24 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   清全部/最后单槽后连续更新均不补存，正常保存前死亡不被内部档接管，下一次切面或复活点变化仍可保存并正确恢复。
   保存暂停、手动 SL 优先和死亡回放实现未改动。证据在 `.work/manual-sl-clear-rules/.work/`。
 
+### 2026-09-10：采集层唯一筛帧与 SFX 连续性（ABI 10）
+
+- 用户 `20260910-124535-631` 成片约 127.1s/5163 帧，实际约 40.6 FPS；capture report 输入约 40.1 FPS，
+  托管/native 队列计数没有丢帧。画面中的游戏物理/渲染计数也存在低于 60 的情况，不承诺录制能补出未渲染的画面。
+- 初步回归复现重复网格筛选：120Hz 输入已选出 358 帧，晚启动录制器误筛成 239 帧。
+  最终方案按用户要求不是让各层继续重复筛选，而是**只有采集层按速率选择**，携带 recipient mask/version 一路分发。
+  队列不筛选、native 录制器不按 FPS 丢帧；PTS 映射仅用于编码和剪辑定位。
+- 真实 SDL/FFmpeg 小画面同时跑 30/60fps、中途增加 60fps 录制并移除不限帧消费者：
+  源选择/递送/编码计数分别一致为 116、231、228；FFprobe 视频包数逐一相等，完整解码通过。
+  native 路由覆盖 90/120/144/165/180/240Hz、同速率共享、增删/改速率；托管覆盖槽复用不能接收旧 GPU 帧。
+- 真实 FMOD 连续音调与三种总线暂停：旧局部时钟额外偏差约 154.2ms，主 mixer 时钟约 4.8ms。
+  内部保存的音效恢复移到首张保留画面的请求边界，Clean 等待期间不消耗音效尾部。
+  混音回归验证叠加/相消与输入顺序无关，去爆音仅最多改变硬切两侧各 1ms，连续波形和 metadata 分段不变。
+- Rust **56 passed / 2 ignored**（本次启用真实 FFmpeg/D3D11）；Recording **138 assertions**、Recorder **113 checks**、
+  Capture 回归通过。实际 SDL/FMOD 双录制 **238** 视频 / **455** 音频 callback，保存 gap 硬切复制约 **45.4ms**，
+  1.5s 死亡回放约 **45.2ms**。均为小尺寸测试，不是用户 2560×1506 或全部模组组合下的性能保证。
+  证据在 `.work/sfx-seams-cadence/.work/`；原用户视频未修改，仍需重新录制验收声音和手感。
+
 ## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。

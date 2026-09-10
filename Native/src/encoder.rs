@@ -50,6 +50,10 @@ pub enum EncoderError {
     Convert(ffmpeg::Error),
     #[error("video encoder rejected a frame: {0}")]
     SendFrame(ffmpeg::Error),
+    #[error(
+        "source supplied non-increasing video PTS {next} after {previous}; frames must be selected at acquisition"
+    )]
+    SourceTimestamp { previous: i64, next: i64 },
     #[error("cannot write an encoded packet: {0}")]
     WritePacket(ffmpeg::Error),
     #[error("cannot flush the video encoder: {0}")]
@@ -255,7 +259,12 @@ impl VideoFileEncoder {
         let timestamp = crate::video_tick(captured.captured_at_unix_nanos, origin, self.fps)
             .min(i64::MAX as u128) as i64;
         if timestamp <= self.last_pts {
-            return Ok(());
+            // This is an invalid source contract, not permission to silently
+            // resample/drop an already selected frame inside the encoder.
+            return Err(EncoderError::SourceTimestamp {
+                previous: self.last_pts,
+                next: timestamp,
+            });
         }
 
         let input_format = input_format(captured);

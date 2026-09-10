@@ -55,7 +55,6 @@ internal static class RecordingSavePause {
         // is the end-exclusive timeline boundary AND the state cloned by SRT.
         phase = Phase.Boundary;
         RecordingMotionSmoothing.FreezePresentation();
-        RecordingPauseAudio.Pause();
     }
 
     internal static bool BeginRecovery(Level owner) {
@@ -76,7 +75,6 @@ internal static class RecordingSavePause {
         AutoRecorder.StageInternalRecoveryResume();
         phase = Phase.Clean;
         cleanFrames = 0;
-        RecordingPauseAudio.Resume();
     }
 
     internal static void Update() {
@@ -102,7 +100,6 @@ internal static class RecordingSavePause {
         completed = null;
         phase = Phase.Clean;
         cleanFrames = 0;
-        RecordingPauseAudio.Resume();
         callback?.Invoke(result);
     }
 
@@ -114,6 +111,7 @@ internal static class RecordingSavePause {
             // Exclude this saved pose here; include it exactly once at resume.
             // Earlier GPU deliveries cannot move the cut behind the state clone.
             AutoRecorder.SuspendForInternalSave(timestamp);
+            RecordingPauseAudio.Pause();
             phase = Phase.Indicator;
         } else if (phase == Phase.Indicator) {
             phase = Phase.Save;
@@ -122,6 +120,9 @@ internal static class RecordingSavePause {
             // the GPU queue. Keep simulation frozen until BOTH sinks accept their
             // actual first resumed frame; callback lag cannot select an old P frame.
             AutoRecorder.PrepareInternalSaveResume(timestamp);
+            // Do not consume one-shot tails during the excluded clean-frame
+            // guard. Resume sound at the first requested retained presentation.
+            RecordingPauseAudio.Resume();
             phase = Phase.ResumeFrame;
         } else if (phase == Phase.ResumeFrame && AutoRecorder.TryResumeAfterInternalSave()) {
             resumeStep = true;

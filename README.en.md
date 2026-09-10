@@ -86,6 +86,9 @@ PBO readback is submitted **before** `SDL_GL_SwapWindow`, with zero-timeout fenc
 polling on subsequent frames. A worker converts/distributes owned BGRA pixels;
 encoding and consumer callbacks never run on the render thread. Resizing rebuilds
 PBOs; no subscribers means no readback. No desktop recording permission is needed.
+Frame-rate selection happens only at acquisition. Equal-rate recordings share the selected images;
+downstream queues and recorders do not resample them. SFX uses the continuous master mixer clock,
+and internal-save audio pause/resume follows retained-video boundaries.
 See [capture architecture and testing](docs/capture-architecture.md).
 
 - Automatic recording can cover every room or only runs carrying a golden berry.

@@ -52,14 +52,16 @@ internal sealed class NativeRoomRecording {
     internal void RequestResumeFrame(ulong timestamp) => capture.RequestKeyframe(timestamp);
     internal ulong ResumeFrameTimestamp => capture.KeyframeAcceptedAt;
     internal double EncodedFrameTimeAt(ulong timestamp) => targetFrameRate <= 0 ? TimeAt(timestamp)
-        : Math.Floor(TimeAt(timestamp) * targetFrameRate + 0.5d) / targetFrameRate;
+        : capture.FrameTimeAt(timestamp, (uint)targetFrameRate)
+            ?? Math.Floor(TimeAt(timestamp)*targetFrameRate + .5d)/targetFrameRate;
+    // Cut boundaries must use the same global grid as selection and encoder PTS.
     internal double FrameTimeAt(ulong timestamp, bool roundUp) {
-        double time = TimeAt(timestamp);
-        if (targetFrameRate <= 0) return time;
-        // Encoder PTS are quantized to frame ticks. An indicator presented just
-        // after a tick may round backwards; never retain that UI as the last frame.
-        double ticks = time * targetFrameRate;
-        return (roundUp ? Math.Ceiling(ticks) : Math.Floor(ticks)) / targetFrameRate;
+        if (targetFrameRate <= 0) return TimeAt(timestamp);
+        if (capture.FrameTimeAt(timestamp, (uint)targetFrameRate, roundUp) is { } time) return time;
+        // Preserve safe boundary rounding when the first source frame has not
+        // established an origin (also used by stopped/unavailable capture).
+        double ticks = TimeAt(timestamp)*targetFrameRate;
+        return (roundUp ? Math.Ceiling(ticks) : Math.Floor(ticks))/targetFrameRate;
     }
 
     public static NativeRoomRecording? Start(string output) {

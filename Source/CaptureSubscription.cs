@@ -37,8 +37,6 @@ public sealed class CaptureSubscription : IDisposable {
     private readonly ulong subscribedAt;
     private readonly uint maxFrameRate;
     private readonly int frameCapacity;
-    private ulong? frameOrigin;
-    private UInt128 lastFrameTick;
     private int disposed;
     private long droppedFrames, droppedAudio, droppedMusic, callbackErrors;
     internal bool WantsPixels => pixels is not null;
@@ -46,6 +44,11 @@ public sealed class CaptureSubscription : IDisposable {
     internal bool WantsMusic => music is not null;
     internal bool BorrowsPixels { get; }
     internal uint MaxFrameRate => maxFrameRate;
+    internal uint SourceMask { get; init; }
+    private ulong sourceVersion;
+    internal void ActivateSourceRoute(ulong version) => Interlocked.CompareExchange(ref sourceVersion, version, 0);
+    internal bool ReceivesSourceFrame(uint mask, ulong version) =>
+        (SourceMask & mask) != 0 && Volatile.Read(ref sourceVersion) is var first && first != 0 && version >= first;
     public long DroppedFrames => Interlocked.Read(ref droppedFrames);
     public long DroppedAudioChunks => Interlocked.Read(ref droppedAudio);
     public long CallbackErrors => Interlocked.Read(ref callbackErrors);
@@ -77,17 +80,8 @@ public sealed class CaptureSubscription : IDisposable {
         if (value.TimestampNanos < subscribedAt || pixels is null || Volatile.Read(ref disposed) != 0) return;
         lock (gate) {
             if (disposed != 0) return;
-            // Select recording frames BEFORE the bounded callback queue. A 60-fps
-            // recorder must not compete with redundant 120/144-Hz presentations.
-            // Ordinary subscribers (rate=0) still receive every acquired frame.
-            if (maxFrameRate != 0) {
-                if (frameOrigin is ulong origin) {
-                    if (value.TimestampNanos < origin) return;
-                    UInt128 tick = ((UInt128)(value.TimestampNanos - origin) * maxFrameRate + 500_000_000) / 1_000_000_000;
-                    if (tick <= lastFrameTick) return;
-                    lastFrameTick = tick;
-                } else { frameOrigin = value.TimestampNanos; lastFrameTick = 0; }
-            }
+            // The acquisition layer selected this frame for us before readback.
+            // This queue does delivery/backpressure only, never resampling.
             value.Lease?.Retain();
             if (frames.Count == frameCapacity) { frames.Dequeue().Lease?.Release(); Interlocked.Increment(ref droppedFrames); }
             frames.Enqueue(value); Signal();
@@ -147,5 +141,18 @@ public sealed class CaptureSubscription : IDisposable {
             while (frames.TryDequeue(out var frame)) frame.Lease?.Release();
             audio.Clear(); musicEvents.Clear(); Signal();
         }
+    }
+}
+
+// PTS/edit-time conversion only, identical to native video_tick. This helper
+// does not select frames; that decision belongs solely to source acquisition.
+internal static class CaptureFrameClock {
+    internal static UInt128 Tick(ulong timestamp, uint fps, bool? roundUp = null) =>
+        ((UInt128)timestamp * fps + (roundUp is true ? 999_999_999u : roundUp is false ? 0u : 500_000_000u)) / 1_000_000_000;
+
+    internal static double SecondsAt(ulong timestamp, ulong origin, uint fps, bool? roundUp = null) {
+        if (fps == 0) return timestamp <= origin ? 0 : (timestamp-origin) / 1_000_000_000d;
+        UInt128 tick = Tick(timestamp, fps, roundUp), start = Tick(origin, fps);
+        return tick <= start ? 0 : (double)(tick-start) / fps;
     }
 }

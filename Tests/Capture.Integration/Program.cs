@@ -55,6 +55,18 @@ Fmod(studio.getEvent("event:/ui/main/button_select",out var description));
 Fmod(studio.getEvent("event:/char/madeline/jump",out var jumpDescription));
 NativeCaptureBridge.Initialize(null); Check(NativeCaptureBridge.Available,"native load failed");
 CaptureSource.Load(); Check(CaptureSource.VideoError is null,$"hook failed: {CaptureSource.VideoError}");
+if (Environment.GetEnvironmentVariable("MQOL_TEST_FRAME_ROUTES") == "1") {
+    FrameRoutingTests.Run(window, i => { clearColor((i%256)/255f,.3f,.7f,1); clear(0x4000); }, output, encoder);
+    CaptureSource.Unload(); Fmod(studio.release());
+    Sdl.DeleteContext(context); Sdl.DestroyWindow(window); Sdl.Quit();
+    return;
+}
+if (Environment.GetEnvironmentVariable("MQOL_TEST_AUDIO_CLOCK") == "1") {
+    AudioContinuityTests.Run(studio, lowLevel, output);
+    CaptureSource.Unload(); Fmod(studio.release());
+    Sdl.DeleteContext(context); Sdl.DestroyWindow(window); Sdl.Quit();
+    return;
+}
 long frameCount=0,audioCount=0; ulong lastSequence=0; int badPixels=0, surroundChunks=0, bgmChunks=0;
 var musicChanges = new System.Collections.Concurrent.ConcurrentQueue<CaptureMusic>();
 Fmod(studio.getEvent("event:/music/menu/level_select", out var musicDescription));
@@ -140,7 +152,7 @@ foreach(var name in new[]{"first.mkv","second.mkv"}) {
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,1.5,"",0)],
     Path.Combine(output,"final.mp4"),encoder,1000,30,false,false,"").GetAwaiter().GetResult();
 Check(first.KeyframeAcceptedAt != 0, "resumed keyframe request was never accepted");
-double resumed = Math.Floor(first.TimeAt(first.KeyframeAcceptedAt)!.Value * 30 + .5) / 30;
+double resumed = first.FrameTimeAt(first.KeyframeAcceptedAt, 30)!.Value;
 List<double> seamProgress = [];
 var seamTimer = System.Diagnostics.Stopwatch.StartNew();
 NativeCaptureBridge.FinalizeRecordingAsync([

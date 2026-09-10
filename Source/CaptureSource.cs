@@ -25,17 +25,7 @@ public static class CaptureSource {
     public static long DroppedAudioChunks => Interlocked.Read(ref sourceAudioDrops);
     public static long DroppedFrames => Interlocked.Read(ref sourceFrameDrops);
     internal static bool WantsPixels => Volatile.Read(ref subscriptions).Any(s => s.WantsPixels);
-    internal static uint RequestedFrameRate {
-        get {
-            uint rate = 0;
-            foreach (var s in Volatile.Read(ref subscriptions)) {
-                if (!s.WantsPixels) continue;
-                if (s.MaxFrameRate == 0) return 0; // a public subscriber requests every frame
-                rate = Math.Max(rate, s.MaxFrameRate);
-            }
-            return rate;
-        }
-    }
+    internal static CaptureSubscription[] FrameRoutes => Volatile.Read(ref subscriptions);
 
     /// <summary>Register any combination of pixel and FMOD callbacks. Dispose the returned registration to unsubscribe.</summary>
     public static CaptureSubscription Subscribe(Action<CaptureFrame>? pixels = null, Action<CaptureAudio>? fmod = null, Action<CaptureMusic>? music = null) {
@@ -55,7 +45,11 @@ public static class CaptureSource {
             if (!loaded) throw new InvalidOperationException("Capture source has not been loaded");
             if (pixels is not null && VideoError is { } error) throw new NotSupportedException(error);
             if (subscriptions.Length >= 16) throw new InvalidOperationException("At most 16 capture subscribers are supported");
-            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music, borrowed, maxFrameRate);
+            uint used = 0;
+            foreach (var existing in subscriptions) used |= existing.SourceMask;
+            uint mask = 1;
+            while ((used & mask) != 0) mask <<= 1;
+            CaptureSubscription subscription = new(pixels, fmod, Remove, SdlFrameSource.ClockNanos(), music, borrowed, maxFrameRate) { SourceMask = mask };
             foreach (var snapshot in musicSnapshots) subscription.Offer(snapshot with { Kind = "snapshot" });
             Volatile.Write(ref subscriptions, [.. subscriptions, subscription]);
             return subscription;
@@ -125,7 +119,7 @@ public static class CaptureSource {
                                 (int)native.Height, native.Timestamp, native.Sequence) { Lease = lease };
                             CaptureFrame? owned = null;
                             foreach (var subscription in Volatile.Read(ref subscriptions)) {
-                                if (!subscription.WantsPixels) continue;
+                                if (!subscription.WantsPixels || !subscription.ReceivesSourceFrame(native.RouteMask, native.RouteVersion)) continue;
                                 subscription.Offer(subscription.BorrowsPixels ? borrowed : owned ??= borrowed.Snapshot());
                             }
                         } finally { lease.Release(); }

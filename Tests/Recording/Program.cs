@@ -54,7 +54,7 @@ var originalSlot = SaveSlotsManager.Slot;
 var normalStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(1d / 60) };
 Check(RecordingSavePause.BeforeEngineUpdate(ref normalStep), "idle gate blocked gameplay");
 Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate();
-Check(RecordingSavePause.Active && !RecordingSavePause.ShowIndicator && RecordingPauseAudio.Paused,
+Check(RecordingSavePause.Active && !RecordingSavePause.ShowIndicator && !RecordingPauseAudio.Paused,
     "save did not freeze on the exact clean boundary before its indicator");
 RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(!SpeedrunToolAutoSave.HasState, "save ran before any indicator presentation");
@@ -62,6 +62,7 @@ int suspends = AutoRecorder.Suspends, resumes = AutoRecorder.Resumes;
 RecordingSavePause.Presented(100);
 Check(AutoRecorder.Suspends == suspends + 1 && RecordingSavePause.ShowIndicator && !SpeedrunToolAutoSave.HasState,
     "clean saved pose did not establish the boundary before the UI");
+Check(RecordingPauseAudio.Paused, "audio did not pause at the excluded video boundary");
 RecordingSavePause.Presented(110);
 RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(AutoRecorder.Suspends == suspends + 1 && SpeedrunToolRecoverySlot.Completing
@@ -77,12 +78,12 @@ for (int i = 0; i < 200; i++) {
 Check(position == 100d, "physics advanced from A to B during saving/catch-up updates");
 StateManager.CloneGate.SetResult(); StateManager.CloneGate = null;
 while (SpeedrunToolRecoverySlot.Completing) { Thread.Sleep(1); RecordingTransitionAutoSave.AfterEngineUpdate(); }
-Check(ReferenceEquals(SaveSlotsManager.Slot, originalSlot) && !RecordingPauseAudio.Paused
-    && RecordingSavePause.Active && !RecordingSavePause.ShowIndicator, "clone did not restore audio/selection before clean frame");
+Check(ReferenceEquals(SaveSlotsManager.Slot, originalSlot) && RecordingPauseAudio.Paused
+    && RecordingSavePause.Active && !RecordingSavePause.ShowIndicator, "audio resumed before the retained clean frame");
 RecordingSavePause.Presented(300);
-Check(RecordingSavePause.Active, "resumed before clean presentation guard");
+Check(RecordingSavePause.Active && RecordingPauseAudio.Paused, "game/audio resumed before clean presentation guard");
 RecordingSavePause.Presented(400);
-Check(RecordingSavePause.Active, "resumed simulation before the keyframe was delivered");
+Check(RecordingSavePause.Active && !RecordingPauseAudio.Paused, "audio did not resume at the requested retained frame, or simulation resumed early");
 RecordingSavePause.Presented(500);
 Check(!RecordingSavePause.Active && AutoRecorder.Resumes == resumes + 1, "clean frame failed to resume exactly once");
 var delayedStep = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };

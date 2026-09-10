@@ -7,8 +7,8 @@ CaptureFrame Frame(ulong n) => new(new byte[4], 1, 1, n * 16_666_667, n);
 CaptureAudio Audio(ulong n) => new(new float[2], 48000, 2, 1, "bus:/gameplay_sfx", n, n);
 
 int removed = 0;
-// Intentional high-refresh sampling happens before the callback queue, not by
-// overflowing it and hoping the native sink selects a usable frame afterwards.
+// Queues do NOT sample: even multiple supplied frames within one FPS bucket
+// must all be delivered. The source is the sole owner of rate selection.
 var sampledEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 var sampledRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 List<ulong> sampledTimes = [];
@@ -17,13 +17,41 @@ using (var sampled = new CaptureSubscription(frame => {
     if(sampledTimes.Count==1) { sampledEntered.SetResult(); sampledRelease.Task.GetAwaiter().GetResult(); }
 }, null, _=>{}, maxFrameRate:60)) {
     sampled.Offer(Frame(0)); await Timeout(sampledEntered.Task);
-    // 144-Hz producer, but only three subsequent 60-Hz ticks should enter the queue.
-    for(ulong i=1;i<=7;i++) sampled.Offer(new CaptureFrame(new byte[4],1,1,i*1_000_000_000/144,i));
-    Check(sampled.DroppedFrames==0,"redundant high-refresh frames overflowed recording callbacks");
+    for(ulong i=1;i<=3;i++) sampled.Offer(new CaptureFrame(new byte[4],1,1,i,i));
+    Check(sampled.DroppedFrames==0,"selected frames overflowed recording callbacks");
     sampled.Complete(); sampledRelease.SetResult(); await Timeout(sampled.Completion);
 }
-Check(sampledTimes.Count==4 && sampledTimes.SequenceEqual(new ulong[]{0,2_000_000_000/144,4_000_000_000/144,7_000_000_000/144}),
-    "recording sampling changed frame timestamps or selected wrong cadence");
+Check(sampledTimes.Count==4 && sampledTimes.SequenceEqual(new ulong[]{0,1,2,3}),
+    "delivery queue resampled source frames or changed timestamps");
+using (var reusedRoute = new CaptureSubscription(_=>{},null,_=>{},maxFrameRate:30) { SourceMask=4 }) {
+    Check(!reusedRoute.ReceivesSourceFrame(4,6),"unconfigured route received an in-flight old frame");
+    reusedRoute.ActivateSourceRoute(7);
+    Check(!reusedRoute.ReceivesSourceFrame(4,6),"reused source slot received its old owner's pending GPU frame");
+    Check(!reusedRoute.ReceivesSourceFrame(2,7),"frame was routed to an unselected subscriber");
+    Check(reusedRoute.ReceivesSourceFrame(4,7),"correct source selection was rejected");
+    reusedRoute.ActivateSourceRoute(8);
+    Check(reusedRoute.ReceivesSourceFrame(4,7),"unrelated route change invalidated an existing route's pending frames");
+}
+// The source already selected global 60-Hz buckets. A late subscriber must not
+// drop them on its own first-frame-relative grid, even at fractional refresh.
+foreach (ulong renderFps in new ulong[] { 90, 120, 144, 165, 180, 240 }) {
+    var accepted = System.Threading.Channels.Channel.CreateUnbounded<ulong>();
+    using var sub = new CaptureSubscription(f => accepted.Writer.TryWrite(f.TimestampNanos), null, _ => {}, maxFrameRate:60);
+    UInt128? previous = null;
+    int selected = 0;
+    for (ulong i=0; i<renderFps*2; i++) {
+        ulong time = 1_700_000_000_001_000_000 + i*1_000_000_000/renderFps;
+        UInt128 tick = ((UInt128)time * 60 + 500_000_000) / 1_000_000_000;
+        if (previous == tick) continue;
+        previous = tick;
+        if (++selected <= 7) continue;
+        sub.Offer(new CaptureFrame(new byte[4],1,1,time,i));
+        ulong received = await accepted.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        Check(received==time,"late subscriber changed a source timestamp");
+    }
+    sub.Complete(); await Timeout(sub.Completion);
+    Check(sub.DroppedFrames==0,"source-paced recorder lost frames at delivery");
+}
 var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 int calls = 0;

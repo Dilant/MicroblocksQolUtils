@@ -6,7 +6,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 9;
+    private const uint ExpectedAbiVersion = 10;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -304,6 +304,10 @@ public sealed class NativeCaptureSession : IDisposable {
         return start == 0 ? null : timestamp <= start ? 0 : (timestamp - start) / 1_000_000_000d;
     }
     internal double? TimelineTimeSeconds => Volatile.Read(ref origin) == 0 ? null : TimeAt(SdlFrameSource.ClockNanos());
+    internal double? FrameTimeAt(ulong timestamp, uint fps, bool? roundUp = null) {
+        ulong start = Volatile.Read(ref origin);
+        return start == 0 ? null : CaptureFrameClock.SecondsAt(timestamp, start, fps, roundUp);
+    }
     private readonly MusicJournal? musicJournal;
     private int stopped;
     internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath, uint fps) {

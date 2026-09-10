@@ -85,6 +85,7 @@ internal sealed class FmodSfxTap : IDisposable {
     private sealed class BusTap : IDisposable {
         private readonly FMOD.Studio.Bus bus;
         private readonly FMOD.ChannelGroup group;
+        private readonly FMOD.ChannelGroup clockGroup;
         private readonly FMOD.DSP dsp;
         private readonly FMOD.DSP_READCALLBACK callback;
         private readonly int busId;
@@ -95,6 +96,7 @@ internal sealed class FmodSfxTap : IDisposable {
         private BusTap(
             FMOD.Studio.Bus bus,
             FMOD.ChannelGroup group,
+            FMOD.ChannelGroup clockGroup,
             FMOD.DSP dsp,
             FMOD.DSP_READCALLBACK callback,
             int busId,
@@ -102,6 +104,7 @@ internal sealed class FmodSfxTap : IDisposable {
         ) {
             this.bus = bus;
             this.group = group;
+            this.clockGroup = clockGroup;
             this.dsp = dsp;
             this.callback = callback;
             this.busId = busId;
@@ -124,6 +127,7 @@ internal sealed class FmodSfxTap : IDisposable {
                 // Flush before querying it or an otherwise valid inactive bus reports NOT_LOADED.
                 FmodSfxTap.Check(studio.flushCommands(), $"materialize channel group {path}");
                 FmodSfxTap.Check(bus.getChannelGroup(out group), $"get channel group {path}");
+                FmodSfxTap.Check(lowLevel.getMasterChannelGroup(out var clockGroup), "get mixer clock group");
 
                 BusTap? owner = null;
                 FMOD.DSP_READCALLBACK callback = (ref FMOD.DSP_STATE state, IntPtr input, IntPtr output,
@@ -139,7 +143,7 @@ internal sealed class FmodSfxTap : IDisposable {
                     read = callback
                 };
                 FmodSfxTap.Check(lowLevel.createDSP(ref description, out dsp), $"create DSP for {path}");
-                owner = new BusTap(bus, group, dsp, callback, busId, sampleRate);
+                owner = new BusTap(bus, group, clockGroup, dsp, callback, busId, sampleRate);
                 FmodSfxTap.Check(group.addDSP(FMOD.CHANNELCONTROL_DSP_INDEX.TAIL, dsp), $"add DSP to {path}");
                 return owner;
             } catch {
@@ -177,8 +181,12 @@ internal sealed class FmodSfxTap : IDisposable {
                 Buffer.MemoryCopy(input.ToPointer(), output.ToPointer(), byteCount, byteCount);
                 outputChannels = inputChannels;
                 if (Volatile.Read(ref disposed) == 0) {
-                    _ = group.getDSPClock(out ulong clock, out _);
-                    ulong timestamp = audioClock.Timestamp(clock, sampleRate, SdlFrameSource.ClockNanos());
+                    // A paused bus's own clock STOPS. Mapping it to video shifts
+                    // resumed SFX backwards until a large resync, then loses a
+                    // block at edits. The master mixer clock keeps real time.
+                    ulong now = SdlFrameSource.ClockNanos();
+                    FMOD.RESULT result = clockGroup.getDSPClock(out ulong clock, out _);
+                    ulong timestamp = result == FMOD.RESULT.OK ? audioClock.Timestamp(clock, sampleRate, now) : now;
                     CaptureSource.PublishAudio((float*)input.ToPointer(), sampleCount, sampleRate, inputChannels, busId, clock, timestamp);
                 }
                 return FMOD.RESULT.OK;

@@ -74,6 +74,8 @@ struct Slot {
     fence: *mut c_void,
     timestamp: u64,
     sequence: u64,
+    route_mask: u32,
+    route_version: u64,
 }
 struct Readback {
     cadence: crate::frame_cadence::FrameCadence,
@@ -90,6 +92,8 @@ struct Frame {
     height: u32,
     timestamp: u64,
     sequence: u64,
+    route_mask: u32,
+    route_version: u64,
     bottom_up: bool,
     rgba: bool,
 }
@@ -102,6 +106,8 @@ pub(crate) fn enqueue_d3d(
     height: u32,
     timestamp: u64,
     sequence: u64,
+    route_mask: u32,
+    route_version: u64,
     rgba: bool,
 ) {
     if let Ok(mut frames) = FRAMES.try_lock() {
@@ -114,6 +120,8 @@ pub(crate) fn enqueue_d3d(
             height,
             timestamp,
             sequence,
+            route_mask,
+            route_version,
             bottom_up: false,
             rgba,
         });
@@ -195,6 +203,8 @@ impl Readback {
                 fence: ptr::null_mut(),
                 timestamp: 0,
                 sequence: 0,
+                route_mask: 0,
+                route_version: 0,
             });
         }
         // Retire in submission order. Never map an unsignaled PBO, never wait for the GPU.
@@ -237,6 +247,8 @@ impl Readback {
                         height,
                         timestamp: slot.timestamp,
                         sequence: slot.sequence,
+                        route_mask: slot.route_mask,
+                        route_version: slot.route_version,
                         bottom_up: true,
                         rgba: true,
                     });
@@ -246,7 +258,8 @@ impl Readback {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.fence.is_null()) else {
             return Ok(());
         };
-        if !self.cadence.due(timestamp) {
+        let (route_mask, route_version) = self.cadence.select(timestamp);
+        if route_mask == 0 {
             return Ok(());
         }
         unsafe {
@@ -273,6 +286,8 @@ impl Readback {
         }
         slot.timestamp = timestamp;
         slot.sequence = sequence;
+        slot.route_mask = route_mask;
+        slot.route_version = route_version;
         Ok(())
     }
 }
@@ -350,6 +365,8 @@ pub struct FrameResult {
     pub height: u32,
     pub timestamp: u64,
     pub sequence: u64,
+    pub route_mask: u32,
+    pub route_version: u64,
 }
 fn convert_rgba(frame: &mut Frame) {
     let stride = frame.width as usize * 4;
@@ -388,6 +405,8 @@ pub unsafe extern "C" fn mqol_source_poll(output: *mut FrameResult) -> i32 {
             height: frame.height,
             timestamp: frame.timestamp,
             sequence: frame.sequence,
+            route_mask: frame.route_mask,
+            route_version: frame.route_version,
         };
         std::mem::forget(bytes);
         unsafe {
@@ -422,6 +441,8 @@ mod tests {
             height: 2,
             timestamp: 5,
             sequence: 9,
+            route_mask: 5,
+            route_version: 1,
             bottom_up: true,
             rgba: true,
         };

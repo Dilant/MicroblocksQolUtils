@@ -241,6 +241,8 @@ struct Slot {
     pending: bool,
     timestamp: u64,
     sequence: u64,
+    route_mask: u32,
+    route_version: u64,
 }
 struct Readback {
     cadence: crate::frame_cadence::FrameCadence,
@@ -282,6 +284,8 @@ impl Readback {
                     pending: false,
                     timestamp: 0,
                     sequence: 0,
+                    route_mask: 0,
+                    route_version: 0,
                 });
             }
             Ok(Self {
@@ -352,11 +356,14 @@ impl Readback {
                     self.height,
                     slot.timestamp,
                     slot.sequence,
+                    slot.route_mask,
+                    slot.route_version,
                     rgba,
                 );
             }
             if let Some(slot) = self.slots.iter_mut().find(|s| !s.pending) {
-                if !self.cadence.due(timestamp) {
+                let (route_mask, route_version) = self.cadence.select(timestamp);
+                if route_mask == 0 {
                     return Ok(());
                 }
                 self.context.CopyResource(&slot.texture, backbuffer);
@@ -364,6 +371,8 @@ impl Readback {
                 slot.pending = true;
                 slot.timestamp = timestamp;
                 slot.sequence = sequence;
+                slot.route_mask = route_mask;
+                slot.route_version = route_version;
             }
             Ok(())
         }
