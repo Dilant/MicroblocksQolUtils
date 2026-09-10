@@ -52,11 +52,50 @@ foreach(var end in Enum.GetValues<GoldenRecordingEnd>()) {
         l.Completed=true;Tick(l); // Banking chapter stats is not the actual exit.
         Check(AutoRecorder.IsRecording,"RegisterAreaComplete must not stop chapter-end mode");
         Advance(4);On.Celeste.Level.Complete(l);Tick(l);
+        Check(AutoRecorder.IsRecording && NativeRecordingFinalizer.Jobs.Count==0,"chapter completion retains the active golden recording");
+        Advance(2); Everest.Events.Level.End(l,new Scene());
     }
     for(int i=0;i<5;i++)Tick(l);
     Check(!AutoRecorder.IsRecording && !AutoRecorder.ManualMode,"successful golden must not restart");
     Check(NativeRecordingFinalizer.Jobs.Count==1,"success saves exactly once");
-    Check(Math.Abs(NativeRecordingFinalizer.Jobs[0].Clips.Sum(c=>c.DurationSeconds)-(end==GoldenRecordingEnd.ChapterComplete?12:8))<0.01,"correct success timeline endpoint");
+    Check(Math.Abs(NativeRecordingFinalizer.Jobs[0].Clips.Sum(c=>c.DurationSeconds)-(end==GoldenRecordingEnd.ChapterComplete?14:8))<0.01,"correct success timeline endpoint");
+}
+
+// Timer-stop/heart cutscenes and CompleteArea's wipe all belong to one source
+// and one output, including a tail with no Player entity left in the Level.
+foreach(bool manual in new[]{false,true}) foreach(bool completeHook in new[]{false,true}) {
+    var(l,p,b)=Begin(manual?AutoRecordingMode.Off:AutoRecordingMode.Chapter);
+    if(manual)AutoRecorder.StartManual(); Tick(l); Advance(5);
+    var source=NativeRoomRecording.Started.Single();
+    l.Completed=true; Tick(l); Advance(3);
+    if(completeHook)On.Celeste.Level.Complete(l);
+    Tick(l); Advance(2);
+    Check(AutoRecorder.IsRecording && !source.Stopped && NativeRecordingFinalizer.Jobs.Count==0,
+        "completion finalized before the in-level tail");
+    l.Tracker.Player=null; Tick(l); Advance(1);
+    Check(NativeRoomRecording.Started.Count==1,"completion split the capture source");
+    Everest.Events.Level.End(l,new Scene());
+    Check(!AutoRecorder.IsRecording && source.Stopped,"level exit did not stop completed capture");
+    var job=NativeRecordingFinalizer.Jobs.Single();
+    Check(job.Clips.Count==1 && job.Clips[0].DurationSeconds==11,"completion lost or split the epilogue");
+    Check(RecordingLibrary.KindOf(root,job.Output)==(manual?RecordingLibraryKind.Full:RecordingLibraryKind.Automatic),
+        "completion changed recording ownership");
+    Everest.Events.Level.End(l,new Scene());
+    Check(NativeRecordingFinalizer.Jobs.Count==1,"repeated level end saved twice");
+}
+// An explicit stop during the epilogue still wins and cannot be restarted by
+// completion, even if the automatic setting is toggled afterwards.
+foreach(bool save in new[]{false,true}) {
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(5);
+    On.Celeste.Level.Complete(l); Tick(l); Advance(2);
+    AutoRecorder.StopManual(l,save); Tick(l); Advance(3);
+    MicroblocksQolUtilsModule.Settings.AutomaticRecording=AutoRecordingMode.Off; Tick(l);
+    MicroblocksQolUtilsModule.Settings.AutomaticRecording=AutoRecordingMode.Chapter; Tick(l);
+    Check(!AutoRecorder.IsRecording,"explicit tail stop restarted automatic capture");
+    Everest.Events.Level.End(l,new Scene());
+    Check(NativeRecordingFinalizer.Jobs.Count==(save?1:0),"exit ignored explicit tail save/discard");
+    if(save)Check(NativeRecordingFinalizer.Jobs.Single().Clips.Sum(c=>c.DurationSeconds)==7,
+        "explicit stop included time after the stop request");
 }
 
 // All six golden policy combinations, including real LevelExit golden restarts.
@@ -77,6 +116,7 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
         Check(!AutoRecorder.CanSaveTransitionTimeline,"uncut failed golden run must not arm recovery rewinds");
         On.Celeste.Player.Raise(respawned);Tick(resumed);respawned.Dead=false;Advance(2);Tick(resumed);
         On.Celeste.Level.Complete(resumed); Tick(resumed);
+        Everest.Events.Level.End(resumed,new Scene());
         var job=NativeRecordingFinalizer.Jobs.Single(j=>j.Description=="自动录像");
         Check(Math.Abs(job.Clips.Sum(c=>c.DurationSeconds)-12)<0.01,"continue retains failures instead of trimming to respawn");
         Check(!AutoRecorder.ManualMode && !AutoRecorder.IsRecording,"continued run ends once");
@@ -289,6 +329,7 @@ foreach(var mode in new[]{AutoRecordingMode.Off,AutoRecordingMode.Chapter}) {
     var(l,p,b)=Begin(AutoRecordingMode.Off);AutoRecorder.StartManual();NativeRoomRecording.FailNextStart=true;Tick(l);
     Check(AutoRecorder.ManualMode && !AutoRecorder.IsRecording,"failed encoder start keeps explicit pending request");
     Tick(l);Advance(1);On.Celeste.Level.Complete(l);Tick(l);Tick(l);
+    Everest.Events.Level.End(l,new Scene());
     Check(!AutoRecorder.ManualMode && !AutoRecorder.IsRecording,"manual completion clears the request");
     AutoRecorder.StartManual();Tick(l);Check(AutoRecorder.ManualMode && AutoRecorder.IsRecording,"explicit manual can start after a previous completion");
 }

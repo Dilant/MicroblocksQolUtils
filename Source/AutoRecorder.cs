@@ -454,10 +454,10 @@ public static class AutoRecorder {
 
     private static ScreenWipe CompleteArea(On.Celeste.Level.orig_CompleteArea_bool_bool_bool orig,
         Level self, bool spotlightWipe, bool skipScreenWipe, bool skipCompleteScreen) {
-        // RegisterAreaComplete is also used to bank collectibles before a chapter
-        // actually ends. CompleteArea is the real chapter-exit boundary.
+        // RegisterAreaComplete can bank collectibles before the chapter ends.
+        // Latch completion here, but keep the active session/branch through the
+        // in-level epilogue and wipe. LevelEnd saves the entire timeline once.
         SessionState.CompleteChapter();
-        RequestStop(self, save: true);
         return orig(self, spotlightWipe, skipScreenWipe, skipCompleteScreen);
     }
 
@@ -485,7 +485,8 @@ public static class AutoRecorder {
             return;
         }
         // Some modded exits bypass CompleteArea; do not lose an already completed run.
-        if (current is not null && level.Completed) RequestStop(level, save: true);
+        if (current is not null && (SessionState.ChapterCompleted || level.Completed))
+            RequestStop(level, save: true);
         FlushPendingRecordingStop();
         _ = nextScene;
         _ = shouldReloadPortraits;
