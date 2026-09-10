@@ -34,12 +34,12 @@ internal static class ProgressCompatibility {
             saving.SetValue(null, true);
             try { present.Invoke(null, [progress, true]); }
             finally { saving.SetValue(null, false); }
-            if (presented != 1) throw new Exception("Private save rendered duplicate progress");
+            if (presented != 2 || !Accept()) throw new Exception("Private save did not reuse isolated SRT progress");
             fail = true;
             try { present.Invoke(null, [progress, true]); }
             catch (TargetInvocationException exception) when (exception.InnerException is InvalidOperationException) { }
             if (!Accept()) throw new Exception("Graphics exception poisoned capture");
-            Console.WriteLine("PASS: actual SRT progress method, source exclusion, private suppression, exception cleanup");
+            Console.WriteLine("PASS: actual SRT progress method, source exclusion, private UI reuse, exception cleanup");
         } finally { adapter.GetMethod("Unload", flags)!.Invoke(null, null); }
     }
 }

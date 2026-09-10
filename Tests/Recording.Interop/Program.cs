@@ -25,6 +25,9 @@ Assembly srt = AssemblyLoadContext.Default.LoadFromAssemblyPath(args.Length == 3
     ? Path.Combine(root, "Mods", "Cache", "SpeedrunTool.SpeedrunTool.dll")
     : Path.Combine(scratch, "SpeedrunTool.dll"));
 Console.WriteLine($"Testing {srt.Location}");
+// Bare singleton supplies a null Scene without constructing Game/graphics.
+typeof(Monocle.Engine).GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!
+    .SetValue(null, System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Monocle.Engine)));
 VerifyDefaultSetting();
 SpeedrunToolAutoSave.Load(srt);
 try {
@@ -35,6 +38,14 @@ try {
     Type slots = srt.GetType("Celeste.Mod.SpeedrunTool.SaveLoad.SaveSlotsManager", true)!;
     slots.GetMethod("SwitchSlot", flags, [typeof(string)])!.Invoke(null, ["interop-user"]);
     object previous = slots.GetField("Slot", flags)!.GetValue(null)!;
+    SpeedrunToolBridge.InstallTransactionHooks(srt);
+    object manager = previous.GetType().GetField("StateManager", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!.GetValue(previous)!;
+    foreach (string method in new[] { "SaveStateImpl", "LoadStateImpl" }) {
+        object?[] arguments = [false, null];
+        if (manager.GetType().GetMethod(method, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(manager, arguments) is not false
+            || arguments[1] is not string { Length: > 0 }) throw new Exception("Transactional hook changed rejected SRT operation");
+    }
+    Console.WriteLine("PASS: production transaction wrappers on actual SRT save/load signatures (no scene, rejected operations)");
     RecoveryResult result = SpeedrunToolRecoverySlot.Run(_ => RecoveryResult.Success, create: true);
     if (result != RecoveryResult.Success || !ReferenceEquals(previous, slots.GetField("Slot", flags)!.GetValue(null))
         || slots.GetProperty("SlotName", flags)!.GetValue(null) as string != "interop-user")
@@ -42,7 +53,7 @@ try {
     if (!SpeedrunToolRecoverySlot.Release()) throw new Exception("Actual SRT private slot was not released");
     Console.WriteLine("PASS: actual SRT slot creation, selection restoration and cleanup (no game save created)");
 } finally {
-    SpeedrunToolAutoSave.Unload();
+    SpeedrunToolBridge.Unload();
 }
 HookCompatibility.Verify(srt);
 ProgressCompatibility.Verify(srt);

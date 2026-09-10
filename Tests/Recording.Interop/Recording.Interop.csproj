@@ -6,8 +6,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../Source/MicroblocksQolUtils.csproj" />
-    <Compile Include="../../Source/SpeedrunToolAutoSave.cs" Link="SpeedrunToolAutoSave.cs" />
-    <Compile Include="../../Source/SpeedrunToolRecoverySlot.cs" Link="SpeedrunToolRecoverySlot.cs" />
     <Reference Include="Celeste"><HintPath>$(CelesteRoot)/Celeste.dll</HintPath></Reference>
     <Reference Include="Mono.Cecil"><HintPath>$(CelesteRoot)/Mono.Cecil.dll</HintPath></Reference>
     <Reference Include="MonoMod.RuntimeDetour"><HintPath>$(CelesteRoot)/MonoMod.RuntimeDetour.dll</HintPath></Reference>

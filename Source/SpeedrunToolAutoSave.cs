@@ -20,6 +20,7 @@ internal static class SpeedrunToolAutoSave {
     private static PropertyInfo? savedByTas;
     private static PropertyInfo? settingsInstance;
     private static PropertyInfo? enabled;
+    private static PropertyInfo? autoLoadAfterDeath;
     private static PropertyInfo? tasRunning;
     private static Func<bool>? allFree;
     private static HookStatus? hookStatus;
@@ -37,7 +38,9 @@ internal static class SpeedrunToolAutoSave {
     private static bool suppressMarking;
     internal static bool Available => hookStatus?.Ready is true;
     internal static bool HasState => Available && SpeedrunToolRecoverySlot.HasState;
-    internal static bool HasManualState => SpeedrunToolRecoverySlot.HasUserStateIn(Monocle.Engine.Scene as Level);
+    internal static bool HasManualState => CanUse && SpeedrunToolRecoverySlot.SelectedUserSaved
+        && autoLoadAfterDeath?.GetValue(settingsInstance!.GetValue(null)) is true
+        && savedByTas!.GetValue(managerInstance!.GetValue(null)) is not true;
     internal static bool ManualOperationActive => SpeedrunToolRecoverySlot.UserOperationActive;
 
     internal static void Load(Assembly assembly) {
@@ -54,6 +57,7 @@ internal static class SpeedrunToolAutoSave {
             savedByTas = RequiredProperty(manager, "SavedByTas", Instance);
             settingsInstance = RequiredProperty(settings, "Instance", Static);
             enabled = RequiredProperty(settings, "Enabled", Instance);
+            autoLoadAfterDeath = RequiredProperty(settings, "AutoLoadStateAfterDeath", Instance);
             tasRunning = RequiredProperty(RequiredType("ModInterop.TasUtils"), "Running", Static);
             allFree = slots.GetMethod("IsAllFree", Static, [])!.CreateDelegate<Func<bool>>();
             save = manager.GetMethod("SaveStateImpl", Instance, [typeof(bool), typeof(string).MakeByRefType()])
@@ -130,7 +134,7 @@ internal static class SpeedrunToolAutoSave {
 
     internal static bool ReadyToSave {
         get {
-            if (!CanUse || HasManualState || SpeedrunToolRecoverySlot.Completing) return false;
+            if (!CanUse || SpeedrunToolRecoverySlot.Completing) return false;
             object? manager = managerInstance!.GetValue(null);
             return manager is not null && savedByTas!.GetValue(manager) is not true
                 && allFree!() && managerState!.GetValue(manager)?.ToString() == "None";
@@ -140,7 +144,7 @@ internal static class SpeedrunToolAutoSave {
     private static RecoveryResult Run(bool loadState, bool preserveMarks, bool deferPreClone = false) {
         if (!Available) return RecoveryResult.Unavailable;
         try {
-            if (!CanUse || HasManualState) return RecoveryResult.Unavailable;
+            if (!CanUse || loadState && HasManualState) return RecoveryResult.Unavailable;
             object? manager = managerInstance!.GetValue(null);
             if (manager is null || savedByTas!.GetValue(manager) is true) return RecoveryResult.Unavailable;
             if (!allFree!() || managerState!.GetValue(manager)?.ToString() != "None") return RecoveryResult.Busy;
@@ -148,16 +152,20 @@ internal static class SpeedrunToolAutoSave {
             SavingSilently = !loadState;
             LoadingSilently = loadState;
             suppressMarking = !preserveMarks;
-            return SpeedrunToolRecoverySlot.Run(ownedManager => {
+            if (loadState) SpeedrunToolBridge.DiscardInternalLoad();
+            RecoveryResult result = SpeedrunToolRecoverySlot.Run(ownedManager => {
                 object?[] arguments = [false, null];
                 if ((loadState ? load : save)!.Invoke(ownedManager, arguments) is true) return RecoveryResult.Success;
                 Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool", $"Recording recovery skipped: {arguments[1]}");
                 return RecoveryResult.Failed;
             }, create: !loadState, deferPreClone);
+            if (loadState && result == RecoveryResult.Success) SpeedrunToolBridge.CommitInternalLoad();
+            return result;
         } catch (Exception exception) {
             Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/SpeedrunTool", $"Recording recovery failed: {exception.GetBaseException().Message}");
             return RecoveryResult.Failed;
         } finally {
+            SpeedrunToolBridge.DiscardInternalLoad();
             SavingSilently = LoadingSilently = suppressMarking = false;
         }
     }
@@ -171,7 +179,7 @@ internal static class SpeedrunToolAutoSave {
         loadHook?.Dispose();
         saveHook = markHook = loadHook = null;
         save = load = null;
-        managerInstance = managerState = savedByTas = settingsInstance = enabled = tasRunning = null;
+        managerInstance = managerState = savedByTas = settingsInstance = enabled = autoLoadAfterDeath = tasRunning = null;
         allFree = null;
         SavingSilently = LoadingSilently = suppressMarking = false;
     }

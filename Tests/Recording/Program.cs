@@ -24,7 +24,8 @@ Level Reset() {
     MicroblocksQolUtilsModule.Settings = new();
     AutoRecorder.IsRecording = AutoRecorder.CanSaveTransitionTimeline = true;
     AutoRecorder.CurrentPath = "run.mkv"; AutoRecorder.Restored = null;
-    SpeedrunToolSettings.Instance.Enabled = true; TasUtils.Running = false; Engine.FreezeTimer = 0;
+    AutoRecorder.Timeline = new([new("run.mkv",0,12,"music",0)], [new("run.mkv",0,10,"music",0)]);
+    SpeedrunToolSettings.Instance.Enabled = true; SpeedrunToolSettings.Instance.AutoLoadStateAfterDeath = true; TasUtils.Running = false; Engine.FreezeTimer = 0;
     SaveData.Instance = new();
     Level level = new(); Engine.Scene = level; return level;
 }
@@ -214,89 +215,137 @@ try { Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Show(); } catch (InvalidOp
 Check(CapturePresentationGate.AcceptGameplay, "failed progress render poisoned game capture");
 Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = null;
 
-// Manual saves own gameplay, including SRT's own later-installed death hook.
-// Any saved user slot in this room suppresses private saves. Clearing the last one must wait
-// for a normal save trigger, without saving here or reviving an abandoned branch.
-level = Reset(); SaveHere(level); user = StateManager.Instance;
-level.Position = 15; user.SaveStateImpl(false, out _); user.State = State.None;
-Check(level.TimerMarked && level.GoldenMarked && user.Freezes == 1, "manual save behavior changed");
-int manualSuspends = AutoRecorder.ManualSuspends;
+// Native SRT hint is used inside the blocked update, with no intervening QolHud
+// indicator draw. Its extra presents cannot advance the boundary/clean gates.
+level = Reset();
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.NativeEnabled = true;
+int hints = Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Begins;
+int waits = Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Waits;
+int disposes = Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Disposes;
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = () => {
+    Check(!CapturePresentationGate.AcceptGameplay && RecordingPauseAudio.Paused, "native hint escaped audio/video suspension");
+    for (int i = 0; i < 5; i++) RecordingSavePause.Presented(150);
+};
+Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate(); RecordingSavePause.Presented(100);
+RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Begins == hints + 1
+    && Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Disposes == disposes + 1
+    && Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Waits > waits, "SRT did not own save hint and preclone wait");
+Check(RecordingSavePause.Active && !RecordingSavePause.ShowIndicator && RecordingPauseAudio.Paused
+    && RecordingTransitionAutoSave.CanRecover(level), "native hint rendered fallback HUD or released clean gate early");
 Tick();
-Check(SpeedrunToolAutoSave.HasManualState && !RecordingTransitionAutoSave.CanRecover(level)
-    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active, "manual save did not retire private recovery");
-for (int i = 0; i < 3; i++) {
-    level.Position = 99; user.LoadStateImpl(false, out _); user.State = State.None; Tick();
-    Check(level.Position == 15 && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
-        "manual load queued another automatic save");
+Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "native hint leaked the game/audio pause");
+// Missing/unavailable native renderer falls back to the existing indicator.
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = null;
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.NativeEnabled = false;
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.FailBegin = true;
+level = Reset(); Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate(); RecordingSavePause.Presented(100);
+RecordingTransitionAutoSave.AfterEngineUpdate();
+Check(RecordingSavePause.ShowIndicator && !SpeedrunToolAutoSave.HasState, "unavailable SRT UI skipped the fallback indicator");
+Tick(); Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.FailBegin = false;
+Check(RecordingTransitionAutoSave.CanRecover(level), "fallback after native UI failure could not save");
+
+// Branch graph: a1 -> M -> route X -> a2 -> S2, load M -> route Y -> a2' -> S3.
+// Manual slots affect death routing ONLY. Every normal checkpoint still saves.
+level = Reset(); level.Session.RespawnPoint = new(1,0); level.Position = 1;
+SaveHere(level); string a1 = RecordingTransitionAutoSave.CurrentVersionId!;
+var a1Timeline = AutoRecorder.Timeline.Copy();
+void UserSave(string slot, int position, RecordingTimelineSnapshot? timeline = null) {
+    Check(SaveSlotsManager.SwitchSlot(slot), "cannot select user save slot");
+    level.Position = position;
+    if (timeline is not null) AutoRecorder.Timeline = timeline;
+    Check(StateManager.Instance.SaveStateImpl(false, out _), "manual save failed");
+    StateManager.Instance.State = State.None; Tick();
 }
-Check(AutoRecorder.ManualSuspends == manualSuspends + 3, "manual load callbacks did not segment video");
+void UserLoad(string slot) {
+    Check(SaveSlotsManager.SwitchSlot(slot), "cannot select user load slot");
+    Check(StateManager.Instance.LoadStateImpl(false, out _), "manual load failed");
+    StateManager.Instance.State = State.None; Tick();
+}
+RecordingTimelineSnapshot Route(string name, double offset) => new([
+    new("run.mkv",0,10,"shared",0), new("run.mkv",offset,10,name,0)
+]);
+UserSave("M",10,new([new("run.mkv",0,10,"shared",0)]));
+var manualM = StateManager.Instance;
+Check(!RecordingTransitionAutoSave.CanRecover(level) && SpeedrunToolRecoverySlot.Contains(a1),
+    "manual priority deleted the fallback instead of only selecting a death target");
+level.Session.RespawnPoint = new(2,0); level.Position = 20; AutoRecorder.Timeline = Route("X",100);
+Queue(level); Tick(); string a2x = RecordingTransitionAutoSave.CurrentVersionId!;
+Check(a2x != a1 && SpeedrunToolRecoverySlot.Contains(a2x) && !RecordingTransitionAutoSave.CanRecover(level)
+    && StateManager.Instance == manualM, "manual save blocked automatic a2 or changed selection");
+var xPrefix = AutoRecorder.Timeline.Copy();
+UserSave("S2",25);
+UserLoad("M");
+Check(level.Position == 10 && level.Session.RespawnPoint == new Microsoft.Xna.Framework.Vector2(1,0)
+    && RecordingTransitionAutoSave.CurrentVersionId == a1 && AutoRecorder.Restored!.Clips.Count == 1,
+    "loading M used future a2 or failed to restore M's video branch");
+level.Session.RespawnPoint = new(2,0); level.Position = 21; AutoRecorder.Timeline = Route("Y",200);
+Queue(level); Tick(); string a2y = RecordingTransitionAutoSave.CurrentVersionId!;
+Check(a2y != a2x && SpeedrunToolRecoverySlot.Contains(a2x), "new a2 overwrote the version pinned by S2");
+var yPrefix = AutoRecorder.Timeline.Copy(); UserSave("S3",26);
+UserLoad("S2");
+Check(level.Position == 25 && RecordingTransitionAutoSave.CurrentVersionId == a2x
+    && AutoRecorder.Restored!.Clips.SequenceEqual(xPrefix.Clips), "S2 borrowed the newer Y branch");
+StateManager.Instance.ClearStateImpl(false); Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level) && RecordingTransitionAutoSave.CurrentVersionId == a2x,
+    "clearing S2 changed fallback context or ignored its still-valid automatic save");
+level.Position = 99; body = Die(level); body.CallEnd(); Tick();
+Check(body.OriginalCalls == 0 && level.Position == 20 && AutoRecorder.Restored!.Clips.SequenceEqual(xPrefix.Clips),
+    "death after clearing S2 did not restore matching X gameplay and video");
+UserLoad("S3");
+Check(level.Position == 26 && RecordingTransitionAutoSave.CurrentVersionId == a2y, "S3 lost Y fallback");
+// Reusing a slot replaces its reference, not versions pinned by other slots.
+UserSave("S2",27); Tick();
+Check(!SpeedrunToolRecoverySlot.Contains(a2x), "unreferenced superseded X savestate was not collected");
+int versionsBeforeClear = SpeedrunToolRecoverySlot.VersionIds.Count;
+SaveSlotsManager.ClearAll(); Tick();
+Check(SpeedrunToolRecoverySlot.VersionIds.Count == versionsBeforeClear && RecordingTransitionAutoSave.CanRecover(level),
+    "clear-all destroyed auto versions or created an unsolicited save");
+body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 21 && AutoRecorder.Restored!.Clips.SequenceEqual(yPrefix.Clips),
+    "clear-all death combined Y state with X video");
+
+// Loading backwards and clearing M must use a1, never the most recently created a2.
+level = Reset(); level.Position = 1; level.Session.RespawnPoint = new(1,0); SaveHere(level);
+a1 = RecordingTransitionAutoSave.CurrentVersionId!;
+UserSave("M",10); level.Session.RespawnPoint = new(2,0); level.Position = 20; Queue(level); Tick();
+UserLoad("M"); StateManager.Instance.ClearStateImpl(false); Tick();
+Check(RecordingTransitionAutoSave.CurrentVersionId == a1, "clear after rewind selected a future checkpoint");
+body = Die(level); body.CallEnd(); Tick(); Check(level.Position == 1, "rewound death did not restore a1");
+
+// Existing manual state does not suppress recording-start autosave; no auto is
+// created just by clearing a slot when no normal trigger has happened.
+level = Reset(); UserSave("M",10); Tick();
+StateManager.Instance.ClearStateImpl(false); Tick();
+Check(!SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active, "clear without an anchor fabricated a save");
+UserSave("M",10); Queue(level); Tick();
+Check(SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active, "manual slot blocked recording-start autosave");
+
+// Selected slot, not 'any nonempty slot', determines SRT's actual death target.
+SaveSlotsManager.SwitchSlot("empty"); Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level), "an unselected user slot disabled recovery globally");
+SaveSlotsManager.SwitchSlot("M"); SpeedrunToolSettings.Instance.AutoLoadStateAfterDeath = false;
+Check(RecordingTransitionAutoSave.CanRecover(level), "disabled manual autoload still blocked internal recovery");
+SpeedrunToolSettings.Instance.AutoLoadStateAfterDeath = true;
 int delegatedDeaths = 0;
 On.Celeste.PlayerDeadBody.hook_End manualDeathHook = (orig, dead) => {
-    delegatedDeaths++;
-    StateManager.Instance.LoadStateImpl(false, out _);
+    delegatedDeaths++; StateManager.Instance.LoadStateImpl(false,out _);
 };
 On.Celeste.PlayerDeadBody.End += manualDeathHook;
-level.Position = 99; body = Die(level); body.CallEnd();
-Check(delegatedDeaths == 1 && level.Position == 15 && !body.Coroutine.Cancelled
-    && StateManager.Instance.State == State.Waiting && !RecordingSavePause.Active,
-    "private hook hijacked manual death recovery or SRT's wait behavior");
-On.Celeste.PlayerDeadBody.End -= manualDeathHook;
-StateManager.Instance.State = State.None;
-SaveSlotsManager.SwitchSlot("empty-user-slot"); Queue(level); Tick();
-Check(!SpeedrunToolRecoverySlot.HasState && SaveSlotsManager.SlotName == "empty-user-slot",
-    "empty selected slot overrode a manual save in another user slot");
-SaveSlotsManager.ClearAll(); level.Position = 50; Tick();
-for (int i = 0; i < 5; i++) Tick();
-Check(!SpeedrunToolAutoSave.HasManualState && !RecordingTransitionAutoSave.CanRecover(level)
-    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
-    "clearing all user slots created an unsolicited automatic anchor");
-level.Position = 75; body = Die(level); body.CallEnd(); Tick();
-Check(body.OriginalCalls == 1 && !SpeedrunToolRecoverySlot.HasState,
-    "death after clear used an old or unsolicited private snapshot");
-level.Tracker.Player = new(); level.Position = 90;
-level.Session.Level = "next-room"; level.Transitioning = true; Queue(level); Tick();
-Check(!SpeedrunToolRecoverySlot.HasState, "normal transition save ran before transition completed");
-level.Transitioning = false; Tick();
-Check(RecordingTransitionAutoSave.CanRecover(level), "next normal transition did not restore automatic saving");
-level.Position = 120; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 90 && Private().Loads == 1, "normal transition failed to establish the correct recovery point");
+body = Die(level); body.CallEnd();
+Check(delegatedDeaths == 1 && !body.Coroutine.Cancelled && StateManager.Instance.State == State.Waiting,
+    "private recovery intercepted SRT's selected manual death target");
+On.Celeste.PlayerDeadBody.End -= manualDeathHook; StateManager.Instance.State = State.None;
 
-level = Reset(); user = StateManager.Instance;
-level.Position = 20; user.SaveStateImpl(false, out _); user.State = State.None;
-Queue(level); Tick();
-Check(!SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
-    "pre-existing manual save allowed an automatic recording-start save");
-user.ClearStateImpl(false); level.Position = 60; Tick();
-for (int i = 0; i < 5; i++) Tick();
-Check(!RecordingTransitionAutoSave.CanRecover(level) && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
-    "clearing the last individual user slot saved outside the normal rules");
-level.Position = 80; body = Die(level); body.CallEnd(); Tick();
-Check(body.OriginalCalls == 1 && !SpeedrunToolRecoverySlot.HasState, "individual clear enabled private death recovery without a normal save");
-level.Tracker.Player = new(); level.Position = 100;
-level.Session.RespawnPoint = new(100, 100); Queue(level); Tick();
-Check(RecordingTransitionAutoSave.CanRecover(level), "normal respawn-point trigger remained blocked after individual clear");
-level.Position = 120; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 100 && Private().Loads == 1, "normal respawn-point save used the wrong recovery point");
-
-// Cross-room manual slots remain intact but must not disable destination saves.
-level = Reset(); user = StateManager.Instance;
-level.Session.Level = "manual-room"; level.Position = 12;
-user.SaveStateImpl(false, out _); user.State = State.None; Tick();
-level.Transitioning = true;
-RecordingTransitionAutoSave.Queue(level, "automatic-room");
-RecordingTransitionAutoSave.AfterEngineUpdate(); // Session still names departure.
-Check(!RecordingSavePause.Active, "saved before the room transition finished");
-level.Session.Level = "automatic-room"; level.Position = 90;
-level.Transitioning = false; Tick();
-Check(RecordingTransitionAutoSave.CanRecover(level) && user.IsSaved && StateManager.Instance == user,
-    "old-room manual slot blocked destination save or changed user selection");
-level.Position = 120; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 90 && Private().Loads == 1 && user.Loads == 0,
-    "destination death returned to an unrelated manual room");
-user.LoadStateImpl(false, out _); user.State = State.None; Tick();
-Check(level.Session.Level == "manual-room" && level.Position == 12 && SpeedrunToolAutoSave.HasManualState
-    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
-    "explicit manual load lost its room, priority or triggered an automatic save");
+// Cross-room context lives in each manual snapshot too.
+level = Reset(); level.Position = 1; SaveHere(level); UserSave("A",10);
+level.Transitioning = true; RecordingTransitionAutoSave.Queue(level,"B"); RecordingTransitionAutoSave.AfterEngineUpdate();
+level.Session.Level = "B"; level.Position = 30; level.Transitioning = false; Tick();
+string bVersion = RecordingTransitionAutoSave.CurrentVersionId!; UserSave("B",35);
+UserLoad("A"); Check(level.Session.Level == "next" && level.Position == 10, "cross-room user load failed");
+UserLoad("B"); StateManager.Instance.ClearStateImpl(false); Tick();
+body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 30 && RecordingTransitionAutoSave.CurrentVersionId == bVersion, "B fallback used A's branch");
 
 level = Reset(); SaveHere(level); SaveSlotsManager.SwitchSlot("user-2");
 level.Position = 8; body = Die(level); body.CallEnd(); Tick();
@@ -362,8 +411,56 @@ level = Reset(); SaveHere(level); user = StateManager.Instance; Private().Throw 
 body = Die(level); body.CallEnd(); Tick();
 Check(body.OriginalCalls == 1 && !SpeedrunToolAutoSave.LoadingSilently && StateManager.Instance == user,
     "failed death load did not fall back/reset scope/restore selection");
-level = Reset(); SaveHere(level); Private().Reject = true; Queue(level); Tick();
-Check(!RecordingTransitionAutoSave.CanRecover(level), "failed save retained a stale recovery anchor");
+level = Reset(); level.Position = 5; SaveHere(level);
+string previousVersion = RecordingTransitionAutoSave.CurrentVersionId!;
+StateManager.RejectNextSave = true; level.Position = 9; Queue(level); Tick(); Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level) && SpeedrunToolRecoverySlot.Name == previousVersion
+    && SpeedrunToolRecoverySlot.VersionIds.Count == 1, "failed replacement lost the valid version or leaked its failed slot");
+body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 5, "failed replacement redirected death to an incomplete slot");
+level.Session.RespawnPoint = new(4,4); StateManager.RejectNextSave = true; Queue(level); Tick(); Tick();
+Check(!RecordingTransitionAutoSave.CanRecover(level), "failed checkpoint save reused a mismatched previous checkpoint");
+
+// Completion callbacks stage snapshots; failed operations must never publish
+// their timeline/context, even after SRT has invoked the callbacks.
+foreach (bool throws in new[] { false, true }) {
+    level = Reset(); SaveHere(level); UserSave("failed-load", 10, Route("saved",100));
+    StateManager failed = StateManager.Instance;
+    AutoRecorder.Timeline = Route("current",200); AutoRecorder.Restored = null;
+    var before = AutoRecorder.Timeline.Copy();
+    string? beforeContext = RecordingTransitionAutoSave.CurrentVersionId;
+    failed.ThrowAfterCallback = throws; failed.RejectAfterCallback = !throws;
+    try { Check(!failed.LoadStateImpl(false,out _), "failed manual load reported success"); }
+    catch (InvalidOperationException) when (throws) { }
+    failed.State = State.None;
+    Check(AutoRecorder.Restored is null && AutoRecorder.Timeline.Clips.SequenceEqual(before.Clips)
+        && RecordingTransitionAutoSave.CurrentVersionId == beforeContext, "failed callback transaction committed a video/fallback branch");
+    failed.ThrowAfterCallback = failed.RejectAfterCallback = false;
+    failed.ClearStateImpl(false);
+    // Same transaction rule applies to the private death target.
+    var automatic = Private(); automatic.ThrowAfterCallback = throws; automatic.RejectAfterCallback = !throws;
+    Check(SpeedrunToolAutoSave.TryLoad(level) == RecoveryResult.Failed && AutoRecorder.Restored is null,
+        "failed private load committed its staged prefix");
+    automatic.ThrowAfterCallback = automatic.RejectAfterCallback = false;
+}
+// A save rejected before callbacks keeps the old slot reference; one rejected
+// after overwriting clears it, allowing an obsolete automatic version to die.
+level = Reset(); SaveHere(level); previousVersion = RecordingTransitionAutoSave.CurrentVersionId!;
+UserSave("overwrite",10); var overwrite = StateManager.Instance;
+Queue(level); Tick(); string replacement = RecordingTransitionAutoSave.CurrentVersionId!;
+overwrite.Reject = true;
+Check(!overwrite.SaveStateImpl(false,out _), "rejected save succeeded"); Tick();
+Check(SpeedrunToolRecoverySlot.Contains(previousVersion), "pre-callback rejection unpinned the intact manual save");
+overwrite.Reject = false; overwrite.RejectAfterCallback = true;
+Check(!overwrite.SaveStateImpl(false,out _), "post-callback rejection succeeded"); Tick();
+Check(!SpeedrunToolRecoverySlot.Contains(previousVersion) && SpeedrunToolRecoverySlot.Contains(replacement),
+    "failed overwrite retained an obsolete root or removed the live version");
+overwrite.RejectAfterCallback = false;
+// A failed preclone cannot publish a new version or destroy its predecessor.
+level = Reset(); SaveHere(level); previousVersion = RecordingTransitionAutoSave.CurrentVersionId!;
+StateManager.FailClone = true; Queue(level); Tick(); StateManager.FailClone = false; Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level) && SpeedrunToolRecoverySlot.Name == previousVersion
+    && SpeedrunToolRecoverySlot.VersionIds.Count == 1, "failed preclone replaced/leaked a private version");
 level = Reset(); SaveHere(level); AutoRecorder.IsRecording = false; Tick();
 Check(!SaveSlotsManager.Dictionary.ContainsKey(SpeedrunToolRecoverySlot.Name), "stopping recording leaked the private slot");
 
@@ -396,8 +493,9 @@ public static class TestExports {
         Action<Dictionary<Type, Dictionary<string, object>>, Level>? load,
         Action? clear, Action<Level>? beforeSave, Action<Level>? beforeLoad, Action? preClone) {
         SaveLoadAction.Save = save; SaveLoadAction.Load = load;
+        SaveLoadAction.Clear = clear;
         SaveLoadAction.BeforeSave = beforeSave; SaveLoadAction.BeforeLoad = beforeLoad;
         return new SaveLoadAction();
     }
-    public static void Unregister(object registration) => SaveLoadAction.Save = SaveLoadAction.Load = null;
+    public static void Unregister(object registration) { SaveLoadAction.Save = SaveLoadAction.Load = null; SaveLoadAction.Clear = null; }
 }

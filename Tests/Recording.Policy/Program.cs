@@ -134,9 +134,10 @@ Check(tail.BgmFollowsVideo && tail.RoomName == "cassette" && tail.SeamlessFromPr
 var shortRoom = clip with { DurationSeconds = .01 };
 var recent = (List<RecordingClip>)Call("CaptureRecentClips", new RecordingClip[] { shortRoom, tail }, 2d)!;
 Check(recent.Count == 2 && recent[0] == shortRoom, "death replay trimming dropped a short sensitive room");
-var snapshot = new RecordingTimelineSnapshot([clip], [tail]).Copy();
+var snapshot = new RecordingTimelineSnapshot([clip], [tail], "version-A", "run.mkv").Copy();
 var restored = JsonSerializer.Deserialize<RecordingTimelineSnapshot>(JsonSerializer.Serialize(snapshot))!;
-Check(restored.Clips[0] == clip && restored.RespawnAnchorClips![0] == tail,
+Check(restored.Clips[0] == clip && restored.RespawnAnchorClips![0] == tail
+    && restored.RecoveryVersionId == "version-A" && restored.RecordingSource == "run.mkv",
     "snapshot/respawn anchor serialization lost room metadata");
 var legacy = JsonSerializer.Deserialize<RecordingClip>("""
     {"Source":"run.mkv","StartSeconds":0,"DurationSeconds":1,"MusicEvent":"","MusicTimelineMilliseconds":0}

@@ -38,6 +38,7 @@ public static class AutoRecorder {
     private static string areaSid = "";
     private static bool branchActive;
     private static bool waitingForStablePlayer;
+    private static bool pendingDeathBranch;
     private static bool resumeFromSavedState;
     private static bool manualSlSuspended;
     private static bool manualSlSeamless;
@@ -276,6 +277,9 @@ public static class AutoRecorder {
     private static void RequestStop(Level? level, bool save) {
         if (pendingRecordingStop is not null || current is null) return;
         // Freeze the timeline now, but detach FMOD only after EntityList.Update.
+        // Stopping before any respawn/load resolves the death as an ordinary
+        // failed attempt, rather than exporting its temporarily retained prefix.
+        ResolvePendingDeathBranch();
         List<RecordingClip> clips = CaptureCurrentClips(current);
         ActivePrefix.Clear();
         ActivePrefix.AddRange(clips);
@@ -335,18 +339,26 @@ public static class AutoRecorder {
         }
         return new RecordingTimelineSnapshot(
             CaptureCurrentClips(recording),
-            respawnAnchor?.Clips.ToArray()
-        );
+            respawnAnchor?.Clips.ToArray(),
+            RecordingTransitionAutoSave.CurrentVersionId,
+            recording.Path
+        ).Copy();
     }
 
-    public static void RestoreTimeline(Level level, RecordingTimelineSnapshot snapshot) {
+    public static void RestoreTimeline(Level level, RecordingTimelineSnapshot snapshot) => TryRestoreTimeline(level, snapshot);
+
+    internal static bool TryRestoreTimeline(Level level, RecordingTimelineSnapshot snapshot) {
         NativeRoomRecording? recording = current;
-        if (recording is null || pendingRecordingStop is not null) return;
-        if (!string.Equals(RunKey(level), runKey, StringComparison.Ordinal)) return;
-        if (snapshot.Clips.Any(clip => !string.Equals(clip.Source, recording.Path, StringComparison.OrdinalIgnoreCase))) {
+        if (recording is null || pendingRecordingStop is not null) return false;
+        if (!string.Equals(RunKey(level), runKey, StringComparison.Ordinal)) return false;
+        if (snapshot.RecordingSource is { } source && !string.Equals(source, recording.Path, StringComparison.OrdinalIgnoreCase)
+            || snapshot.RecordingSource is null && snapshot.Clips.Count == 0
+            || snapshot.Clips.Any(clip => !string.Equals(clip.Source, recording.Path, StringComparison.OrdinalIgnoreCase))
+            || snapshot.RespawnAnchorClips?.Any(clip => !string.Equals(clip.Source, recording.Path, StringComparison.OrdinalIgnoreCase)) is true) {
             Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder", "Ignored SpeedrunTool timeline from another recording session.");
-            return;
+            return false;
         }
+        pendingDeathBranch = false;
         ActivePrefix.Clear();
         ActivePrefix.AddRange(snapshot.Clips);
         RecordingDeathAudio.StopRemainder();
@@ -360,6 +372,19 @@ public static class AutoRecorder {
         transitioningRoom = false;
         resumeFromSavedState = true;
         observedRespawnPoint = level.Session.RespawnPoint;
+        return true;
+    }
+
+    internal static void BreakForUntrackedLoad(Level level) {
+        if (current is null) return;
+        // There is no recorded route to this state. Start a new prefix instead
+        // of fabricating a seamless connection from an unrelated recording.
+        ActivePrefix.Clear(); respawnAnchor = null;
+        branchActive = false; waitingForStablePlayer = true;
+        resumeFromSavedState = false; pendingDeathBranch = false;
+        transitioningRoom = false;
+        observedRespawnPoint = level.Session.RespawnPoint;
+        Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder", "Loaded state has no matching recording prefix; starting a discontinuous recording segment.");
     }
 
     private static PlayerDeadBody? PlayerDie(
@@ -396,9 +421,10 @@ public static class AutoRecorder {
             RecordingTransitionAutoSave.Reset();
             return body;
         }
-        ActivePrefix.Clear();
+        // Retain the old prefix until the actual load succeeds. Normal respawn
+        // fallback resolves this pending cut when its playable branch starts.
+        pendingDeathBranch = true;
         resumeFromSavedState = false;
-        if (respawnAnchor is not null) ActivePrefix.AddRange(respawnAnchor.Clips);
         branchActive = false;
         branchSeamlessFromPrevious = false;
         waitingForStablePlayer = true;
@@ -518,6 +544,7 @@ public static class AutoRecorder {
     private static void StartBranchAtCurrentTime(bool seamlessFromPrevious = false) {
         NativeRoomRecording? recording = current;
         if (recording is null) return;
+        ResolvePendingDeathBranch();
         if (waitingForStablePlayer) RecordingDeathAudio.StopRemainder();
         branchStartSeconds = recording.TimelineTimeSeconds;
         branchMusicStart = MusicPosition.Read();
@@ -527,6 +554,13 @@ public static class AutoRecorder {
         branchActive = true;
         waitingForStablePlayer = false;
         resumeFromSavedState = false;
+    }
+
+    private static void ResolvePendingDeathBranch() {
+        if (!pendingDeathBranch) return;
+        ActivePrefix.Clear();
+        if (respawnAnchor is not null) ActivePrefix.AddRange(respawnAnchor.Clips);
+        pendingDeathBranch = false;
     }
 
     private static void StartDeathReplayBranchAtCurrentTime(bool seamlessFromPrevious = false) {
@@ -1115,6 +1149,7 @@ public static class AutoRecorder {
     }
 
     private static void ResetFullRecordingState() {
+        pendingDeathBranch = false;
         resumeFromSavedState = false;
         RecordingTransitionAutoSave.Reset();
         ActivePrefix.Clear();

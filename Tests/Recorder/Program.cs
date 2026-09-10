@@ -203,6 +203,58 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==20
         && clips[1].SeamlessFromPrevious,"repeated recovery retained failed gameplay or used resume wall time/crossfade");
 }
+// Saved branches contain immutable edit references to one append-only source.
+// Loading/clearing game slots must not recycle the source backing older routes.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(2);
+    var shared=AutoRecorder.CaptureTimeline(l)!;
+    var source=NativeRoomRecording.Started.Single();
+    Check(shared.RecordingSource==source.Path,"snapshot omitted its source identity");
+    Check(shared.Clips is System.Collections.Generic.ICollection<RecordingClip> { IsReadOnly:true },"captured prefix is mutable");
+    Advance(3); var x=AutoRecorder.CaptureTimeline(l)!;
+    Check(AutoRecorder.TryRestoreTimeline(l,shared),"shared branch restore failed"); Tick(l); Advance(4);
+    var y=AutoRecorder.CaptureTimeline(l)!;
+    Check(x.Clips.Sum(c=>c.DurationSeconds)==5 && y.Clips.Sum(c=>c.DurationSeconds)==6,
+        "branch creation mutated the previous saved prefix");
+    Check(NativeRoomRecording.Started.Count==1 && !source.Stopped
+        && y.Clips.All(c=>c.Source==source.Path),"branching duplicated/stopped the footage source");
+    Check(AutoRecorder.TryRestoreTimeline(l,x),"older X prefix was discarded by Y"); Tick(l); Advance(1);
+    AutoRecorder.StopManual(l,true); Tick(l);
+    var clips=NativeRecordingFinalizer.Jobs.Single().Clips;
+    Check(clips.Sum(c=>c.DurationSeconds)==6 && clips.All(c=>c.Source==source.Path),"export selected Y instead of restored X");
+    Check(clips.Last().SeamlessFromPrevious,"restored branch lost its hard-cut boundary");
+}
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(2);
+    var saved=AutoRecorder.CaptureTimeline(l)!;
+    Check(!AutoRecorder.TryRestoreTimeline(l,new([],RecordingSource:"previous-run.mkv")),"empty old-session prefix accepted");
+    Check(!AutoRecorder.TryRestoreTimeline(l,new([])),"unidentified empty prefix accepted");
+    Check(!AutoRecorder.TryRestoreTimeline(l,saved with { RespawnAnchorClips=[new("other.mkv",0,1,"",0)] }),
+        "foreign respawn prefix accepted");
+    Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"invalid load changed the live prefix");
+    AutoRecorder.BreakForUntrackedLoad(l); Tick(l); Advance(1);
+    var fresh=AutoRecorder.CaptureTimeline(l)!;
+    Check(fresh.Clips.Count==1 && fresh.Clips[0].DurationSeconds==1 && !fresh.Clips[0].SeamlessFromPrevious,
+        "unknown load fabricated continuity with unrelated gameplay");
+}
+// Stop while still dead must not export the temporarily retained failed route.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter); Tick(l); Advance(2);
+    AutoRecorder.SuspendForInternalSave(100); Advance(1); AutoRecorder.ResumeAfterInternalSave(200);
+    Advance(4); AutoRecorder.SuspendForManualSl(); AutoRecorder.ManualSlPresented(300);
+    Advance(1); On.Celeste.Player.Raise(p);
+    AutoRecorder.StopManual(l,true); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Single().Clips.Sum(c=>c.DurationSeconds)==2,
+        "stop during pending death exported a failed branch");
+}
+// Copies isolate both the successful-prefix and normal-respawn-prefix arrays.
+{
+    var clips=new List<RecordingClip>{new("source",0,1,"",0)};
+    var copy=new RecordingTimelineSnapshot(clips,clips,"auto-version","source").Copy();
+    clips.Clear();
+    Check(copy.Clips.Count==1 && copy.RespawnAnchorClips!.Count==1 && copy.RecoveryVersionId=="auto-version"
+        && copy.RecordingSource=="source","snapshot copy aliased a mutable list or lost context");
+}
 foreach(var mode in new[]{AutoRecordingMode.Off,AutoRecordingMode.Chapter}) {
     var(l,p,b)=Begin(mode);if(mode==AutoRecordingMode.Off)AutoRecorder.StartManual();Tick(l);Advance(5);
     On.Celeste.Player.Raise(p);Tick(l);p.Dead=false;Tick(l);Advance(2);AutoRecorder.StopManual(l,true);Tick(l);

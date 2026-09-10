@@ -163,16 +163,21 @@ While full recording is active (including manual recording), it saves the game a
 timeline into a dedicated internal SpeedrunTool slot after each room transition. Normal same-room
 deaths load that slot automatically; golden chapter restarts and custom death actions are not
 intercepted. Recording start and respawn-point changes also refresh the recovery point.
-**Any user save in the current room disables internal automatic saves and loads**, even when an empty slot is selected.
-Saves in other rooms remain intact but do not block normal automatic saves in a new room; explicit manual loads remain SRT-owned.
+**Manual saves affect only the death target, never normal automatic-save triggers.** If the selected user slot has a valid
+save and SRT's death auto-load is enabled, SRT owns recovery. Otherwise, the current branch's automatic version is used
+when valid, never a different branch or a future checkpoint.
 SRT alone handles manual-slot death recovery; its waits, wipes and input behavior are unchanged.
 We only segment video and restore valid saved recording prefixes, preferring hard cuts for those joins.
 SRT progress-only presentations never enter frame acquisition or advance recovery gates; their wait time is cut too, including clear/GC operations.
-Clearing the last user save only lifts the block: automatic saves still require a normal recording-start,
-room-transition or respawn-point-change trigger. It neither saves immediately nor reuses the old internal state.
-Internal saving freezes gameplay with a saving indicator until clean resume frames reach the recordings.
+Each user slot binds an immutable video prefix and its automatic fallback version. Overwriting/clearing slots only changes
+references; it never immediately saves, loads, or replaces the active video branch.
+Internal saving freezes gameplay until clean resume frames reach both recordings. It reuses SRT's save/preclone indicator
+when available, with our own indicator only as a fallback.
+Video/audio sources live on disk under `.working/<area>` in the recording directory. Branches share these files; RAM holds
+buffers, edit references and retained game snapshots. Branch restoration is limited to the same full-recording session;
+loading an older save without matching footage starts a fresh prefix rather than fabricating a seamless connection.
 It preserves user slots/selection, existing marks and normal death/time statistics, adds no timer/golden-berry
-marks, and does not require SRT's death-auto-load setting. Stopping recording/disabling the feature releases the slot.
+marks, and does not require SRT's death-auto-load setting for private recovery. Stopping recording/disabling the feature releases private versions.
 Death-replay-only capture, disabled/missing/incompatible SRT, active TAS and TAS-owned selected
 slots are skipped safely.
 

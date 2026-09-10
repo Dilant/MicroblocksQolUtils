@@ -23,10 +23,14 @@ public sealed record RecordingClip(
 
 public sealed record RecordingTimelineSnapshot(
     IReadOnlyList<RecordingClip> Clips,
-    IReadOnlyList<RecordingClip>? RespawnAnchorClips = null
+    IReadOnlyList<RecordingClip>? RespawnAnchorClips = null,
+    string? RecoveryVersionId = null,
+    string? RecordingSource = null
 ) {
     public RecordingTimelineSnapshot Copy() => new(
-        Clips.ToArray(),
-        RespawnAnchorClips?.ToArray()
+        Array.AsReadOnly(Clips.ToArray()),
+        RespawnAnchorClips is null ? null : Array.AsReadOnly(RespawnAnchorClips.ToArray()),
+        RecoveryVersionId,
+        RecordingSource
     );
 }

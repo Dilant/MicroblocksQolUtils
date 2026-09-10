@@ -126,18 +126,25 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static RecordingTimelineSnapshot? Restored;
         public static RecordingTimelineSnapshot CaptureTimeline(Level level) => Timeline.Copy();
         public static void RestoreTimeline(Level level, RecordingTimelineSnapshot snapshot) => Restored = snapshot;
+        public static bool TryRestoreTimeline(Level level, RecordingTimelineSnapshot snapshot) {
+            if (snapshot.RecordingSource != CurrentPath) return false;
+            Restored = snapshot; Timeline = snapshot.Copy(); return true;
+        }
+        public static void BreakForUntrackedLoad(Level level) { Restored = null; Timeline = new([]); }
     }
 }
 namespace Celeste.Mod.SpeedrunTool {
     public class SpeedrunToolSettings {
         public static SpeedrunToolSettings Instance { get; } = new();
         public bool Enabled { get; set; } = true;
+        public bool AutoLoadStateAfterDeath { get; set; } = true;
     }
 }
 namespace Celeste.Mod.SpeedrunTool.ModInterop { public static class TasUtils { public static bool Running { get; set; } } }
 namespace Celeste.Mod.SpeedrunTool.SaveLoad {
     public enum State { None, Saving, Loading, Waiting }
     public class SaveLoadAction {
+        public static Action? Clear;
         public static Action<Dictionary<Type, Dictionary<string, object>>, Level>? Save, Load;
         public static Action<Level>? BeforeSave, BeforeLoad;
     }
@@ -166,7 +173,8 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         public bool SavedByTas { get; set; }
         public bool IsSaved { get; private set; }
         public int Saves, Loads, Clones, Freezes;
-        public bool Throw, Reject;
+        public bool Throw, Reject, ThrowAfterCallback, RejectAfterCallback;
+        public static bool RejectNextSave;
         public Task? preCloneTask;
         public string? PreCloneObservedSlot;
         public Dictionary<Type, Dictionary<string, object>> Values = [];
@@ -178,6 +186,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         [MethodImpl(MethodImplOptions.NoInlining)]
         public bool SaveStateImpl(bool tas, out string popup) {
             popup = "test";
+            if (RejectNextSave) { RejectNextSave = false; return false; }
             if (Reject) return false;
             SavedByTas = tas; State = State.Saving;
             if (Throw) throw new InvalidOperationException("expected failure");
@@ -190,6 +199,8 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             IsSaved = true;
             Utils.StateMarkUtils.ReColor(Values, level);
             SaveLoadAction.Save?.Invoke(Values, level);
+            if (ThrowAfterCallback) throw new InvalidOperationException("expected post-save failure");
+            if (RejectAfterCallback) { ClearStateImpl(false); return false; }
             PreCloneSavedEntities();
             if (tas) State = State.None;
             else { Freezes++; State = State.Waiting; }
@@ -208,6 +219,8 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             level.Tracker.Player = new();
             Utils.StateMarkUtils.ReColor(Values, level);
             SaveLoadAction.Load?.Invoke(Values, level);
+            if (ThrowAfterCallback) throw new InvalidOperationException("expected post-load failure");
+            if (RejectAfterCallback) { State = State.None; return false; }
             PreCloneSavedEntities();
             if (tas) LoadStateComplete(level);
             else { Freezes++; State = State.Waiting; }
@@ -227,7 +240,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         public static bool FailClone;
         private void LoadStateComplete(Level level) => State = State.None;
         public bool ClearStateImpl(bool gc) {
-            preCloneTask?.Wait(); IsSaved = false; savedSession = null; Values.Clear(); State = State.None; return true;
+            preCloneTask?.Wait(); IsSaved = false; savedSession = null; Values.Clear(); State = State.None; SaveLoadAction.Clear?.Invoke(); return true;
         }
     }
 }

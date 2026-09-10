@@ -84,6 +84,18 @@ internal static class RecordingSavePause {
             Cancel();
             return;
         }
+        if (phase == Phase.Indicator) {
+            // Boundary has already been presented and video/audio are suspended.
+            // If SRT can render hints, let it own both the clone and wait UI in
+            // this blocked update. No QolHud draw occurs between these scopes.
+            using IDisposable? nativeIndicator = SpeedrunToolProgress.BeginSaveIndicator();
+            if (nativeIndicator is not null) {
+                phase = Phase.Save;
+                Finish(SpeedrunToolAutoSave.TrySave(deferPreClone: false));
+                return;
+            }
+            // Old SRT/TAS/render-unavailable: show our normal fallback next draw.
+        }
         if (phase == Phase.Save) {
             RecoveryResult result = SpeedrunToolAutoSave.TrySave(deferPreClone: true);
             if (result == RecoveryResult.Success) phase = Phase.Cloning;
