@@ -188,8 +188,8 @@ Engine.Scene = new Level(); RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "scene switch leaked the recovery gate");
 
 // Manual saves own gameplay, including SRT's own later-installed death hook.
-// Any saved user slot suppresses private saves; clearing the last one takes a
-// NEW snapshot at current state instead of reviving an abandoned private branch.
+// Any saved user slot suppresses private saves. Clearing the last one must wait
+// for a normal save trigger, without saving here or reviving an abandoned branch.
 level = Reset(); SaveHere(level); user = StateManager.Instance;
 level.Position = 15; user.SaveStateImpl(false, out _); user.State = State.None;
 Check(level.TimerMarked && level.GoldenMarked && user.Freezes == 1, "manual save behavior changed");
@@ -219,10 +219,20 @@ SaveSlotsManager.SwitchSlot("empty-user-slot"); Queue(level); Tick();
 Check(!SpeedrunToolRecoverySlot.HasState && SaveSlotsManager.SlotName == "empty-user-slot",
     "empty selected slot overrode a manual save in another user slot");
 SaveSlotsManager.ClearAll(); level.Position = 50; Tick();
-Check(!SpeedrunToolAutoSave.HasManualState && RecordingTransitionAutoSave.CanRecover(level),
-    "clearing all user slots did not re-enable a fresh automatic anchor");
+for (int i = 0; i < 5; i++) Tick();
+Check(!SpeedrunToolAutoSave.HasManualState && !RecordingTransitionAutoSave.CanRecover(level)
+    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
+    "clearing all user slots created an unsolicited automatic anchor");
 level.Position = 75; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 50 && Private().Loads == 1, "clear resurrected the pre-manual private snapshot");
+Check(body.OriginalCalls == 1 && !SpeedrunToolRecoverySlot.HasState,
+    "death after clear used an old or unsolicited private snapshot");
+level.Tracker.Player = new(); level.Position = 90;
+level.Session.Level = "next-room"; level.Transitioning = true; Queue(level); Tick();
+Check(!SpeedrunToolRecoverySlot.HasState, "normal transition save ran before transition completed");
+level.Transitioning = false; Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level), "next normal transition did not restore automatic saving");
+level.Position = 120; body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 90 && Private().Loads == 1, "normal transition failed to establish the correct recovery point");
 
 level = Reset(); user = StateManager.Instance;
 level.Position = 20; user.SaveStateImpl(false, out _); user.State = State.None;
@@ -230,9 +240,16 @@ Queue(level); Tick();
 Check(!SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
     "pre-existing manual save allowed an automatic recording-start save");
 user.ClearStateImpl(false); level.Position = 60; Tick();
-Check(RecordingTransitionAutoSave.CanRecover(level), "clearing the last individual user slot did not establish a fresh anchor");
+for (int i = 0; i < 5; i++) Tick();
+Check(!RecordingTransitionAutoSave.CanRecover(level) && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
+    "clearing the last individual user slot saved outside the normal rules");
 level.Position = 80; body = Die(level); body.CallEnd(); Tick();
-Check(level.Position == 60, "individual clear recovered an old branch instead of the current-state anchor");
+Check(body.OriginalCalls == 1 && !SpeedrunToolRecoverySlot.HasState, "individual clear enabled private death recovery without a normal save");
+level.Tracker.Player = new(); level.Position = 100;
+level.Session.RespawnPoint = new(100, 100); Queue(level); Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level), "normal respawn-point trigger remained blocked after individual clear");
+level.Position = 120; body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 100 && Private().Loads == 1, "normal respawn-point save used the wrong recovery point");
 
 level = Reset(); SaveHere(level); SaveSlotsManager.SwitchSlot("user-2");
 level.Position = 8; body = Die(level); body.CallEnd(); Tick();

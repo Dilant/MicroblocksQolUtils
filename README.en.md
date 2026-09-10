@@ -163,7 +163,8 @@ intercepted. Recording start and respawn-point changes also refresh the recovery
 **Any saved user slot disables internal automatic saves and loads**, even when an empty slot is selected.
 SRT alone handles manual-slot death recovery; its waits, wipes and input behavior are unchanged.
 We only segment video and restore valid saved recording prefixes, preferring hard cuts for those joins.
-Clearing the last user save creates a fresh internal recovery point at the current state, never the old branch.
+Clearing the last user save only lifts the block: automatic saves still require a normal recording-start,
+room-transition or respawn-point-change trigger. It neither saves immediately nor reuses the old internal state.
 Internal saving freezes gameplay with a saving indicator until clean resume frames reach the recordings.
 It preserves user slots/selection, existing marks and normal death/time statistics, adds no timer/golden-berry
 marks, and does not require SRT's death-auto-load setting. Stopping recording/disabling the feature releases the slot.

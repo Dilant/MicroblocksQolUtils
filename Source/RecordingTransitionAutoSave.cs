@@ -8,7 +8,6 @@ internal static class RecordingTransitionAutoSave {
     private static Session? pendingSession;
     private static string pendingRoom = "";
     private static RecoveryAnchor? anchor;
-    private static bool manualOwned;
 
     internal static bool Enabled => MicroblocksQolUtilsModule.Settings.Enabled
         && MicroblocksQolUtilsModule.Settings.RecordingAutoSaveOnTransition && AutoRecorder.IsRecording;
@@ -45,7 +44,6 @@ internal static class RecordingTransitionAutoSave {
 
     internal static void AfterEngineUpdate() {
         if (SpeedrunToolAutoSave.HasManualState) {
-            manualOwned = true;
             Reset();
             // Do not block/wait inside SRT's save/load callbacks. Once the user
             // operation is idle, retire the now-obsolete private snapshot.
@@ -57,17 +55,12 @@ internal static class RecordingTransitionAutoSave {
             return;
         }
         if (!Enabled || Engine.Scene is not Level) {
-            manualOwned = false;
             Reset();
             SpeedrunToolRecoverySlot.Release();
             return;
         }
-        if (manualOwned && Engine.Scene is Level resumed) {
-            manualOwned = false;
-            // All user saves were cleared: take a fresh anchor at CURRENT state,
-            // never revive a private snapshot from before the manual SL branch.
-            Queue(resumed, resumed.Session.Level);
-        }
+        // Clearing user slots is not a save trigger. Wait for the existing
+        // recording-start, room-transition or respawn-point-change requests.
         if (pendingLevel is not { } level) return;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
         Player? player = level.Tracker.GetEntity<Player>();

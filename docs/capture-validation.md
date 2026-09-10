@@ -292,7 +292,8 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   MotionSmoothing 显示位置固定在当前物理样本，避免保存耗时外推和 catch-up 多步跳跃。
 - Recording **132 assertions**：30 次补步只放行一次、无采集回调时普通绘制解除恢复门、任意用户档优先、
   连续手动 load 不创建内部档、SRT 自己的死亡 hook/Waiting/协程不被抢占、选中空槽仍尊重其他槽，
-  清全部及最后单独一槽后从当前状态重新保存。既有无标记、统计保留、失败回退等测试继续通过。
+  当时清全部及最后单独一槽后从当前状态重新保存（此策略已由下述“清档遵循原有触发规则”修正）。
+  既有无标记、统计保留、失败回退等测试继续通过。
 - Recorder **113 checks**：手动 SL 只分段视频，排除等待和失败尝试，有效前缀硬切，
   录制前的手动 save 不阻塞启动录制，切面晚于 HUD 结束也在同一 tick 安排保存。
 - 实际 MotionSmoothing Cache DLL **26 checks**：故意注入过时镜头显示坐标，冻结后匹配物理位置，
@@ -302,6 +303,14 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   1.5s 死亡回放快速最终化 **52.1ms**，输出 MP4 完整解码通过。此次不改 native 最终化路径。
   这些是 160×90 小画面数据，不代表用户分辨率或游戏负载下的耗时。证据在 `.work/manual-sl-priority/.work/`。
 - 自动测试不替代用户模组组合下重新录制的实机验收；手动 SL 不采用内部冻结确认门，不承诺任意 GPU/队列负载下零丢帧。
+
+### 2026-09-10：清档遵循原有触发规则
+
+- 按用户纠正，移除“清空最后一个手动档后立即在当前位置补存”的逻辑。
+  清档只解除手动档优先限制，仍由录制开始、切面或复活点变化发起保存；不复用旧内部档。
+- 新回归在修复前明确失败于“清全部后创建未请求的自动档”；修复后 Recording **137 assertions** 通过：
+  清全部/最后单槽后连续更新均不补存，正常保存前死亡不被内部档接管，下一次切面或复活点变化仍可保存并正确恢复。
+  保存暂停、手动 SL 优先和死亡回放实现未改动。证据在 `.work/manual-sl-clear-rules/.work/`。
 
 ## 平台与功能限制
 
