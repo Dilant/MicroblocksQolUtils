@@ -45,6 +45,7 @@ try {
     SpeedrunToolAutoSave.Unload();
 }
 HookCompatibility.Verify(srt);
+ProgressCompatibility.Verify(srt);
 
 [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
 static void VerifyDefaultSetting() {

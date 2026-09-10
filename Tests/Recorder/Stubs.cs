@@ -15,6 +15,7 @@ namespace Celeste {
     public class Level : Scene {
         public Tracker Tracker = new(); public EntityList Entities = new(); public Session Session = new();
         public bool Paused, Transitioning, Completed;
+        public ScreenWipe? Wipe;
     }
     public class Session { public AreaKey Area = new(); public Vector2? RespawnPoint; public object MapData = new(); public string Level = "room"; }
     public class AreaKey { public string SID = "test/chapter"; public int Mode; }
@@ -70,6 +71,7 @@ namespace Celeste.Mod {
     } } }
 }
 namespace Celeste.Mod.MicroblocksQolUtils {
+    public static class RecordingSavePause { public static bool Active; }
     public enum BgmRecordingMode { CaptureGameMix, SfxOnlyWithPostMix }
     public class QolSettings {
         public AutoRecordingMode AutomaticRecording;

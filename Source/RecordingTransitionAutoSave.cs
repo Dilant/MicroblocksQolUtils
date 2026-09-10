@@ -24,7 +24,7 @@ internal static class RecordingTransitionAutoSave {
         anchor = null;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
         if (!settings.Enabled || !settings.RecordingAutoSaveOnTransition || !AutoRecorder.IsRecording
-            || SpeedrunToolAutoSave.HasManualState) return;
+            || SpeedrunToolRecoverySlot.HasUserStateIn(level, room)) return;
         pendingLevel = level;
         pendingSession = level.Session;
         pendingRoom = room;
@@ -43,6 +43,10 @@ internal static class RecordingTransitionAutoSave {
     }
 
     internal static void AfterEngineUpdate() {
+        // TransitionTo queues the destination while Session.Level may still name
+        // the departure room. Its manual save must not erase the pending request.
+        if (pendingLevel is { Transitioning: true } transitioning
+            && ReferenceEquals(Engine.Scene, transitioning)) return;
         if (SpeedrunToolAutoSave.HasManualState) {
             Reset();
             // Do not block/wait inside SRT's save/load callbacks. Once the user

@@ -107,7 +107,7 @@ internal static class SdlFrameSource {
                 string title = Marshal.PtrToStringUTF8(SDL_GetWindowTitle(value)) ?? "";
                 if (title.StartsWith("Celeste", StringComparison.OrdinalIgnoreCase)) window = value;
             }
-            if (value == window) {
+            if (value == window && CapturePresentationGate.AcceptGameplay) {
                 Backend = "OpenGL";
                 Volatile.Write(ref lastPresentAt, Environment.TickCount64);
                 bool enabled = CaptureSource.WantsPixels && failure is null;
@@ -136,7 +136,7 @@ internal static class SdlFrameSource {
         if (trace) Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Capture", $"DXGI entry chain={chain:X} window={window:X}");
         try {
             // DXGI_PRESENT_TEST is an occlusion query, not a presented frame.
-            if ((flags & 1) == 0) {
+            if ((flags & 1) == 0 && CapturePresentationGate.AcceptGameplay) {
                 if (window == 0) {
                     for (uint id = 1; id <= 64; id++) {
                         nint candidate = SDL_GetWindowFromID(id);

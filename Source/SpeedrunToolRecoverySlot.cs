@@ -12,7 +12,7 @@ internal static class SpeedrunToolRecoverySlot {
     private const BindingFlags Static = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
     private const BindingFlags Instance = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
     internal static string Name { get; } = "MicroblocksQolUtils.Recording." + Guid.NewGuid().ToString("N");
-    private static FieldInfo? dictionary, currentSlot, slotManager, preClone;
+    private static FieldInfo? dictionary, currentSlot, slotManager, preClone, savedLevel;
     private static PropertyInfo? currentName, state, isSaved;
     private static MethodInfo? clear;
     private static Func<string, bool>? switchSlot;
@@ -26,10 +26,27 @@ internal static class SpeedrunToolRecoverySlot {
     internal static bool HasState => ownedSlot is not null && ReferenceEquals(Slots[Name], ownedSlot)
         && isSaved!.GetValue(slotManager!.GetValue(ownedSlot)) is true;
 
-    // Any user slot takes precedence, even if an empty slot is currently selected.
+    // Any user slot in THIS room takes precedence, even if an empty slot is selected.
     // Never switch slots to inspect them, and never count our leased slot as manual.
     internal static bool HasUserState => dictionary is not null && Slots.Values.Cast<object>()
         .Any(slot => !ReferenceEquals(slot, ownedSlot) && isSaved!.GetValue(slotManager!.GetValue(slot)) is true);
+
+    internal static bool HasUserStateIn(Level? level, string? room = null) {
+        if (level is null) return HasUserState;
+        if (dictionary is null) return false;
+        foreach (object slot in Slots.Values) {
+            if (ReferenceEquals(slot, ownedSlot)) continue;
+            object manager = slotManager!.GetValue(slot)!;
+            if (isSaved!.GetValue(manager) is not true) continue;
+            // Unknown metadata fails closed; never steal a user's recovery.
+            if (savedLevel?.GetValue(manager) is not Level saved) return true;
+            if (saved.Session.Area == level.Session.Area && saved.Session.Level == (room ?? level.Session.Level)) return true;
+        }
+        return false;
+    }
+
+    internal static bool OwnedOperationActive => ownedSlot is not null
+        && ReferenceEquals(currentSlot?.GetValue(null), ownedSlot);
 
     internal static bool UserOperationActive => currentSlot?.GetValue(null) is { } slot
         && !ReferenceEquals(slot, ownedSlot)
@@ -45,6 +62,7 @@ internal static class SpeedrunToolRecoverySlot {
         currentName = slots.GetProperty("SlotName", Static) ?? throw new MissingMemberException("SlotName");
         slotManager = slot.GetField("StateManager", Instance) ?? throw new MissingFieldException("StateManager");
         preClone = manager.GetField("preCloneTask", Instance) ?? throw new MissingFieldException("preCloneTask");
+        savedLevel = manager.GetField("savedLevel", Instance);
         state = manager.GetProperty("State", Instance) ?? throw new MissingMemberException("State");
         isSaved = manager.GetProperty("IsSaved", Instance) ?? throw new MissingMemberException("IsSaved");
         clear = manager.GetMethod("ClearStateImpl", Instance, [typeof(bool)])
@@ -148,7 +166,7 @@ internal static class SpeedrunToolRecoverySlot {
         clearAllHook?.Dispose();
         clearAllHook = null;
         ownedSlot = null;
-        dictionary = currentSlot = slotManager = preClone = null;
+        dictionary = currentSlot = slotManager = preClone = savedLevel = null;
         currentName = state = isSaved = null;
         clear = null;
         switchSlot = null;

@@ -5,6 +5,8 @@
     <CelesteRoot Condition="'$(CelesteRoot)' == ''">C:/SteamLibrary/steamapps/common/Celeste</CelesteRoot>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../Source/CapturePresentationGate.cs" Link="CapturePresentationGate.cs" />
+    <Compile Include="../../Source/SpeedrunToolProgress.cs" Link="SpeedrunToolProgress.cs" />
     <Compile Include="../../Source/SpeedrunToolAutoSave.cs" Link="SpeedrunToolAutoSave.cs" />
     <Compile Include="../../Source/SpeedrunToolRecoverySlot.cs" Link="SpeedrunToolRecoverySlot.cs" />
     <Compile Include="../../Source/RecordingDeathRecovery.cs" Link="RecordingDeathRecovery.cs" />

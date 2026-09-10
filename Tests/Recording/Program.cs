@@ -177,7 +177,7 @@ for (int attempt = 0; attempt < 3; attempt++) {
         "load catch-up/slow GPU skipped the saved pose before it could be recorded");
     AutoRecorder.ResumeReady = true;
     RecordingSavePause.Presented(2000);
-    Check(!RecordingSavePause.Active, "accepted recovery frame did not release physics");
+Check(!RecordingSavePause.Active, "accepted recovery frame did not release physics");
     var resume = new Microsoft.Xna.Framework.GameTime { ElapsedGameTime = TimeSpan.FromSeconds(2) };
     Check(RecordingSavePause.BeforeEngineUpdate(ref resume) && resume.ElapsedGameTime <= TimeSpan.FromSeconds(1d / 60),
         "load wall-time leaked into the first resumed physics step");
@@ -188,8 +188,34 @@ RecordingDeathRecovery.AfterEngineUpdate();
 Engine.Scene = new Level(); RecordingTransitionAutoSave.AfterEngineUpdate();
 Check(!RecordingSavePause.Active && !RecordingPauseAudio.Paused, "scene switch leaked the recovery gate");
 
+// Progress presents are not gameplay, even before SRT has changed State.None.
+level = Reset();
+Check(SpeedrunToolProgress.Available, "progress isolation hook did not install");
+int auxiliaryCalls = 0;
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = () => {
+    Check(!CapturePresentationGate.AcceptGameplay, "progress entered gameplay capture");
+    auxiliaryCalls++;
+    RecordingSavePause.Presented(10);
+};
+Queue(level); RecordingTransitionAutoSave.AfterEngineUpdate();
+int beforeAuxSuspends = AutoRecorder.Suspends;
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Show();
+Check(auxiliaryCalls == 1 && AutoRecorder.Suspends == beforeAuxSuspends && !RecordingSavePause.ShowIndicator,
+    "auxiliary present advanced the clean boundary gate");
+Check(CapturePresentationGate.AcceptGameplay, "progress leaked presentation exclusion");
+Tick();
+SpeedrunToolRecoverySlot.Run(_ => {
+    Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Show();
+    return RecoveryResult.Success;
+}, create: false);
+Check(auxiliaryCalls == 1, "private slot rendered duplicate SRT progress/readback");
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = () => throw new InvalidOperationException("test draw failure");
+try { Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Show(); } catch (InvalidOperationException) { }
+Check(CapturePresentationGate.AcceptGameplay, "failed progress render poisoned game capture");
+Celeste.Mod.SpeedrunTool.Progress.BusyIndicator.Drawing = null;
+
 // Manual saves own gameplay, including SRT's own later-installed death hook.
-// Any saved user slot suppresses private saves. Clearing the last one must wait
+// Any saved user slot in this room suppresses private saves. Clearing the last one must wait
 // for a normal save trigger, without saving here or reviving an abandoned branch.
 level = Reset(); SaveHere(level); user = StateManager.Instance;
 level.Position = 15; user.SaveStateImpl(false, out _); user.State = State.None;
@@ -251,6 +277,26 @@ level.Session.RespawnPoint = new(100, 100); Queue(level); Tick();
 Check(RecordingTransitionAutoSave.CanRecover(level), "normal respawn-point trigger remained blocked after individual clear");
 level.Position = 120; body = Die(level); body.CallEnd(); Tick();
 Check(level.Position == 100 && Private().Loads == 1, "normal respawn-point save used the wrong recovery point");
+
+// Cross-room manual slots remain intact but must not disable destination saves.
+level = Reset(); user = StateManager.Instance;
+level.Session.Level = "manual-room"; level.Position = 12;
+user.SaveStateImpl(false, out _); user.State = State.None; Tick();
+level.Transitioning = true;
+RecordingTransitionAutoSave.Queue(level, "automatic-room");
+RecordingTransitionAutoSave.AfterEngineUpdate(); // Session still names departure.
+Check(!RecordingSavePause.Active, "saved before the room transition finished");
+level.Session.Level = "automatic-room"; level.Position = 90;
+level.Transitioning = false; Tick();
+Check(RecordingTransitionAutoSave.CanRecover(level) && user.IsSaved && StateManager.Instance == user,
+    "old-room manual slot blocked destination save or changed user selection");
+level.Position = 120; body = Die(level); body.CallEnd(); Tick();
+Check(level.Position == 90 && Private().Loads == 1 && user.Loads == 0,
+    "destination death returned to an unrelated manual room");
+user.LoadStateImpl(false, out _); user.State = State.None; Tick();
+Check(level.Session.Level == "manual-room" && level.Position == 12 && SpeedrunToolAutoSave.HasManualState
+    && !SpeedrunToolRecoverySlot.HasState && !RecordingSavePause.Active,
+    "explicit manual load lost its room, priority or triggered an automatic save");
 
 level = Reset(); SaveHere(level); SaveSlotsManager.SwitchSlot("user-2");
 level.Position = 8; body = Die(level); body.CallEnd(); Tick();

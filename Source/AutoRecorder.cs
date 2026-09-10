@@ -557,6 +557,11 @@ public static class AutoRecorder {
         }
     }
 
+    internal static void SuspendForExternalOperation() {
+        if (manualSlSuspended || RecordingSavePause.Active) return;
+        SuspendForManualSl();
+    }
+
     internal static void SuspendForManualSl(bool loading = false) {
         if (current is null && deathReplayCurrent is null) return;
         manualSlSeamless = !loading;
@@ -570,8 +575,9 @@ public static class AutoRecorder {
     }
 
     internal static void ManualSlPresented(ulong timestamp) {
-        if (!manualSlSuspended || SpeedrunToolAutoSave.ManualOperationActive
+        if (!CapturePresentationGate.AcceptGameplay || !manualSlSuspended || SpeedrunToolAutoSave.ManualOperationActive
             || Engine.Scene is not Level level || level.Paused
+            || level.Wipe is not null || !PauseOverlayCleared(level)
             || level.Tracker.GetEntity<Player>() is not { } player || !PlayerIsRecordable(level, player)) return;
         // Observe SRT, never unfreeze it. Resume video at its first clean presented
         // frame, without waiting for a QolHud update or pausing the game ourselves.

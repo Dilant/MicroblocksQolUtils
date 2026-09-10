@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><LangVersion>latest</LangVersion></PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../Source/CapturePresentationGate.cs" Link="CapturePresentationGate.cs" />
     <Compile Include="../../Source/AutoRecorder.cs" Link="AutoRecorder.cs" />
     <Compile Include="../../Source/RecordingSessionState.cs" Link="RecordingSessionState.cs" />
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs" />

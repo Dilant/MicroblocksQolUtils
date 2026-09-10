@@ -106,6 +106,8 @@ namespace Celeste.Mod.MicroblocksQolUtils {
         public static void Resume() => Paused = false;
     }
     public static class AutoRecorder {
+        public static int ExternalSuspends;
+        public static void SuspendForExternalOperation() => ExternalSuspends++;
         public static int ManualSuspends;
         public static void SuspendForManualSl(bool loading = false) => ManualSuspends++;
         public static int Suspends, Resumes;
@@ -169,6 +171,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
         public string? PreCloneObservedSlot;
         public Dictionary<Type, Dictionary<string, object>> Values = [];
         private Session? savedSession;
+        private Level? savedLevel;
         private int savedPosition, savedCamera, savedFrame;
         private bool savedGolden;
 
@@ -182,6 +185,7 @@ namespace Celeste.Mod.SpeedrunTool.SaveLoad {
             Level level = (Level)Monocle.Engine.Scene!;
             SaveLoadAction.BeforeSave?.Invoke(level);
             savedSession = level.Session.Copy(); savedPosition = level.Position; savedGolden = level.GoldenMarked;
+            savedLevel = new Level { Session = savedSession };
             savedCamera = level.CameraPosition; savedFrame = level.SceneFrame;
             IsSaved = true;
             Utils.StateMarkUtils.ReColor(Values, level);

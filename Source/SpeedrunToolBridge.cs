@@ -39,10 +39,12 @@ public static class SpeedrunToolBridge {
         );
         SpeedrunToolImports.IgnoreSaveState?.Invoke(typeof(QolHud), false);
         SpeedrunToolAutoSave.Load(registration.GetType().Assembly);
+        SpeedrunToolProgress.Load(registration.GetType().Assembly);
         Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "SpeedrunTool recording timeline integration enabled");
     }
 
     public static void Unload() {
+        SpeedrunToolProgress.Unload();
         RecordingTransitionAutoSave.Reset();
         SpeedrunToolAutoSave.Unload();
         if (registration is not null) SpeedrunToolImports.Unregister?.Invoke(registration);

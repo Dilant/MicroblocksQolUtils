@@ -104,6 +104,7 @@ internal static class RecordingSavePause {
     }
 
     internal static void Presented(ulong timestamp) {
+        if (!CapturePresentationGate.AcceptGameplay) return;
         // A fixed-step loop may call Engine.Update repeatedly after a stall.
         // Allow only one recovery step until its result was actually presented.
         resumeUpdateAwaitingPresentation = false;

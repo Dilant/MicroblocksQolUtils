@@ -37,7 +37,7 @@ internal static class SpeedrunToolAutoSave {
     private static bool suppressMarking;
     internal static bool Available => hookStatus?.Ready is true;
     internal static bool HasState => Available && SpeedrunToolRecoverySlot.HasState;
-    internal static bool HasManualState => SpeedrunToolRecoverySlot.HasUserState;
+    internal static bool HasManualState => SpeedrunToolRecoverySlot.HasUserStateIn(Monocle.Engine.Scene as Level);
     internal static bool ManualOperationActive => SpeedrunToolRecoverySlot.UserOperationActive;
 
     internal static void Load(Assembly assembly) {

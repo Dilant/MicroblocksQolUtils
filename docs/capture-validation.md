@@ -330,6 +330,27 @@ dotnet run --project Tests/Capture.Integration/Capture.Integration.csproj -c Rel
   1.5s 死亡回放约 **45.2ms**。均为小尺寸测试，不是用户 2560×1506 或全部模组组合下的性能保证。
   证据在 `.work/sfx-seams-cadence/.work/`；原用户视频未修改，仍需重新录制验收声音和手感。
 
+### 2026-09-10：SRT 进度 Present 与录像隔离、跨房间手动档策略
+
+- 用户 `20260910-132953-848-…99e37b4e….mp4`（25.49s）在约 11.85–13.33s 保留了
+  “正在清除状态”的进度界面与约 1.48s 静止画面。其 timeline 中还出现了无内部恢复点的非无缝房间分支。
+  原视频未修改，采样图与检测日志放在 `.work/srt-progress-recording/.work/`。
+- 在 SRT 首次进度绘制前排除辅助 Present；它早于 Saving/Loading 状态和存读档回调。
+  清档/GC 等等待也关闭录像分支，不能只过滤像素然后让上一帧持续整个等待。
+  内部槽跳过重复 SRT 提示与 backbuffer 同步读回；两路恢复门不再接受提示帧确认。
+- 本房间任意手动档仍优先；旧房间手动档不阻止目标房间正常保存。
+  覆盖 Session 仍指向旧房间时排队、切面中不存、切面结束后立即冻结保存、死亡回新面内部档、显式手动回旧档。
+  不覆盖手动槽、不改变选槽，清档仍不补存。
+- Recording **148 assertions**、Recorder **117 checks**、Capture、生产 Recording.Policy 全通过。
+  安装版 SRT 原始 DLL 和 Everest 缓存 DLL 均通过实际 progress hook、私有提示抑制、异常清理，
+  以及原有立即/延迟并行 IL hook 兼容性回归。
+- 真实 OpenGL：每个游戏 swap 前插入纯绿提示 swap，**238** 视频 / **443** 音频 callback，
+  没有提示像素混入、恢复门误推进或像素方向错误。保存硬切复制 **29.4ms**，1.5s 死亡回放 **56.2ms**。
+- 真实 FNA/D3D11：**1440** 次辅助 Present 被排除，观察到 **477** 个干净游戏帧；
+  60fps 录制接收/编码 **225/225**，零 native/回调丢帧，零提示像素污染。
+  全部测试 MP4 与 D3D MKV 完整解码通过。以上是 **160×90 测试**，不是用户完整模组组合下的性能或无缝保证。
+- 本次未改 native 编码器/混音、采集层唯一限帧选择或死亡回放快速导出；仍需用户重新录制验收实际地图与背景动画。
+
 ## 平台与功能限制
 
 ABI 8 的 Linux x64、macOS x64、Android arm64 无 FFmpeg 编译检查通过；实际 GPU/音频/FFmpeg 运行仍仅在 Windows 验证。三平台 CI 打包矩阵保留，不能把 cargo check 当作真机通过。

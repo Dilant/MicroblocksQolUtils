@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AllowUnsafeBlocks>true</AllowUnsafeBlocks><LangVersion>latest</LangVersion><CelesteRoot Condition="'$(CelesteRoot)' == ''">$(CELESTE_ROOT)</CelesteRoot></PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../Source/CapturePresentationGate.cs" Link="CapturePresentationGate.cs" />
     <Reference Include="Celeste"><HintPath>$(CelesteRoot)/Celeste.dll</HintPath></Reference>
     <Reference Include="FNA"><HintPath>$(CelesteRoot)/FNA.dll</HintPath></Reference>
     <Reference Include="MonoMod.RuntimeDetour"><HintPath>$(CelesteRoot)/MonoMod.RuntimeDetour.dll</HintPath></Reference>

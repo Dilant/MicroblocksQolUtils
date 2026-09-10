@@ -97,6 +97,14 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Advance(10); Tick(l); AutoRecorder.ManualSlPresented(100);
     Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"SRT save wait leaked into video");
     SpeedrunToolAutoSave.ManualOperationActive=false;
+    using (CapturePresentationGate.Auxiliary()) {
+        AutoRecorder.SuspendForExternalOperation();
+        AutoRecorder.ManualSlPresented(999);
+        Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips), "progress reopened manual wait");
+    }
+    l.Wipe = new(); AutoRecorder.ManualSlPresented(998);
+    Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips), "wipe reopened manual wait");
+    l.Wipe = null;
     AutoRecorder.ManualSlPresented(101); Advance(2); Tick(l);
     var full=NativeRoomRecording.Started.First();
     Check(full.RequestedFrame==101,"manual save resume did not request a boundary keyframe");
@@ -105,10 +113,29 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     SpeedrunToolAutoSave.ManualOperationActive=true; Advance(20); Tick(l); AutoRecorder.ManualSlPresented(200);
     Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"manual load wait reopened the abandoned branch");
     SpeedrunToolAutoSave.ManualOperationActive=false;
+    using (CapturePresentationGate.Auxiliary()) {
+        AutoRecorder.SuspendForExternalOperation(); AutoRecorder.ManualSlPresented(999);
+    }
     AutoRecorder.ManualSlPresented(201); Advance(2); AutoRecorder.StopManual(l,true); Tick(l);
     var clips=NativeRecordingFinalizer.Jobs.Last().Clips;
     Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==35
         && clips[1].DurationSeconds==2 && clips[1].SeamlessFromPrevious,"manual SL retained waits, failed gameplay or crossfade");
+}
+
+// Clear/GC progress has no save/load callback. Exclude its time in both sinks.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(3);
+    using (CapturePresentationGate.Auxiliary()) {
+        AutoRecorder.SuspendForExternalOperation(); Advance(5);
+        AutoRecorder.SuspendForExternalOperation(); AutoRecorder.ManualSlPresented(400);
+        Check(AutoRecorder.CaptureTimeline(l)!.Clips.Sum(c=>c.DurationSeconds)==3,
+            "clear/GC progress time entered the prefix");
+    }
+    AutoRecorder.ManualSlPresented(401); Advance(2); AutoRecorder.StopManual(l,true); Tick(l);
+    var clips=NativeRecordingFinalizer.Jobs.Last().Clips;
+    Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==8
+        && clips[1].DurationSeconds==2 && clips[1].SeamlessFromPrevious,
+        "clear/GC exclusion retained a frozen hold or added a crossfade");
 }
 
 {

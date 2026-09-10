@@ -163,9 +163,11 @@ While full recording is active (including manual recording), it saves the game a
 timeline into a dedicated internal SpeedrunTool slot after each room transition. Normal same-room
 deaths load that slot automatically; golden chapter restarts and custom death actions are not
 intercepted. Recording start and respawn-point changes also refresh the recovery point.
-**Any saved user slot disables internal automatic saves and loads**, even when an empty slot is selected.
+**Any user save in the current room disables internal automatic saves and loads**, even when an empty slot is selected.
+Saves in other rooms remain intact but do not block normal automatic saves in a new room; explicit manual loads remain SRT-owned.
 SRT alone handles manual-slot death recovery; its waits, wipes and input behavior are unchanged.
 We only segment video and restore valid saved recording prefixes, preferring hard cuts for those joins.
+SRT progress-only presentations never enter frame acquisition or advance recovery gates; their wait time is cut too, including clear/GC operations.
 Clearing the last user save only lifts the block: automatic saves still require a normal recording-start,
 room-transition or respawn-point-change trigger. It neither saves immediately nor reuses the old internal state.
 Internal saving freezes gameplay with a saving indicator until clean resume frames reach the recordings.

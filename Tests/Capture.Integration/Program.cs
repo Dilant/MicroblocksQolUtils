@@ -124,6 +124,11 @@ for(int i=0;i<240;i++) {
     if(i==160) { Fmod(song.stop(FMOD.Studio.STOP_MODE.IMMEDIATE)); Fmod(song.start()); }
     if(i==120) {Parallel.Invoke(first.Dispose, first.Dispose); before=second!.Statistics.FramesCaptured; Sdl.SetWindowSize(window,192,108);}
     if(i==210) {Check(second!.Statistics.FramesCaptured>before,"second stopped when first unsubscribed");}
+    // Progress-only swaps use a deliberately invalid test color. They must not
+    // reach pixels, advance recorder gates, or consume the FPS source selector.
+    using (CapturePresentationGate.Auxiliary()) {
+        clearColor(0,1,0,1);clear(0x4000);Sdl.Swap(window);
+    }
     Sdl.Drawable(window,out int w,out int h);
     disable(0x0C11);clearColor(1,0,0,1);clear(0x4000);
     enable(0x0C11);scissor(0,h/2,w,h-h/2);clearColor(0,0,1,1);clear(0x4000);disable(0x0C11);
@@ -227,8 +232,12 @@ internal static class Sdl {
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] internal delegate void Scissor(int x,int y,int w,int h);
 }
 namespace Celeste.Mod.MicroblocksQolUtils {
-    internal static class RecordingSavePause { internal static void Presented(ulong time) { } }
-    internal static class AutoRecorder { internal static bool IsRecording => true; internal static void ManualSlPresented(ulong time) { } }
+    internal static class RecordingSavePause { internal static void Presented(ulong time) {
+        if (!CapturePresentationGate.AcceptGameplay) throw new Exception("Auxiliary swap advanced save gate");
+    } }
+    internal static class AutoRecorder { internal static bool IsRecording => true; internal static void ManualSlPresented(ulong time) {
+        if (!CapturePresentationGate.AcceptGameplay) throw new Exception("Auxiliary swap resumed manual SL");
+    } }
     internal enum LogLevel {Info,Warn,Error}
     internal static class Logger {
         internal static void Log(LogLevel level,string tag,string text)=>Console.WriteLine($"{level} {tag}: {text}");

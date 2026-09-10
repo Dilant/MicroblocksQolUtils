@@ -7,7 +7,9 @@ using Celeste.Mod.MicroblocksQolUtils;
 // Real FNA Game/SDL/DXGI presentation, with production managed callback workers.
 // Never launches Celeste/Steam or touches the user's settings and saves.
 internal sealed class CadenceGame : Game {
-    private const int Width=2560,Height=1506,RenderFps=120;
+    private static readonly bool AuxiliaryTest = Environment.GetEnvironmentVariable("MQOL_TEST_AUXILIARY_PRESENTS") == "1";
+    private static readonly int Width=AuxiliaryTest ? 160 : 2560,Height=AuxiliaryTest ? 90 : 1506;
+    private const int RenderFps=120;
     private readonly int totalDraws=RenderFps*int.Parse(Environment.GetEnvironmentVariable("MQOL_TEST_SECONDS")??"20");
     private readonly GraphicsDeviceManager graphics;
     private readonly string root,output,encoder;
@@ -21,6 +23,8 @@ internal sealed class CadenceGame : Game {
     private CaptureDeliveryStatistics delivery;
     private readonly Stopwatch watch=new();
     private int draws;
+    private CaptureSubscription? pixelProbe;
+    private int observed, contaminated, auxiliaryPresents;
     internal CadenceGame(string root,string output,string encoder) {
         this.root=root; this.output=output; this.encoder=encoder;
         IsFixedTimeStep=false;
@@ -29,6 +33,12 @@ internal sealed class CadenceGame : Game {
         Window.Title="Celeste full-resolution cadence test";
     }
     protected override void LoadContent() {
+        if (AuxiliaryTest) {
+            for (uint id=1; id<=64; id++) {
+                nint window = GetWindow(id);
+                if (window != 0) HideWindow(window);
+            }
+        }
         byte[] sample=File.ReadAllBytes(Environment.GetEnvironmentVariable("MQOL_TEST_BGRA")!);
         if(sample.Length!=Width*Height*4) throw new Exception("wrong BGRA fixture dimensions");
         for(int i=0;i<sample.Length;i+=4) (sample[i],sample[i+2])=(sample[i+2],sample[i]);
@@ -44,6 +54,12 @@ internal sealed class CadenceGame : Game {
         Fmod(studio.getEvent("event:/music/lvl1/main",out var music)); Fmod(music.createInstance(out var song)); Fmod(song.start());
         NativeCaptureBridge.Initialize(null); CaptureSource.Load();
         capture=NativeCaptureBridge.StartRecording(60,Path.Combine(output,"fna-d3d.mkv"),encoder,12000);
+        if (AuxiliaryTest) pixelProbe = CaptureSource.Subscribe(frame => {
+            var pixels = frame.Pixels.Span;
+            // Normal draws have a black/white binary counter at pixel zero.
+            if (pixels[0] != pixels[1] || pixels[1] != pixels[2]) Interlocked.Increment(ref contaminated);
+            Interlocked.Increment(ref observed);
+        });
         if(Environment.GetEnvironmentVariable("MQOL_TEST_DUAL")=="1")
             second=NativeCaptureBridge.StartRecording(60,Path.Combine(output,"fna-second.mkv"),encoder,12000);
         watch.Start();
@@ -56,6 +72,15 @@ internal sealed class CadenceGame : Game {
         double due=(double)draws/RenderFps;
         while(watch.Elapsed.TotalSeconds<due) {
             if(due-watch.Elapsed.TotalSeconds>.002) Thread.Sleep(1); else Thread.SpinWait(20);
+        }
+        if (AuxiliaryTest) {
+            using (CapturePresentationGate.Auxiliary()) {
+                for (int i=0; i<3; i++) {
+                    GraphicsDevice.Clear(Color.Lime);
+                    GraphicsDevice.Present();
+                    auxiliaryPresents++;
+                }
+            }
         }
         GraphicsDevice.Clear(Color.Black);
         sprites.Begin(SpriteSortMode.Deferred,BlendState.Opaque,SamplerState.PointClamp,DepthStencilState.None,RasterizerState.CullNone);
@@ -70,6 +95,12 @@ internal sealed class CadenceGame : Game {
             double elapsed=watch.Elapsed.TotalSeconds;
             stopping=Task.Run(()=> {
                 capture.Stop(); result=capture.Statistics; delivery=capture.DeliveryStatistics;
+                if (pixelProbe is not null) {
+                    pixelProbe.Complete(); pixelProbe.Completion.GetAwaiter().GetResult();
+                    if (observed < 100 || contaminated != 0 || pixelProbe.CallbackErrors != 0)
+                        throw new Exception($"D3D progress isolation failed: observed={observed}, contaminated={contaminated}");
+                    Console.WriteLine($"PASS actual D3D11: {auxiliaryPresents} auxiliary presents excluded, {observed} clean frames");
+                }
                 second?.Stop();
                 string report=$"wall={elapsed:F3} backend={CaptureSource.VideoBackend} sourcePoolDrops={CaptureSource.DroppedFrames} sourceAudioDrops={CaptureSource.DroppedAudioChunks}\n{result}\n{delivery}";
                 Console.WriteLine("FNA_FINAL "+report);
@@ -95,6 +126,11 @@ internal sealed class CadenceGame : Game {
     }
     protected override void UnloadContent() {
         capture?.Dispose(); second?.Dispose(); CaptureSource.Unload(); studio.release();
+        pixelProbe?.Dispose();
         sprites?.Dispose(); picture?.Dispose(); white?.Dispose();
     }
+    [System.Runtime.InteropServices.DllImport("SDL2", EntryPoint="SDL_GetWindowFromID")]
+    private static extern nint GetWindow(uint id);
+    [System.Runtime.InteropServices.DllImport("SDL2", EntryPoint="SDL_HideWindow")]
+    private static extern void HideWindow(nint window);
 }
