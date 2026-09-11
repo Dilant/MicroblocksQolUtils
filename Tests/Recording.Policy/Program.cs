@@ -165,4 +165,5 @@ Check(jobs.Length == 1 && (bool)jobs[0].GetType().GetProperty("PreferVideoCopy")
 Check((bool)jobs[0].GetType().GetProperty("RemoveFreezeFrames")!.GetValue(jobs[0])!,
     "fast replay silently disabled freeze-frame editing");
 Check(pending.Count == 0, "death replay job was not consumed");
+LibraryProgress.Run(settings);
 Console.WriteLine("PASS production AutoRecorder room policy, both sink branches, restore/short rooms, explicit mix mode, death trim, snapshots and legacy metadata");
