@@ -479,11 +479,11 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
         Color[]? work = diagnose ? ReadTargetCentre(screenWork!) : null;
 
-        // Blend the processed wake over the composed frame in the viewport. The
-        // shader emits non-premultiplied colour with coverage in alpha.
+        // The shader composes the untouched frame into its output itself, so the
+        // write-back is a plain opaque replace — no blending semantics involved.
         device.SetRenderTarget(null);
         device.Viewport = viewport;
-        BeginSprite(BlendState.NonPremultiplied, SamplerState.LinearClamp);
+        BeginSprite(BlendState.Opaque, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(screenWork, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
         if (diagnose) {
