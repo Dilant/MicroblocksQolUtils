@@ -32,5 +32,6 @@
 
   <ItemGroup>
     <EmbeddedResource Include="MaterialSymbols\Rounded\*.svg" LogicalName="Celeste.Mod.MicroblocksQolUtils.MaterialSymbols.Rounded.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Effects\HighSpeedWake.fxb" LogicalName="Celeste.Mod.MicroblocksQolUtils.Effects.HighSpeedWake.fxb" />
   </ItemGroup>
 </Project>
