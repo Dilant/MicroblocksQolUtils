@@ -170,7 +170,7 @@ public static class AutoRecorder {
             && (settings.AutomaticRecording == AutoRecordingMode.Off
                 || (SessionState.Kind == RecordingSessionKind.AutoGolden) != (settings.AutomaticRecording == AutoRecordingMode.Golden)))
             RequestStop(level, save: true);
-        fullRecordingEnabled = SessionState.Next(carryingGolden) != RecordingSessionKind.None;
+        fullRecordingEnabled = SessionState.Next(carryingGolden || HasUncollectedGolden(level)) != RecordingSessionKind.None;
         UpdateFullRecording(level, player, settings);
         UpdateDeathReplayRecording(level, player, settings);
     }
@@ -179,9 +179,9 @@ public static class AutoRecorder {
         current?.CheckpointRecovery();
         deathReplayCurrent?.CheckpointRecovery();
         FlushPendingRecordingStop();
-        if (deathReplayFinalizeRequested) {
+        if (deathReplayFinalizeRequested && DeathAnimationFinished()) {
             deathReplayFinalizeRequested = false;
-            // Finish the failed attempt before an internal load replaces its entities.
+            // Keep capturing through the death animation and its final black wipe.
             FinalizeDeathReplayCapture();
         }
         if (manualSlSuspended && MicroblocksQolUtilsModule.Settings.DeathReplayEnabled && deathReplayCurrent is null) {
@@ -526,7 +526,7 @@ public static class AutoRecorder {
         current = NativeRoomRecording.Start(path);
         if (current is null) return;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        SessionState.Start(SessionState.Next(CarriesGolden(level.Tracker.GetEntity<Player>())),
+        SessionState.Start(SessionState.Next(CarriesGolden(level.Tracker.GetEntity<Player>()) || HasUncollectedGolden(level)),
             settings.GoldenRecordingEnd, settings.GoldenRecordingDeath);
         ActivePrefix.Clear();
         respawnAnchor = null;
@@ -913,6 +913,21 @@ public static class AutoRecorder {
 
     private static bool CarriesGolden(Player? player) => player?.Leader.Followers
         .Any(follower => follower.Entity is Strawberry { Golden: true }) == true;
+
+    private static bool HasUncollectedGolden(Level level) {
+        if (level.Session.MapData is not MapData map) return false;
+        return MapCollectibleCache.Get(map).Any(collectible =>
+            collectible.Kind == MiniMapCollectibleKind.GoldenBerry
+            && string.Equals(collectible.Room, level.Session.Level, StringComparison.Ordinal)
+            && !collectible.IsCollected(level.Session));
+    }
+
+    private static bool DeathAnimationFinished() {
+        if (Engine.Scene is not Level level) return true;
+        // A death replay must include the complete death cutscene and the wipe to black.
+        // Once the wipe/cutscene is gone, the next update can safely finalize it.
+        return !level.InCutscene && !level.SkippingCutscene && !level.Transitioning && level.Wipe is null;
+    }
 
     private static bool PlayerIsRecordable(Level level, Player player) {
         // A freshly respawned Player is already non-dead while the respawn wipe/animation is
