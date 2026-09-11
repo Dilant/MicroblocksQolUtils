@@ -61,7 +61,9 @@ for name in avutil swresample swscale avcodec avformat; do
   cp -L "$FFMPEG_DIR/lib/lib$name.so" "$libs/"
 done
 for lib in "$libs"/*.so; do
-  "$llvm/bin/llvm-readelf" -h "$lib" | grep -q 'Machine:.*AArch64'
+  # Do not use grep -q with pipefail: llvm-readelf can receive SIGPIPE when
+  # grep exits early, which makes the whole build fail with status 74.
+  "$llvm/bin/llvm-readelf" -h "$lib" | grep 'Machine:.*AArch64' >/dev/null
   "$llvm/bin/llvm-readelf" -d "$lib"
   "$llvm/bin/llvm-strip" --strip-unneeded "$lib"
 done
