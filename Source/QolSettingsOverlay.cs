@@ -1563,6 +1563,17 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 Toggle("显示地图人数", () => settings.ShowMapPlayerCount, value => settings.ShowMapPlayerCount = value),
                 Toggle("显示当前时间", () => settings.ShowClock, value => settings.ShowClock = value)
             ]),
+            new SettingsTab("高速特效", "bolt", [
+                Toggle("启用高速特效", () => settings.HighSpeedEffects, value => settings.HighSpeedEffects = value),
+                Range("速度阈值", () => settings.HighSpeedThreshold, value => settings.HighSpeedThreshold = value,
+                    200, 2000, 50, value => $"{value}"),
+                Range("特效强度", () => settings.HighSpeedEffectIntensity,
+                    value => settings.HighSpeedEffectIntensity = value, 25, 200, 5, value => $"{value}%"),
+                Toggle("拖尾光带", () => settings.HighSpeedTrail, value => settings.HighSpeedTrail = value),
+                Toggle("空间尾波", () => settings.HighSpeedWarp, value => settings.HighSpeedWarp = value),
+                Toggle("尾迹色差", () => settings.HighSpeedAberration, value => settings.HighSpeedAberration = value),
+                Toggle("高速粒子", () => settings.HighSpeedParticles, value => settings.HighSpeedParticles = value)
+            ]),
             new SettingsTab("Profiler", "speed", [], ProfilerPage: true),
             new SettingsTab("小地图", "map", [
                 Toggle("启用小地图", () => settings.MiniMapEnabled, value => settings.MiniMapEnabled = value),
