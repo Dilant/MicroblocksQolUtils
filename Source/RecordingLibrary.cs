@@ -20,27 +20,40 @@ internal readonly record struct RecordingLibraryEntry(
 internal static class RecordingLibrary {
     public static IReadOnlyList<RecordingLibraryEntry> Scan() {
         string root = AutoRecorder.RecordingRoot;
-        if (!Directory.Exists(root)) return [];
+        Dictionary<string, RecordingLibraryEntry> entries = new(StringComparer.OrdinalIgnoreCase);
+        // The final MP4 does not exist until native encoding and muxing finish.
+        // Use the job's stable destination from the start, never its temporary files.
+        foreach (var output in AutoRecorder.FinalizingOutputs) {
+            if (!IsSafeRecording(output.Path)) continue;
+            entries[output.Path] = new RecordingLibraryEntry(
+                output.Path,
+                Path.GetFileName(output.Path),
+                RelativeDirectory(root, Path.GetDirectoryName(output.Path)),
+                output.StartedAt,
+                0,
+                KindOf(root, output.Path)
+            );
+        }
 
         try {
-            return Directory
-                .EnumerateFiles(root, "*.mp4", SearchOption.AllDirectories)
-                .Where(path => !IsWorkingFile(root, path))
-                .Select(path => new FileInfo(path))
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .Select(file => new RecordingLibraryEntry(
-                    file.FullName,
-                    file.Name,
-                    RelativeDirectory(root, file.DirectoryName),
-                    file.LastWriteTime,
-                    file.Length,
-                    KindOf(root, file.FullName)
-                ))
-                .ToArray();
+            if (Directory.Exists(root)) {
+                foreach (string path in Directory.EnumerateFiles(root, "*.mp4", SearchOption.AllDirectories)) {
+                    FileInfo file = new(path);
+                    if (IsWorkingFile(root, path) || entries.ContainsKey(file.FullName)) continue;
+                    try {
+                        entries[file.FullName] = new RecordingLibraryEntry(
+                            file.FullName, file.Name, RelativeDirectory(root, file.DirectoryName),
+                            file.LastWriteTime, file.Length, KindOf(root, file.FullName)
+                        );
+                    } catch (FileNotFoundException) {
+                        // Finalization/retention can rename or remove a file during a refresh.
+                    }
+                }
+            }
         } catch (Exception exception) {
             Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/Library");
-            return [];
         }
+        return entries.Values.OrderByDescending(entry => entry.ModifiedAt).ToArray();
     }
 
     public static bool OpenFolder(out string error) {
@@ -115,7 +128,10 @@ internal static class RecordingLibrary {
     }
 
     private static bool IsWorkingFile(string root, string path) {
-        return IsUnderDirectory(path, Path.Combine(root, ".working"));
+        string name = Path.GetFileName(path);
+        return IsUnderDirectory(path, Path.Combine(root, ".working"))
+            || name.EndsWith(".working.video.mp4", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".working.mp4", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static RecordingLibraryKind KindOf(string root, string path) {
