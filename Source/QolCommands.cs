@@ -19,6 +19,9 @@ public static class QolCommands {
     [Command("qol_watch_list", "List watched MiaoNet players")]
     public static void List() => Engine.Commands.Log(WatchList.Describe());
 
+    [Command("qol_wakestat", "Log high-speed wake diagnostics (camera, segments, field activity)")]
+    public static void WakeStat() => HighSpeedEffects.DumpWakeStats();
+
     [Command("qol_speedfx", "Preview the high-speed effects while you move: qol_speedfx <speed> [seconds] (0 to stop)")]
     public static void SpeedFx(string speedText, string secondsText = "4") {
         if (!float.TryParse(speedText, System.Globalization.CultureInfo.InvariantCulture, out float speed)
