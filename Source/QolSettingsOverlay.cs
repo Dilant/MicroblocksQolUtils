@@ -11,7 +11,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     private const float RowHeight = 92f;
     private const float RowGap = 12f;
     private const float RecorderHeroHeight = 150f;
-    private const float RecorderFileHeight = 76f;
+    private const float RecorderFileHeight = 104f;
     private const float RecorderSettingHeight = 92f;
     private const float DropdownItemHeight = 42f;
     private const int DropdownMaxVisibleItems = 7;
@@ -392,52 +392,87 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         }
 
         for (int index = 0; IsRecorderLibrary && index < recordingFiles.Count; index++) {
-            RecordingLibraryEntry file = recordingFiles[index];
-            bool finalizing = AutoRecorder.TryGetFinalizationProgress(
-                file.Path,
-                out double finalizationProgress,
-                out string finalizationDescription
-            );
-            string key = $"settings.recorder.file.{file.Path}";
             MaterialRect rect = RecorderFileRect(layout, index);
             if (rect.Bottom < layout.Rows.Y || rect.Y > layout.Rows.Bottom) continue;
-            bool selected = recorderSelectedItem == CurrentRows.Count + index;
-            float emphasis = Math.Max(selected ? 1f : 0f, motion.Emphasis(key));
-            Color fill = Color.Lerp(palette.SurfaceHigh * 0.72f, palette.SurfaceHighest, emphasis);
-            MaterialUi.RoundedRect(rect.X, rect.Y + 2f, rect.Width, rect.Height, 20f,
-                Color.Black * (0.08f * alpha));
-            MaterialUi.RoundedRect(rect.X, rect.Y, rect.Width, rect.Height, 20f, fill * alpha);
-            motion.RenderStateLayer(key, rect, 20f, palette.Primary, alpha);
-            if (emphasis > 0.01f) {
-                MaterialUi.RoundedOutline(rect.X, rect.Y, rect.Width, rect.Height, 20f,
-                    1f + emphasis, palette.Primary * (alpha * MathHelper.Lerp(0.28f, 0.78f, emphasis)));
-            }
-
-            MaterialUiKit.Text(Trim(file.FileName, finalizing ? 40 : 54), new Vector2(rect.X + 20f, rect.Y + 14f),
-                Vector2.Zero, MaterialTextRole.Label, palette.OnSurface, alpha, scaleOverride: 0.30f);
-            string metadata = $"{file.ModifiedAt:yyyy-MM-dd HH:mm}  ·  {FormatBytes(file.SizeBytes)}  ·  {file.RelativeDirectory}";
-            MaterialUiKit.Text(Trim(metadata, 72), new Vector2(rect.X + 20f, rect.Y + 45f),
-                Vector2.Zero, MaterialTextRole.Caption, palette.OnSurfaceVariant, alpha,
-                scaleOverride: 0.24f);
-
-            if (finalizing) {
-                MaterialUiKit.Text($"正在生成{finalizationDescription}  {finalizationProgress:P0}",
-                    new Vector2(rect.Right - 20f, rect.Y + 15f), new Vector2(1f, 0f),
-                    MaterialTextRole.Label, palette.Primary, alpha, scaleOverride: 0.27f);
-                const float progressMargin = 20f;
-                float progressWidth = rect.Width - progressMargin * 2f;
-                MaterialUi.RoundedRect(rect.X + progressMargin, rect.Bottom - 8f,
-                    progressWidth, 4f, 2f, palette.Outline * (0.28f * alpha));
-                MaterialUi.RoundedRect(rect.X + progressMargin, rect.Bottom - 8f,
-                    progressWidth * (float)Math.Clamp(finalizationProgress, 0d, 1d),
-                    4f, 2f, palette.Primary * alpha);
-            } else {
-                RenderFileAction(RecorderFileOpenRect(rect), "播放", false, palette, alpha,
-                    key + ".open");
-                RenderFileAction(RecorderFileDeleteRect(rect), "删除", true, palette, alpha,
-                    key + ".delete");
-            }
+            RenderRecordingFile(recordingFiles[index], rect,
+                recorderSelectedItem == CurrentRows.Count + index, palette, alpha);
         }
+    }
+
+    private void RenderRecordingFile(RecordingLibraryEntry file, MaterialRect rect, bool selected,
+        MaterialPalette palette, float alpha) {
+        bool finalizing = AutoRecorder.TryGetFinalizationProgress(file.Path, out double progress, out _);
+        string key = $"settings.recorder.file.{file.Path}";
+        float emphasis = Math.Max(selected ? 1f : 0f, motion.Emphasis(key));
+        Color surface = finalizing
+            ? Color.Lerp(palette.SurfaceHigh, palette.Primary, 0.10f)
+            : palette.SurfaceHigh * 0.72f;
+        Color fill = Color.Lerp(surface, palette.SurfaceHighest, emphasis);
+        MaterialUi.RoundedRect(rect.X, rect.Y + 2f, rect.Width, rect.Height, 24f,
+            Color.Black * (0.08f * alpha));
+        MaterialUi.RoundedRect(rect.X, rect.Y, rect.Width, rect.Height, 24f, fill * alpha);
+        motion.RenderStateLayer(key, rect, 24f, palette.Primary, alpha);
+        if (emphasis > 0.01f) {
+            MaterialUi.RoundedOutline(rect.X, rect.Y, rect.Width, rect.Height, 24f,
+                1f + emphasis, palette.Primary * (alpha * MathHelper.Lerp(0.28f, 0.78f, emphasis)));
+        }
+
+        MaterialRect icon = new(rect.X + 20f, rect.Y + (finalizing ? 18f : 28f), 48f, 48f);
+        MaterialUi.RoundedRect(icon.X, icon.Y, icon.Width, icon.Height, 16f,
+            palette.Primary * ((finalizing ? 0.18f : 0.10f) * alpha));
+        MaterialIcon.Draw(file.Kind == RecordingLibraryKind.DeathReplay ? "replay" : "movie",
+            icon.Center, 27f, palette.Primary, alpha);
+
+        float textX = rect.X + 84f;
+        float titleY = rect.Y + (finalizing ? 20f : 29f);
+        MaterialRect status = new(rect.Right - 218f, rect.Y + 16f, 198f, 38f);
+        float textRight = (finalizing ? status.X : RecorderFileOpenRect(rect).X) - 20f;
+        float textWidth = Math.Max(0f, textRight - textX);
+        MaterialUiKit.Text(MaterialTextUtil.Ellipsize(file.FileName, textWidth, 0.30f, UiFontWeight.Bold),
+            new Vector2(textX, titleY), Vector2.Zero, MaterialTextRole.Label,
+            palette.OnSurface, alpha, scaleOverride: 0.30f);
+        string metadata = finalizing
+            ? $"{file.ModifiedAt:yyyy-MM-dd HH:mm}  ·  {file.RelativeDirectory}"
+            : $"{file.ModifiedAt:yyyy-MM-dd HH:mm}  ·  {FormatBytes(file.SizeBytes)}  ·  {file.RelativeDirectory}";
+        MaterialUiKit.Text(MaterialTextUtil.Ellipsize(metadata, textWidth, 0.24f),
+            new Vector2(textX, titleY + 30f), Vector2.Zero, MaterialTextRole.Caption,
+            palette.OnSurfaceVariant, alpha, scaleOverride: 0.24f);
+
+        if (finalizing) {
+            RenderRecordingGeneration(status, new MaterialRect(textX, rect.Bottom - 22f,
+                rect.Right - 20f - textX, 6f), progress, palette, alpha);
+        } else {
+            RenderFileAction(RecorderFileOpenRect(rect), "播放", false, palette, alpha, key + ".open");
+            RenderFileAction(RecorderFileDeleteRect(rect), "删除", true, palette, alpha, key + ".delete");
+        }
+    }
+
+    private static void RenderRecordingGeneration(MaterialRect status, MaterialRect track,
+        double value, MaterialPalette palette, float alpha) {
+        float progress = (float)Math.Clamp(value, 0d, 1d);
+        string label = progress <= 0f ? "准备生成" : progress >= 0.99f ? "即将完成" : "正在生成";
+        MaterialUi.RoundedRect(status.X, status.Y, status.Width, status.Height, status.Height / 2f,
+            palette.Primary * (0.16f * alpha));
+        MaterialUiKit.Text(label, new Vector2(status.X + 16f, status.Center.Y), new Vector2(0f, 0.5f),
+            MaterialTextRole.Label, palette.Primary, alpha, scaleOverride: 0.26f);
+        // Reserve 100% for a finished file, even when the native encoder rounds up early.
+        string percentage = $"{Math.Min(99, (int)Math.Floor(progress * 100d))}%";
+        MaterialUiKit.Text(percentage, new Vector2(status.Right - 16f, status.Center.Y), new Vector2(1f, 0.5f),
+            MaterialTextRole.Label, palette.Primary, alpha, scaleOverride: 0.29f);
+
+        float filled = track.Width * progress;
+        // The gap and end stop follow Material's determinate linear progress treatment.
+        float remainingX = track.X + Math.Max(0f, filled > 0f ? filled + 5f : 0f);
+        if (remainingX < track.Right) {
+            MaterialUi.RoundedRect(remainingX, track.Y, track.Right - remainingX, track.Height,
+                track.Height / 2f, palette.Primary * (0.16f * alpha));
+        }
+        if (filled > 0f) {
+            MaterialUi.RoundedRect(track.X, track.Y, filled, track.Height, track.Height / 2f,
+                palette.Primary * alpha);
+        }
+        MaterialUi.Circle(new Vector2(track.Right - 2f, track.Y + track.Height / 2f), 2f,
+            palette.Primary * alpha);
     }
 
     private void RenderRecordingLibraryTab(
@@ -2203,10 +2238,10 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private static MaterialRect RecorderFileOpenRect(MaterialRect row) =>
-        new(row.Right - 214f, row.Y + 19f, 92f, 38f);
+        new(row.Right - 214f, row.Center.Y - 19f, 92f, 38f);
 
     private static MaterialRect RecorderFileDeleteRect(MaterialRect row) =>
-        new(row.Right - 110f, row.Y + 19f, 92f, 38f);
+        new(row.Right - 110f, row.Center.Y - 19f, 92f, 38f);
 
     private static MaterialRect RecordingDeleteModalRect() => new(610f, 380f, 700f, 320f);
 

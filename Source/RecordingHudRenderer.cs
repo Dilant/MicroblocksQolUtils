@@ -17,9 +17,6 @@ internal static class RecordingHudRenderer {
         if (showRecording) {
             RenderRecordingBadge(settings, top);
         }
-        if (AutoRecorder.IsFinalizing) {
-            RenderFinalizationProgress(settings, showRecording ? top + Height + 8f : top);
-        }
     }
 
     private static void RenderRecordingBadge(QolSettings settings, float top) {
@@ -58,35 +55,6 @@ internal static class RecordingHudRenderer {
                 UiFontWeight.Bold
             );
         }
-    }
-
-    private static void RenderFinalizationProgress(QolSettings settings, float top) {
-        float progress = (float)Math.Clamp(AutoRecorder.FinalizationProgress, 0d, 1d);
-        string text = $"生成{AutoRecorder.FinalizationDescription}  {progress:P0}";
-        const float scale = 0.34f;
-        Vector2 measured = SystemTtfFont.Measure(text, scale, UiFontWeight.Bold);
-        float width = Math.Max(230f, measured.X + 28f);
-        float right = ScreenWidth - Margin;
-        float left = right - width;
-        if (settings.HudMaterialSurfaces) {
-            MaterialUi.RoundedRect(left, top, width, Height, Height / 2f, Color.Black * 0.68f);
-            MaterialUi.RoundedOutline(left, top, width, Height, Height / 2f, 1.5f, Color.White * 0.18f);
-        }
-        SystemTtfFont.Draw(
-            text,
-            new Vector2(left + 14f, top + 6f),
-            Vector2.Zero,
-            scale,
-            Color.White,
-            1f,
-            Color.Black * 0.85f,
-            UiFontWeight.Bold
-        );
-        float trackWidth = width - 28f;
-        MaterialUi.RoundedRect(left + 14f, top + Height - 8f, trackWidth, 4f, 2f,
-            Color.White * 0.18f);
-        MaterialUi.RoundedRect(left + 14f, top + Height - 8f, trackWidth * progress, 4f, 2f,
-            new Color(178, 143, 255));
     }
 
     private static string FormatDuration(double seconds) {
