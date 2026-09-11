@@ -6,5 +6,6 @@
     <Compile Include="../../Source/RecordingSessionState.cs" Link="RecordingSessionState.cs" />
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs" />
     <Compile Include="../../Source/RecordingLibrary.cs" Link="RecordingLibrary.cs" />
+    <Compile Include="../../Source/RecordingRecovery.cs" Link="RecordingRecovery.cs" />
   </ItemGroup>
 </Project>

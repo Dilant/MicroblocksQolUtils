@@ -1652,6 +1652,10 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             Range("死亡回放时长", () => settings.DeathReplayBufferSeconds, value => settings.DeathReplayBufferSeconds = value,
                 10, 60, 5, value => $"最近 {value} 秒"));
         Group(RecorderSettingsSection.Quality,
+            Toggle("启用录像剪辑（关闭保留完整原片）", () => settings.RecordingEditingEnabled,
+                value => settings.RecordingEditingEnabled = value),
+            Toggle("保留暂停画面", () => settings.RecordingKeepPausedFrames, value => settings.RecordingKeepPausedFrames = value),
+            Toggle("保留死亡前的失败尝试", () => settings.RecordingKeepFailedAttempts, value => settings.RecordingKeepFailedAttempts = value),
             Toggle("切面自动存档（保持视频连续）", () => settings.RecordingAutoSaveOnTransition,
                 value => settings.RecordingAutoSaveOnTransition = value),
             EnumRow("BGM 拼接", () => settings.BgmMode, value => settings.BgmMode = value),
@@ -1663,6 +1667,9 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 2000, 50000, 1000, value => $"{value / 1000f:0.#} Mbps"),
             Text("编码器", () => settings.RecordingEncoder, value => settings.RecordingEncoder = value, "auto / nvenc / qsv / amf…", 48));
         Group(RecorderSettingsSection.Storage,
+            Action("恢复未保存录像", "恢复", RecordingRecovery.Recover,
+                () => !RecordingRecovery.IsRecovering && !AutoRecorder.IsRecording && !AutoRecorder.IsFinalizing && !AutoRecorder.IsDeathReplayRecording),
+            Status("录像恢复", () => RecordingRecovery.Status),
             Range("最多保留手动录像", () => settings.RecordingRetentionCount, value => settings.RecordingRetentionCount = value,
                 0, 500, 10, value => value == 0 ? "不限" : $"{value} 个"),
             Range("最多保留自动录像", () => settings.AutoRecordingRetentionCount, value => settings.AutoRecordingRetentionCount = value,

@@ -7,6 +7,8 @@ internal sealed class NativeRoomRecording {
     private int stopped;
     private double lastMediaTime;
     private readonly int targetFrameRate;
+    private long nextCheckpoint;
+    private Task checkpoint = Task.CompletedTask;
     private readonly long initialSourcePoolDrops = CaptureSource.DroppedFrames;
     private readonly long initialSourceAudioDrops = CaptureSource.DroppedAudioChunks;
 
@@ -33,6 +35,7 @@ internal sealed class NativeRoomRecording {
         this.capture = capture;
         Path = path;
         targetFrameRate = MicroblocksQolUtilsModule.Settings.RecordingFrameRate;
+        RecordingRecovery.Register(path);
     }
 
     public double MediaTimeSeconds {
@@ -45,6 +48,13 @@ internal sealed class NativeRoomRecording {
             }
             return lastMediaTime;
         }
+    }
+
+    internal void CheckpointRecovery() {
+        if (Environment.TickCount64 < nextCheckpoint || !checkpoint.IsCompleted) return;
+        nextCheckpoint = Environment.TickCount64 + 1_000;
+        double seconds = MediaTimeSeconds;
+        checkpoint = Task.Run(() => RecordingRecovery.Checkpoint(Path, seconds));
     }
 
     internal double TimelineTimeSeconds => capture.TimelineTimeSeconds ?? MediaTimeSeconds;
@@ -104,11 +114,13 @@ internal sealed class NativeRoomRecording {
         return FinishAsync();
 
         async Task FinishAsync() {
+            await checkpoint.ConfigureAwait(false);
             await drain.ConfigureAwait(false);
             await Task.Run(() => {
             try {
                 // Read counters after draining, before destroying the native handle.
                 capture.Stop();
+                RecordingRecovery.Checkpoint(Path, MediaTimeSeconds);
                 var report = new RecordingCaptureReport(targetFrameRate, capture.Statistics,
                     capture.DeliveryStatistics, CaptureSource.DroppedFrames - initialSourcePoolDrops,
                     CaptureSource.DroppedAudioChunks - initialSourceAudioDrops);
@@ -127,6 +139,7 @@ internal sealed class NativeRoomRecording {
                 }
             } finally { capture.Dispose(); }
             }).ConfigureAwait(false);
+            RecordingRecovery.Release(Path);
         }
     }
 }

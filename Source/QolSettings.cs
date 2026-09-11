@@ -301,6 +301,15 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(false)]
     public bool RecordingRemoveFreezeFrames { get; set; }
 
+    [DefaultValue(true)]
+    public bool RecordingEditingEnabled { get; set; } = true;
+
+    [DefaultValue(false)]
+    public bool RecordingKeepPausedFrames { get; set; }
+
+    [DefaultValue(false)]
+    public bool RecordingKeepFailedAttempts { get; set; }
+
     [DefaultValue(60)]
     [SettingRange(30, 120)]
     public int RecordingFrameRate { get; set; } = 60;
