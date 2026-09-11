@@ -11,32 +11,55 @@ internal static class AndroidNativeLibrary {
         || (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("RALCORE_NATIVEDIR"))
             && Directory.Exists("/system/fonts"));
     private static nint backend;
+    // FFmpeg dependencies must be available before dlopen reaches the backend.
+    // Keep their handles alive for the lifetime of the process, like the backend.
+    private static readonly List<nint> dependencies = [];
+    private static readonly string[] dependencyNames = [
+        "libavutil.so", "libswresample.so", "libswscale.so", "libavcodec.so", "libavformat.so"
+    ];
 
     internal static void Load(EverestModuleMetadata metadata) {
         if (!IsAndroid || backend != 0) return;
         const string file = "libmicroblocks_qol_native.so";
-        const string entry = "Code/lib-linux/" + file;
-        byte[] bytes;
+        Dictionary<string, byte[]> libraries = [];
         if (!string.IsNullOrEmpty(metadata.PathArchive)) {
             using ZipArchive zip = ZipFile.OpenRead(metadata.PathArchive);
-            using Stream input = (zip.GetEntry(entry)
-                ?? throw new FileNotFoundException("Install the Android ARM64 mod package: " + entry)).Open();
-            using MemoryStream output = new();
-            input.CopyTo(output);
-            bytes = output.ToArray();
+            foreach (string name in dependencyNames.Append(file)) {
+                ZipArchiveEntry? entry = zip.GetEntry("Code/lib-linux/" + name);
+                if (entry is null) continue;
+                using Stream input = entry.Open();
+                using MemoryStream output = new();
+                input.CopyTo(output);
+                libraries.Add(name, output.ToArray());
+            }
         } else {
-            bytes = File.ReadAllBytes(Path.Combine(metadata.PathDirectory, entry));
+            foreach (string name in dependencyNames.Append(file)) {
+                string source = Path.Combine(metadata.PathDirectory, "Code", "lib-linux", name);
+                if (File.Exists(source)) libraries.Add(name, File.ReadAllBytes(source));
+            }
         }
+        if (!libraries.ContainsKey(file))
+            throw new FileNotFoundException("Install the Android ARM64 mod package: " + file);
+        if (dependencyNames.Any(libraries.ContainsKey) && !dependencyNames.All(libraries.ContainsKey))
+            throw new FileNotFoundException("The Android mod package is missing FFmpeg libraries; reinstall it.");
         // External Android storage is noexec. CeleMod's DOTNET_ROOT is in its
         // private files directory, alongside the extracted runtime libraries.
         string runtime = Environment.GetEnvironmentVariable("DOTNET_ROOT")
             ?? throw new InvalidOperationException("Android host did not provide DOTNET_ROOT");
-        string hash = Convert.ToHexString(SHA256.HashData(bytes));
+        using IncrementalHash digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (byte[] bytes in libraries.Values) digest.AppendData(bytes);
+        string hash = Convert.ToHexString(digest.GetHashAndReset());
         string cache = Path.Combine(runtime, "mod-native-cache", "MicroblocksQolUtils", hash);
         Directory.CreateDirectory(cache);
-        string path = Path.Combine(cache, file);
-        if (!File.Exists(path)) File.WriteAllBytes(path, bytes);
-        backend = NativeLibrary.Load(path);
+        foreach (var (name, bytes) in libraries) {
+            string path = Path.Combine(cache, name);
+            // Rewrite incomplete/corrupt cache entries after an interrupted extraction.
+            if (!File.Exists(path) || !SHA256.HashData(File.ReadAllBytes(path)).SequenceEqual(SHA256.HashData(bytes)))
+                File.WriteAllBytes(path, bytes);
+        }
+        foreach (string name in dependencyNames)
+            if (libraries.ContainsKey(name)) dependencies.Add(NativeLibrary.Load(Path.Combine(cache, name)));
+        backend = NativeLibrary.Load(Path.Combine(cache, file));
         NativeLibrary.SetDllImportResolver(typeof(AndroidNativeLibrary).Assembly, Resolve);
     }
 
