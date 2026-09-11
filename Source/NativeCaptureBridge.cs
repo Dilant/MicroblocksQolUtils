@@ -1,7 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using System.Reflection;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
@@ -12,26 +11,11 @@ public static class NativeCaptureBridge {
     private static bool available;
     private static string? loadError;
 
-    // Everest's desktop AssemblyLoadContext does not assign an unmanaged-library
-    // folder on Android. Resolve our own library from the packaged lib-linux
-    // directory so P/Invoke also works when the mod is loaded from a ZIP cache.
-    static NativeCaptureBridge() {
-        if (!OperatingSystem.IsAndroid()) return;
-        NativeLibrary.SetDllImportResolver(typeof(NativeCaptureBridge).Assembly, ResolveAndroidLibrary);
-    }
-
-    private static nint ResolveAndroidLibrary(string name, Assembly assembly, DllImportSearchPath? searchPath) {
-        if (!string.Equals(name, LibraryName, StringComparison.Ordinal)) return nint.Zero;
-        string? directory = Path.GetDirectoryName(assembly.Location);
-        if (string.IsNullOrEmpty(directory)) return nint.Zero;
-        string path = Path.Combine(directory, "lib-linux", "lib" + LibraryName + ".so");
-        return NativeLibrary.TryLoad(path, out nint handle) ? handle : nint.Zero;
-    }
-
     public static bool Available => available;
 
     public static void InitializeFromMod(EverestModuleMetadata metadata) {
         ArgumentNullException.ThrowIfNull(metadata);
+        AndroidNativeLibrary.Load(metadata);
         Initialize(null);
     }
 
