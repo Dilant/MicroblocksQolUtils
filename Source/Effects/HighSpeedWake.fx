@@ -15,6 +15,7 @@ texture FieldTex;
 texture BlurHalfTex;
 texture BlurQuarterTex;
 texture BlurEighthTex;
+texture PlayerMaskTex;
 
 sampler2D screenS : register(s0) = sampler_state {
     Texture = (ScreenTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
@@ -36,26 +37,27 @@ sampler2D eighthS : register(s4) = sampler_state {
     Texture = (BlurEighthTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
+sampler2D playerMaskS : register(s5) = sampler_state {
+    Texture = (PlayerMaskTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
+    AddressU = Clamp; AddressV = Clamp;
+};
 
 float WarpScale;
 float2 CaShift;
 float BrightnessLift;
 float BlurAmount;
 float2 PlayerUV;
-float2 PlayerRadiusUV;
+float2 PlayerMaskSpan;
 float2 ScreenTexel;
 
 float Smoothstep01(float x) { return x * x * (3.0 - 2.0 * x); }
 
-// Pushes a sample position out of the player's ellipse (sized from the hitbox)
-// so the sprite is never smeared into the wake by displaced sampling.
-// Branch-free: inside the ellipse the position is projected onto its rim,
-// outside it is left untouched.
-float2 AvoidPlayer(float2 uv) {
-    float2 delta = uv - PlayerUV;
-    float len = length(delta / PlayerRadiusUV);
-    float scale = 1.0 / min(1.0, max(len, 1e-5));
-    return PlayerUV + delta * scale;
+// The player rendered alone into transparency: its alpha is the exact
+// avoidance mask, pixel-accurate for the current animation frame. Pixels on
+// the player drop the effect; samples that land on the sprite fall back to
+// the untouched frame.
+float PlayerMask(float2 uv) {
+    return tex2D(playerMaskS, (uv - PlayerUV) / PlayerMaskSpan + 0.5).a;
 }
 
 // Rounded cross-tap sample for the blur pyramid levels (fx_2_0 cannot pass
@@ -70,8 +72,9 @@ float2 AvoidPlayer(float2 uv) {
 float4 WakePixel(float2 uv : TEXCOORD0) : COLOR0 {
     float4 field = tex2D(fieldS, uv);
     float2 vec = field.rg - 0.5;
-    float strength = field.b;
-    float2 wuv = AvoidPlayer(uv + vec * WarpScale);
+    // No effect on the player itself.
+    float strength = field.b * (1.0 - PlayerMask(uv));
+    float2 wuv = uv + vec * WarpScale;
     float3 col = tex2D(screenS, wuv);
     // Graded blur: radius follows wake strength continuously across three
     // pyramid levels, each sampled with a rounded cross-tap kernel.
@@ -87,9 +90,9 @@ float4 WakePixel(float2 uv : TEXCOORD0) : COLOR0 {
     // Wake-local chromatic aberration.
     float fringe = saturate(strength * 1.3);
     float3 shifted = float3(
-        tex2D(screenS, AvoidPlayer(wuv + CaShift)).r,
+        tex2D(screenS, wuv + CaShift).r,
         col.g,
-        tex2D(screenS, AvoidPlayer(wuv - CaShift)).b);
+        tex2D(screenS, wuv - CaShift).b);
     col = lerp(col, shifted, fringe);
     col += BrightnessLift * strength;
     // Compose inside the shader: outside the wake, emit the untouched frame
@@ -99,6 +102,8 @@ float4 WakePixel(float2 uv : TEXCOORD0) : COLOR0 {
     float3 base = tex2D(screenS, nnUv);
     float coverage = saturate((strength - 0.05) / 0.20);
     coverage = Smoothstep01(coverage);
+    // Samples that would land on the sprite fall back to the untouched frame.
+    coverage *= 1.0 - PlayerMask(wuv);
     col = lerp(base, col, coverage);
     return float4(col, 1);
 }

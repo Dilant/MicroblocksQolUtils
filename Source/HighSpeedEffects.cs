@@ -83,6 +83,10 @@ public static class HighSpeedEffects {
     private static RenderTarget2D? screenHalf;
     private static RenderTarget2D? screenQuarter;
     private static RenderTarget2D? screenEighth;
+    // The player rendered alone into transparency — its alpha channel is the
+    // exact wake-avoidance mask (follows the current animation frame).
+    private static RenderTarget2D? playerMaskRT;
+    private const int PlayerMaskSize = 64;
     private static int screenWidth;
     private static int screenHeight;
 
@@ -121,6 +125,8 @@ public static class HighSpeedEffects {
         screenQuarter = null;
         screenEighth?.Dispose();
         screenEighth = null;
+        playerMaskRT?.Dispose();
+        playerMaskRT = null;
         wakeEffect?.Dispose();
         wakeEffect = null;
         diagnosedWake = false;
@@ -457,14 +463,23 @@ public static class HighSpeedEffects {
             ? direction * offsetPixels / new Vector2(width, height)
             : Vector2.Zero);
         effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
-        // Keep displaced sampling away from the player's sprite: an ellipse
-        // sized from the hitbox with a little padding for hair and limbs.
+        // Exact player mask: render the player (current animation frame, hair,
+        // facing) into a small transparent texture; the shader samples its
+        // alpha so the wake never covers or samples the sprite.
+        RenderTarget2D playerMask = playerMaskRT ??= new RenderTarget2D(device, PlayerMaskSize, PlayerMaskSize,
+            false, SurfaceFormat.Color, DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        device.SetRenderTarget(playerMask);
+        device.Clear(Color.Transparent);
+        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp,
+            DepthStencilState.None, RasterizerState.CullNone, null, level.Camera.Matrix);
+        player.Render();
+        Draw.SpriteBatch.End();
         Vector2 playerLocal = player.Center - level.Camera.Position;
         if (SaveData.Instance.Assists.MirrorMode) playerLocal.X = 320f - playerLocal.X;
         effect.Parameters["PlayerUV"].SetValue(playerLocal / new Vector2(FieldWidth, FieldHeight));
-        float halfWidth = (player.Collider?.Width ?? 8f) * 0.5f * 1.8f + 3f;
-        float halfHeight = (player.Collider?.Height ?? 11f) * 0.5f * 1.8f + 3f;
-        effect.Parameters["PlayerRadiusUV"].SetValue(new Vector2(halfWidth / FieldWidth, halfHeight / FieldHeight));
+        effect.Parameters["PlayerMaskSpan"].SetValue(
+            new Vector2(PlayerMaskSize / (float)FieldWidth, PlayerMaskSize / (float)FieldHeight));
+        effect.Parameters["PlayerMaskTex"].SetValue(playerMask);
         bool diagnose = !diagnosedWake;
         diagnosedWake = true;
         device.SetRenderTarget(screenWork);
