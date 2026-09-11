@@ -36,10 +36,11 @@ public static class HighSpeedEffects {
     private const float WakePushScale = 0.6f;
     private const float WakeForwardCut = 0.45f;
 
-    // Final mesh: how strongly the wake vectors displace the composed image.
-    private const int MeshCellsX = 40;
-    private const int MeshCellsY = 24;
-    private const float MeshWarpScale = 0.06f;
+    // Wake warp: how strongly the wake vectors displace the composed image. The
+    // warp runs as a pure-spritebatch tile grid — the same drawing path as every
+    // other layer here, no custom vertex pipeline involved.
+    private const int WarpTileSize = 4;
+    private const float MeshWarpScale = 6f;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -95,11 +96,6 @@ public static class HighSpeedEffects {
     // they follow the wake's own fade-out instead of the player's speed.
     private static float fieldActivity;
 
-    private static VertexPositionColorTexture[]? meshVertices;
-    private static short[]? meshIndices;
-    private static IndexBuffer? meshIndexBuffer;
-    private static BasicEffect? meshEffect;
-
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
     // player's actual path.
@@ -141,12 +137,6 @@ public static class HighSpeedEffects {
         blurHalf = null;
         blurQuarter?.Dispose();
         blurQuarter = null;
-        meshEffect?.Dispose();
-        meshEffect = null;
-        meshIndexBuffer?.Dispose();
-        meshIndexBuffer = null;
-        meshVertices = null;
-        meshIndices = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -491,75 +481,30 @@ public static class HighSpeedEffects {
         => Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, blend, sampler,
             DepthStencilState.None, RasterizerState.CullNone);
 
-    // Redraws the composed level through a vertex grid whose UVs are displaced
-    // by the wake vectors; vertex alpha (wake strength) makes the warp fade at
-    // the rim, so unmixed pixels keep the sharp source underneath.
+    // Redraws the composed level through a pure-spritebatch tile grid: every
+    // small tile samples the snapshot with its source rectangle shifted by the
+    // wake vector, and the tint carries the wake strength so the warp lerps in
+    // from the sharp image at the rim. Same drawing path as every other layer
+    // here — no custom vertex pipeline to go wrong.
     private static void WarpComposedMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
-        if (meshVertices is null || meshIndices is null || meshIndexBuffer is null || meshEffect is null) {
-            BuildMesh(device);
-            meshEffect = new BasicEffect(device) {
-                TextureEnabled = true,
-                VertexColorEnabled = true,
-                World = Matrix.Identity,
-                View = Matrix.Identity,
-                Projection = Matrix.CreateOrthographicOffCenter(0f, FieldWidth, FieldHeight, 0f, 0f, 1f),
-            };
-        }
-        VertexPositionColorTexture[] vertices = meshVertices!;
-        short[] indices = meshIndices!;
-        BasicEffect effect = meshEffect!;
-
-        int vertex = 0;
-        for (int j = 0; j <= MeshCellsY; j++) {
-            int sampleY = Math.Min(j * FieldHeight / MeshCellsY, FieldHeight - 1);
-            for (int i = 0; i <= MeshCellsX; i++) {
-                int sampleX = Math.Min(i * FieldWidth / MeshCellsX, FieldWidth - 1);
-                int index = sampleY * FieldWidth + sampleX;
-                float x = (float)Math.Min(i * FieldWidth / MeshCellsX, FieldWidth);
-                float y = (float)Math.Min(j * FieldHeight / MeshCellsY, FieldHeight);
-                float strength = WakeStrength[index];
-                byte alpha = (byte)(strength * 255f);
-                vertices[vertex].Position = new Vector3(x, y, 0f);
-                // rgb mirrors alpha so alpha blending lerps sharp -> warped.
-                vertices[vertex].Color = new Color(alpha, alpha, alpha, alpha);
-                vertices[vertex].TextureCoordinate = new Vector2(
-                    x / FieldWidth + WakeVecX[index] * MeshWarpScale,
-                    y / FieldHeight + WakeVecY[index] * MeshWarpScale);
-                vertex++;
-            }
-        }
-
         device.SetRenderTarget(target);
         device.Clear(Color.Transparent);
-        device.Indices = meshIndexBuffer;
-        effect.Texture = source;
-        foreach (EffectPass pass in effect.CurrentTechnique.Passes) {
-            pass.Apply();
-            device.DrawUserIndexedPrimitives(PrimitiveType.TriangleList,
-                vertices, 0, vertices.Length, indices, 0, indices.Length / 3);
-        }
-    }
-
-    private static void BuildMesh(GraphicsDevice device) {
-        int columns = MeshCellsX + 1;
-        int rows = MeshCellsY + 1;
-        meshVertices = new VertexPositionColorTexture[columns * rows];
-        meshIndices = new short[MeshCellsX * MeshCellsY * 6];
-        int index = 0;
-        for (int j = 0; j < MeshCellsY; j++) {
-            for (int i = 0; i < MeshCellsX; i++) {
-                int a = j * columns + i;
-                meshIndices[index++] = (short)a;
-                meshIndices[index++] = (short)(a + 1);
-                meshIndices[index++] = (short)(a + columns);
-                meshIndices[index++] = (short)(a + 1);
-                meshIndices[index++] = (short)(a + columns + 1);
-                meshIndices[index++] = (short)(a + columns);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        for (int y = 0; y < FieldHeight; y += WarpTileSize) {
+            for (int x = 0; x < FieldWidth; x += WarpTileSize) {
+                int index = y * FieldWidth + x;
+                float strength = WakeStrength[index];
+                byte alpha = (byte)(strength * 255f);
+                if (alpha == 0) continue;
+                int shiftX = (int)MathF.Round(WakeVecX[index] * MeshWarpScale);
+                int shiftY = (int)MathF.Round(WakeVecY[index] * MeshWarpScale);
+                Rectangle sourceRect = new(x + shiftX, y + shiftY, WarpTileSize, WarpTileSize);
+                // rgb mirrors alpha so alpha blending lerps sharp -> warped.
+                Draw.SpriteBatch.Draw(source, new Vector2(x, y), sourceRect,
+                    new Color(alpha, alpha, alpha, alpha));
             }
         }
-        meshIndexBuffer = new IndexBuffer(device, IndexElementSize.SixteenBits,
-            meshIndices.Length, BufferUsage.WriteOnly);
-        meshIndexBuffer.SetData(meshIndices);
+        Draw.SpriteBatch.End();
     }
 
     // The blur pyramid: two successive halvings of the composed level, each
