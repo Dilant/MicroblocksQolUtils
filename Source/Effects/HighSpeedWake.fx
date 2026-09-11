@@ -43,6 +43,7 @@ float BrightnessLift;
 float BlurAmount;
 float2 PlayerUV;
 float PlayerRadiusUV;
+float2 ScreenTexel;
 
 float Smoothstep01(float x) { return x * x * (3.0 - 2.0 * x); }
 
@@ -92,7 +93,7 @@ float4 WakePixel(float2 uv : TEXCOORD0) : COLOR0 {
     // Compose inside the shader: outside the wake, emit the untouched frame
     // with nearest-neighbour sampling so the pixel-perfect upscale survives;
     // the result is written back with opaque blending, no dst dependency.
-    float2 nnUv = (floor(uv * float2(320.0, 180.0)) + 0.5) / float2(320.0, 180.0);
+    float2 nnUv = (floor(uv / ScreenTexel) + 0.5) * ScreenTexel;
     float3 base = tex2D(screenS, nnUv);
     float coverage = saturate((strength - 0.05) / 0.20);
     coverage = Smoothstep01(coverage);

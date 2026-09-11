@@ -102,14 +102,12 @@ public static class HighSpeedEffects {
         On.Celeste.Player.Update += PlayerUpdate;
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
-        On.Celeste.HudRenderer.RenderContent += HudRenderContent;
     }
 
     public static void Unload() {
         On.Celeste.Player.Update -= PlayerUpdate;
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
-        On.Celeste.HudRenderer.RenderContent -= HudRenderContent;
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
@@ -395,33 +393,29 @@ public static class HighSpeedEffects {
         }
     }
 
-    // The level buffer is finished here; only the field is built at this point,
-    // the actual post processing runs at render resolution once the frame is
-    // composed to the backbuffer.
+    // The level buffer is finished here (bloom, glitch, foreground) and still
+    // bound — the wake pass runs inside the pipeline, reading and writing the
+    // level buffer itself. With MotionSmoothing's Fancy mode that buffer is a
+    // 1920x1080 surface, so the effect automatically runs at high resolution
+    // there and falls back to 320x180 otherwise.
     private static void GlitchApply(On.Celeste.Glitch.orig_Apply orig, VirtualRenderTarget source,
         float timer, float seed, float amplitude) {
         orig(source, timer, seed, amplitude);
-        if (source == GameplayBuffers.Level) BuildWakeField(Engine.Scene as Level);
+        if (source == GameplayBuffers.Level) {
+            BuildWakeField(Engine.Scene as Level);
+            RenderWakeInPipeline(Engine.Scene as Level);
+        }
     }
 
-    // Runs right before the HUD content: the composed frame sits in the
-    // backbuffer, so the wake shader runs at full render resolution.
-    private static void HudRenderContent(On.Celeste.HudRenderer.orig_RenderContent orig,
-        HudRenderer self, Scene scene) {
-        RenderScreenEffects(scene as Level);
-        orig(self, scene);
-    }
-
-    private static void RenderScreenEffects(Level? level) {
-        if (level is null || !Active || fieldActivity <= 0.01f || HiresRenderer.DrawToBuffer) return;
+    private static void RenderWakeInPipeline(Level? level) {
+        if (level is null || !Active || fieldActivity <= 0.01f) return;
         if (!Settings.HighSpeedWarp && !Settings.HighSpeedBlur && !Settings.HighSpeedAberration) return;
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
-        // Engine.Viewport is Celeste's presentation viewport (what the level
-        // composite targets); the device's current viewport could belong to
-        // whatever render target is bound right now (e.g. a 320x180 buffer).
-        Viewport viewport = Engine.Viewport;
-        if (viewport.Width < 16 || viewport.Height < 16) return;
-        EnsureScreenTargets(device, viewport.Width, viewport.Height);
+        RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
+        int width = levelBuffer.Width;
+        int height = levelBuffer.Height;
+        if (width < 16 || height < 16) return;
+        EnsureScreenTargets(device, width, height);
 
         List<Entity> players = level.Tracker.GetEntities<Player>();
         Player? player = FindFocusPlayer(level)
@@ -429,10 +423,8 @@ public static class HighSpeedEffects {
         if (player is null) return;
         PlayerFx fx = Fx.GetOrCreateValue(player);
 
-        // The blur pyramid comes from the level buffer; the shader then renders
-        // at full resolution, warping and blurring through linear sampling of
-        // the field-sized sources — smooth output instead of magnified pixels.
-        RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
+        // Blur pyramid from the level buffer (half/quarter/eighth of its real
+        // size — high resolution under MotionSmoothing, field-sized otherwise).
         device.SetRenderTarget(screenHalf);
         BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
         Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
@@ -447,7 +439,7 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
 
         // One shader pass: warp + graded blur + aberration + brightness lift,
-        // with wake coverage in alpha so only the wake region is replaced.
+        // self-composited over a nearest-neighbour copy of the frame.
         float activity = MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f);
         float intensity = Intensity;
         Effect effect = GetWakeEffect();
@@ -456,12 +448,13 @@ public static class HighSpeedEffects {
         effect.Parameters["BlurHalfTex"].SetValue(screenHalf);
         effect.Parameters["BlurQuarterTex"].SetValue(screenQuarter);
         effect.Parameters["BlurEighthTex"].SetValue(screenEighth);
+        effect.Parameters["ScreenTexel"].SetValue(new Vector2(1f / width, 1f / height));
         effect.Parameters["WarpScale"].SetValue(Settings.HighSpeedWarp ? 0.06f : 0f);
         effect.Parameters["BlurAmount"].SetValue(Settings.HighSpeedBlur ? 1f : 0f);
         Vector2 direction = ScreenDirection(player, fx);
         float offsetPixels = MathF.Max(1f, (0.2f + 1.1f * activity) * intensity);
         effect.Parameters["CaShift"].SetValue(Settings.HighSpeedAberration
-            ? direction * offsetPixels / new Vector2(viewport.Width, viewport.Height)
+            ? direction * offsetPixels / new Vector2(width, height)
             : Vector2.Zero);
         effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
         // Keep displaced sampling away from the player's sprite.
@@ -471,45 +464,30 @@ public static class HighSpeedEffects {
         effect.Parameters["PlayerRadiusUV"].SetValue(20f / FieldWidth);
         bool diagnose = !diagnosedWake;
         diagnosedWake = true;
-        Color[]? before = diagnose ? ReadBackbufferCentre(device, viewport) : null;
         device.SetRenderTarget(screenWork);
-        device.Clear(Color.Transparent);
         Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp,
             DepthStencilState.None, RasterizerState.CullNone, effect);
-        // Drive the shader with a quad covering the whole output — the source
-        // texture's own size would leave the rest of the target as garbage.
-        Draw.SpriteBatch.Draw(levelBuffer, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
+        Draw.SpriteBatch.Draw(levelBuffer, new Rectangle(0, 0, width, height), Color.White);
         Draw.SpriteBatch.End();
         Color[]? work = diagnose ? ReadTargetCentre(screenWork!) : null;
 
-        // The shader composes the untouched frame into its output itself, so the
-        // write-back is a plain opaque replace — no blending semantics involved.
-        device.SetRenderTarget(null);
-        device.Viewport = viewport;
+        // Write the processed frame back into the level buffer; the vanilla
+        // composite (or MotionSmoothing's) then carries it to the screen.
+        device.SetRenderTarget(levelBuffer);
         BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(screenWork, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
+        Draw.SpriteBatch.Draw(screenWork, new Rectangle(0, 0, width, height), Color.White);
         Draw.SpriteBatch.End();
         if (diagnose) {
-            Color[] after = ReadBackbufferCentre(device, viewport);
-            PresentationParameters presentation = device.PresentationParameters;
+            Color[] after = ReadTargetCentre(levelBuffer);
             Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
-                $"wakediag: viewport={viewport.X},{viewport.Y},{viewport.Width},{viewport.Height} "
-                + $"backbuffer={presentation.BackBufferWidth}x{presentation.BackBufferHeight} "
-                + $"drawToBuffer={HiresRenderer.DrawToBuffer} "
-                + $"before={before![0]} shaderOut={work![0]} after={after[0]}");
+                $"wakediag: level={width}x{height} motionSmoothing={MotionSmoothingBridge.Enabled} "
+                + $"shaderOut={work![0]} after={after[0]}");
         }
     }
 
-    // One-shot diagnostics when the wake first renders: samples the backbuffer
-    // before, the shader output, and the backbuffer after compositing.
+    // One-shot diagnostics when the wake first renders: samples the shader
+    // output and the level buffer after the write-back.
     private static bool diagnosedWake;
-
-    private static Color[] ReadBackbufferCentre(GraphicsDevice device, Viewport viewport) {
-        Color[] centre = new Color[1];
-        device.GetBackBufferData(
-            new Rectangle(viewport.X + viewport.Width / 2, viewport.Y + viewport.Height / 2, 1, 1), centre, 0, 1);
-        return centre;
-    }
 
     private static Color[] ReadTargetCentre(RenderTarget2D target) {
         Color[] centre = new Color[1];
