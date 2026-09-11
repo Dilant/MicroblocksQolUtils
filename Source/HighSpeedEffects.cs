@@ -6,12 +6,12 @@ using Monocle;
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 /// <summary>
-/// Motion feedback for the extreme speeds (1000+ px/frame) tech and gimmick maps
-/// reach, where vanilla effects read as teleportation: an additive motion ribbon
-/// in world space, chromatic aberration with radial ghosting on the level buffer,
-/// and a space-crush wake — the world along the player's recent path is pushed
-/// aside through vanilla's displacement map, like field lines bending around a
-/// wire. Purely visual; physics are untouched.
+/// Motion feedback for the extreme speeds tech and gimmick maps reach, where
+/// vanilla effects read as teleportation: an additive motion ribbon in world
+/// space, restrained chromatic aberration on the level buffer, and a water-wake
+/// space crush — the world along the player's recent path is pushed aside
+/// through vanilla's displacement map and ripples outward like a boat's wake.
+/// Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
@@ -25,18 +25,17 @@ public static class HighSpeedEffects {
         public int Head;
         public float Heat;
         public Vector2 LastDirection = new(1f, 0f);
-        // Anchor for the qol_speedfx preview: a virtual head that actually travels
-        // so a stationary player still ploughs a corridor through the world.
-        public Vector2 VirtualPosition;
     }
 
     // Trail history keyed weakly so respawned players never leak.
     private static readonly ConditionalWeakTable<Player, PlayerFx> Fx = new();
 
     private static Texture2D? crushTexture;
+    private static Texture2D? waveTexture;
 
-    // Debug override driven by the qol_speedfx command: fakes the given speed on
-    // the local player so every layer of the effect can be eyeballed in any map.
+    // Debug override driven by the qol_speedfx command: feeds the given speed to
+    // every layer while the player moves for real, so the wake follows the
+    // player's actual path.
     internal static float? DebugSpeed;
     internal static float DebugSpeedTimer;
 
@@ -56,6 +55,8 @@ public static class HighSpeedEffects {
         DebugSpeed = null;
         crushTexture?.Dispose();
         crushTexture = null;
+        waveTexture?.Dispose();
+        waveTexture = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -63,6 +64,11 @@ public static class HighSpeedEffects {
     private static bool Active => Settings.Enabled && Settings.HighSpeedEffects;
 
     private static float Intensity => Settings.HighSpeedEffectIntensity / 100f;
+
+    // Effects begin just below the threshold and saturate at 3x, so the wake is
+    // already faintly visible at the threshold itself.
+    private static float HeatCurve(float speed, float threshold)
+        => MathHelper.Clamp((speed - 0.7f * threshold) / (2.3f * threshold), 0f, 1f);
 
     private static void OnLoadLevel(Level level, Player.IntroTypes intro, bool fromLoader) {
         if (level.Tracker.GetEntity<SpaceCrushHook>() is null) level.Add(new SpaceCrushHook());
@@ -80,23 +86,16 @@ public static class HighSpeedEffects {
     private static void PlayerUpdate(On.Celeste.Player.orig_Update orig, Player self) {
         orig(self);
         PlayerFx fx = Fx.GetOrCreateValue(self);
-        if (fx.Count == 0) fx.VirtualPosition = self.Center;
         if (self.Speed.LengthSquared() > 1f) fx.LastDirection = Vector2.Normalize(self.Speed);
-        if (DebugSpeed is float debugSpeed) {
+        float speed = DebugSpeed is float debugSpeed ? debugSpeed : self.Speed.Length();
+        if (DebugSpeed is float) {
             DebugSpeedTimer -= Engine.RawDeltaTime;
             if (DebugSpeedTimer <= 0f) DebugSpeed = null;
-            fx.Heat = Calc.Approach(fx.Heat, 1f, 8f * Engine.DeltaTime);
-            fx.VirtualPosition += fx.LastDirection * debugSpeed * Engine.DeltaTime;
-            PushSample(fx, fx.VirtualPosition, debugSpeed);
-        } else {
-            float speed = self.Speed.Length();
-            float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
-            float target = Active && self.Scene is Level
-                ? MathHelper.Clamp((speed - threshold) / threshold, 0f, 1f)
-                : 0f;
-            fx.Heat = Calc.Approach(fx.Heat, target, (target > fx.Heat ? 10f : 3.5f) * Engine.DeltaTime);
-            PushSample(fx, self.Position, speed);
         }
+        float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
+        float target = Active && self.Scene is Level ? HeatCurve(speed, threshold) : 0f;
+        fx.Heat = Calc.Approach(fx.Heat, target, (target > fx.Heat ? 10f : 3.5f) * Engine.DeltaTime);
+        PushSample(fx, self.Position, speed);
     }
 
     private static void PushSample(PlayerFx fx, Vector2 position, float speed) {
@@ -146,7 +145,7 @@ public static class HighSpeedEffects {
             // Streaks shooting off the sprite keep the direction legible even when
             // the ribbon itself has already left the visible area.
             Vector2 direction = player.Speed.LengthSquared() > 1f ? Vector2.Normalize(player.Speed) : fx.LastDirection;
-            float streak = MathHelper.Clamp((speed - 400f) * 0.05f, 10f, 90f) * heat * intensity;
+            float streak = MathHelper.Clamp((speed - 300f) * 0.05f, 8f, 80f) * heat * intensity;
             for (int i = 0; i < 3; i++) {
                 Vector2 side = new Vector2(-direction.Y, direction.X) * ((i - 1) * 7f);
                 Vector2 start = player.Center + side - direction * 8f;
@@ -178,7 +177,8 @@ public static class HighSpeedEffects {
         Vector2 direction = ScreenDirection(player, fx);
         Vector2 focus = player.Center - level.Camera.Position;
         if (SaveData.Instance.Assists.MirrorMode) focus.X = 320f - focus.X;
-        float offset = MathF.Max(0.75f, (0.5f + 3f * heat) * intensity);
+        // Deliberately restrained: aberration is seasoning, not the dish.
+        float offset = MathF.Max(0.5f, (0.2f + 1.1f * heat) * intensity);
 
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
@@ -203,22 +203,23 @@ public static class HighSpeedEffects {
         // Two enlarged copies centred on the player smear the world outward from
         // the focal point, selling extreme velocity without a blur pass.
         float smear = heat * intensity;
-        Draw.SpriteBatch.Draw(temp, focus, null, Color.White * (0.10f * smear), 0f, focus,
-            1f + 0.015f * smear, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.Draw(temp, focus, null, Color.White * (0.06f * smear), 0f, focus,
-            1f + 0.035f * smear, SpriteEffects.None, 0f);
+        Draw.SpriteBatch.Draw(temp, focus, null, Color.White * (0.05f * smear), 0f, focus,
+            1f + 0.010f * smear, SpriteEffects.None, 0f);
+        Draw.SpriteBatch.Draw(temp, focus, null, Color.White * (0.03f * smear), 0f, focus,
+            1f + 0.022f * smear, SpriteEffects.None, 0f);
         Draw.SpriteBatch.End();
     }
 
-    // The space-crush wake: for every segment of the player's recent path, push
-    // the world sideways through the displacement map — perpendicular to the
-    // motion at that point, scaled by the speed at that point, decaying as the
-    // segment ages. Space "bends around" the traversed path and closes back up.
+    // The wake: two layers per path segment. The fresh crush strip squeezes the
+    // world aside right behind the player and closes again quickly; the wave lobe
+    // starts narrow near the path and spreads outward as the segment ages, like
+    // ripples propagating away from a boat's track.
     private static void RenderSpaceCrush(Level? level) {
         if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
         float intensity = Intensity;
         float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
-        Texture2D texture = GetCrushTexture();
+        Texture2D crush = GetCrushTexture();
+        Texture2D wave = GetWaveTexture();
 
         foreach (Player player in level.Tracker.GetEntities<Player>()) {
             PlayerFx fx = Fx.GetOrCreateValue(player);
@@ -233,17 +234,29 @@ public static class HighSpeedEffects {
 
                 float speed = fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
                 float speedFactor = MathHelper.Clamp(speed / threshold, 0f, 2.5f);
-                if (speedFactor <= 0.3f) continue;
+                if (speedFactor <= 0.4f) continue;
                 float age = i / (float)(fx.Count - 1);
+                float speedStrength = MathHelper.Clamp(speedFactor, 0f, 1.6f);
                 float halfWidth = 4f + 9f * speedFactor;
-                float alpha = fx.Heat * MathF.Pow(1f - age, 1.3f)
-                    * MathHelper.Clamp(speedFactor, 0f, 1.6f) * 0.5f * intensity;
-                if (alpha <= 0.01f) continue;
+                Vector2 centre = (newer + older) * 0.5f;
+                float rotation = MathF.Atan2(direction.Y, direction.X);
+                Vector2 origin = new Vector2(CrushTextureWidth, CrushTextureHeight) * 0.5f;
+                Vector2 stretch = new Vector2(length, 1f) / CrushTextureWidth * 1.12f;
 
-                Vector2 scale = new(length / CrushTextureWidth * 1.12f, halfWidth * 2f / CrushTextureHeight);
-                Draw.SpriteBatch.Draw(texture, (newer + older) * 0.5f, null, Color.White * alpha,
-                    MathF.Atan2(direction.Y, direction.X),
-                    new Vector2(CrushTextureWidth, CrushTextureHeight) * 0.5f, scale, SpriteEffects.None, 0f);
+                // Squeeze layer: strong when fresh, gone by mid-history.
+                float crushAlpha = fx.Heat * MathF.Pow(1f - age, 2.4f) * speedStrength * 0.5f * intensity;
+                if (crushAlpha > 0.01f) {
+                    Draw.SpriteBatch.Draw(crush, centre, null, Color.White * crushAlpha, rotation, origin,
+                        new Vector2(stretch.X, halfWidth * 2f / CrushTextureHeight), SpriteEffects.None, 0f);
+                }
+
+                // Wave layer: one outward lobe per side, widening as it ages out.
+                float waveAlpha = fx.Heat * MathF.Pow(1f - age, 0.8f) * speedStrength * 0.35f * intensity;
+                if (waveAlpha > 0.01f) {
+                    float spread = (0.45f + 1.6f * age) * halfWidth;
+                    Draw.SpriteBatch.Draw(wave, centre, null, Color.White * waveAlpha, rotation, origin,
+                        new Vector2(stretch.X, spread * 2f / CrushTextureHeight), SpriteEffects.None, 0f);
+                }
             }
         }
     }
@@ -271,6 +284,30 @@ public static class HighSpeedEffects {
         crushTexture = new Texture2D(Engine.Instance.GraphicsDevice, CrushTextureWidth, CrushTextureHeight);
         crushTexture.SetData(pixels);
         return crushTexture;
+    }
+
+    // A propagating ripple: displacement is zero near the centre line, rises to a
+    // single outward lobe and falls back to zero — drawing it with a growing
+    // across-scale makes the lobe travel away from the path like a water ripple.
+    private static Texture2D GetWaveTexture() {
+        if (waveTexture is { } texture) return texture;
+        Color[] pixels = new Color[CrushTextureWidth * CrushTextureHeight];
+        for (int y = 0; y < CrushTextureHeight; y++) {
+            float across = (y - (CrushTextureHeight - 1) * 0.5f) / ((CrushTextureHeight - 1) * 0.5f);
+            float acrossAbs = MathF.Abs(across);
+            float lobe = acrossAbs <= 0.15f ? 0f
+                : MathF.Sin(MathF.PI * (acrossAbs - 0.15f) / 0.85f);
+            for (int x = 0; x < CrushTextureWidth; x++) {
+                float along = x / (float)(CrushTextureWidth - 1);
+                float cap = MathF.Pow(MathF.Sin(MathF.PI * along), 0.35f);
+                float sideways = MathF.Sign(across) * lobe * cap;
+                pixels[y * CrushTextureWidth + x] = new Color(new Vector4(
+                    0.5f, 0.5f + 0.5f * sideways, 0f, 1f));
+            }
+        }
+        waveTexture = new Texture2D(Engine.Instance.GraphicsDevice, CrushTextureWidth, CrushTextureHeight);
+        waveTexture.SetData(pixels);
+        return waveTexture;
     }
 
     private static Player? FindFocusPlayer(Level? level) {
