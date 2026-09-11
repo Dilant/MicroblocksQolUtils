@@ -76,7 +76,8 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public class QolSettings {
         public AutoRecordingMode AutomaticRecording;
         public bool AutoRecorderEnabled => AutomaticRecording != AutoRecordingMode.Off;
-        public bool DeathReplayEnabled, RecordingRemoveFreezeFrames;
+        public bool DeathReplayEnabled, RecordingRemoveFreezeFrames, RecordingEditingEnabled = true,
+            RecordingKeepPausedFrames, RecordingKeepFailedAttempts;
         public int DeathReplayBufferSeconds=30, RecordingRetentionCount, AutoRecordingRetentionCount, DeathReplayRetentionCount;
         public string RecordingDirectory="";
         public GoldenRecordingEnd GoldenRecordingEnd;
@@ -96,7 +97,8 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public class NativeRoomRecording {
         public static List<NativeRoomRecording> Started=[];
         public static bool FailNextStart;
-        public string Path=""; public string AudioPath=>Path+".audio"; public string BgmPath=>Path+".bgm"; public string MusicEventsPath=>Path+".music"; public string CaptureReportPath=>Path+".capture.json";
+        public string Path=""; public string AudioPath=>Path+".audio"; public string BgmPath=>Path+".bgm"; public string MusicEventsPath=>Path+".music"; public string CaptureReportPath=>Path+".capture.json"; public string RecoveryManifestPath=>Path+".recovery.json";
+        public void CheckpointRecovery() { }
         public double MediaTimeSeconds; public bool HasAudioTap=>true;
         public double TimelineTimeSeconds => MediaTimeSeconds;
         public double TimeAt(ulong timestamp) => MediaTimeSeconds;

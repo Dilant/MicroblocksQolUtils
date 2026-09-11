@@ -176,6 +176,8 @@ public static class AutoRecorder {
     }
 
     public static void AfterEngineUpdate() {
+        current?.CheckpointRecovery();
+        deathReplayCurrent?.CheckpointRecovery();
         FlushPendingRecordingStop();
         if (deathReplayFinalizeRequested) {
             deathReplayFinalizeRequested = false;
@@ -204,7 +206,7 @@ public static class AutoRecorder {
             return;
         }
         if (manualSlSuspended) return;
-        if (level.Paused) {
+        if (level.Paused && !MicroblocksQolUtilsModule.Settings.RecordingKeepPausedFrames) {
             SuspendForPause();
             return;
         }
@@ -244,7 +246,7 @@ public static class AutoRecorder {
         }
         if (manualSlSuspended) return;
         if (deathReplayFinalizeRequested) return;
-        if (level.Paused) {
+        if (level.Paused && !MicroblocksQolUtilsModule.Settings.RecordingKeepPausedFrames) {
             SuspendDeathReplayForPause();
             return;
         }
@@ -359,8 +361,10 @@ public static class AutoRecorder {
             return false;
         }
         pendingDeathBranch = false;
-        ActivePrefix.Clear();
-        ActivePrefix.AddRange(snapshot.Clips);
+        if (!MicroblocksQolUtilsModule.Settings.RecordingKeepFailedAttempts) {
+            ActivePrefix.Clear();
+            ActivePrefix.AddRange(snapshot.Clips);
+        }
         RecordingDeathAudio.StopRemainder();
         respawnAnchor = snapshot.RespawnAnchorClips is null
             ? null
@@ -417,7 +421,7 @@ public static class AutoRecorder {
         }
         // Continuing a failed golden attempt is intentionally uncut: keep the death
         // and respawn, and stay latched even after the berry leaves the followers.
-        if (action == RecordingDeathAction.Continue) {
+        if (action == RecordingDeathAction.Continue || MicroblocksQolUtilsModule.Settings.RecordingKeepFailedAttempts) {
             RecordingTransitionAutoSave.Reset();
             return body;
         }
@@ -780,6 +784,8 @@ public static class AutoRecorder {
             RecordingClip? finalClip = CurrentClip(recording.TimelineTimeSeconds);
             if (finalClip is not null) clips.Add(finalClip);
         }
+        bool unedited = !MicroblocksQolUtilsModule.Settings.RecordingEditingEnabled;
+        if (unedited) clips = [new(recording.Path, 0, recording.TimelineTimeSeconds, "", 0, BgmFollowsVideo: true)];
         current = null;
         Task stop = recording.StopAsync();
         List<RecordingFinalizationJob> jobs = [];
@@ -790,8 +796,8 @@ public static class AutoRecorder {
                 $"{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Sanitize(areaSid)}-{Guid.NewGuid():N}.mp4"
             );
             lastOutput = output;
-            jobs.Insert(0, new RecordingFinalizationJob(clips, output, SessionState.Automatic ? "自动录像" : "手动录像", reconstructBgm,
-                MicroblocksQolUtilsModule.Settings.RecordingRemoveFreezeFrames));
+            jobs.Insert(0, new RecordingFinalizationJob(clips, output, SessionState.Automatic ? "自动录像" : "手动录像", !unedited && reconstructBgm,
+                !unedited && MicroblocksQolUtilsModule.Settings.RecordingRemoveFreezeFrames, PreferVideoCopy: unedited));
         }
         FinishStoppedRecording(recording, stop, jobs);
         ResetFullRecordingState();
@@ -803,6 +809,11 @@ public static class AutoRecorder {
 
         double bufferSeconds = Math.Clamp(settings.DeathReplayBufferSeconds, 10, 60);
         List<RecordingClip> clips = CaptureRecentDeathReplayClips(recording, bufferSeconds);
+        bool unedited = !settings.RecordingEditingEnabled;
+        if (unedited) {
+            double end = recording.TimelineTimeSeconds;
+            clips = [new(recording.Path, Math.Max(0, end - bufferSeconds), Math.Min(end, bufferSeconds), "", 0, BgmFollowsVideo: true)];
+        }
         if (clips.Count == 0) return;
 
         Level? level = player.Scene as Level;
@@ -811,8 +822,8 @@ public static class AutoRecorder {
             DateTime.Now,
             level?.Session.Area.SID ?? areaSid,
             level?.Session.Level ?? "room",
-            reconstructBgm,
-            MicroblocksQolUtilsModule.Settings.RecordingRemoveFreezeFrames
+            !unedited && reconstructBgm,
+            !unedited && settings.RecordingRemoveFreezeFrames
         ));
         int retentionCount = Math.Max(0, settings.DeathReplayRetentionCount);
         if (retentionCount > 0 && PendingDeathReplays.Count > retentionCount) {
