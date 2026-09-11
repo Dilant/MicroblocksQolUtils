@@ -70,6 +70,7 @@ public static class HighSpeedEffects {
     private static readonly float[] WakeVecX = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeVecY = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeStrength = new float[FieldWidth * FieldHeight];
+    private static readonly float[] ScratchField = new float[FieldWidth * FieldHeight];
     private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
     private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
     private static Texture2D? fieldTexture;
@@ -347,15 +348,17 @@ public static class HighSpeedEffects {
             }
         }
 
+        // Blur the strength so the aberration mask is wider than the displacement
+        // band itself — the fringes then ease in over a 10px+ slope instead of
+        // hugging the wave's hard edge.
+        BlurStrength(4);
         for (int index = 0; index < FieldPixels.Length; index++) {
             float strength = WakeStrength[index];
             FieldPixels[index] = new Color(new Vector4(
                 0.5f + WakeVecX[index],
                 0.5f + WakeVecY[index],
                 0f, 1f));
-            // Wide taper: strengths up to 0.6 spread across the whole fade, so
-            // the fringe edges ease out over a broad band instead of a rim.
-            float ramp = MathHelper.Clamp(strength / 0.6f, 0f, 1f);
+            float ramp = MathHelper.Clamp((strength - 0.12f) / 0.58f, 0f, 1f);
             float mask = ramp * ramp * (3f - 2f * ramp);
             CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
         }
@@ -366,6 +369,35 @@ public static class HighSpeedEffects {
         // The hook's sprite batch is already begun with the camera transform and
         // alpha blending; draw the field over the camera's view of the world.
         Draw.SpriteBatch.Draw(texture, camera, Color.White);
+    }
+
+    // Separable box blur over the wake strength, in place.
+    private static void BlurStrength(int radius) {
+        int width = FieldWidth, height = FieldHeight;
+        Span<float> scratch = ScratchField;
+        int window = radius * 2 + 1;
+        int stride = width;
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            float sum = 0f;
+            for (int k = -radius; k <= radius; k++)
+                sum += WakeStrength[row + Math.Clamp(k, 0, width - 1)];
+            for (int x = 0; x < width; x++) {
+                scratch[row + x] = sum / window;
+                sum -= WakeStrength[row + Math.Clamp(x - radius, 0, width - 1)];
+                sum += WakeStrength[row + Math.Clamp(x + radius + 1, 0, width - 1)];
+            }
+        }
+        for (int x = 0; x < width; x++) {
+            float sum = 0f;
+            for (int k = -radius; k <= radius; k++)
+                sum += scratch[Math.Clamp(k, 0, height - 1) * stride + x];
+            for (int y = 0; y < height; y++) {
+                WakeStrength[y * width + x] = sum / window;
+                sum -= scratch[Math.Clamp(y - radius, 0, height - 1) * stride + x];
+                sum += scratch[Math.Clamp(y + radius + 1, 0, height - 1) * stride + x];
+            }
+        }
     }
 
     // Runs right after the level buffer is finished (bloom, glitch, foreground):
@@ -417,10 +449,10 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.Draw(tempA, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        DrawMaskedLayer(device, tempB, tempA, direction * offset, maskPosition, new Color(255, 0, 0, 255));
-        DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 255, 255));
+        DrawMaskedLayer(device, tempB, tempA, direction * offset, maskPosition, new Color(170, 0, 0, 255));
+        DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 170, 255));
         // A faint uniform white copy inside the wake acts as a brightness lift.
-        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(60, 60, 60, 255));
+        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(85, 85, 85, 255));
         // Two slight along-motion copies soften the wake with directional blur.
         DrawMaskedLayer(device, tempB, tempA, direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
         DrawMaskedLayer(device, tempB, tempA, -direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
