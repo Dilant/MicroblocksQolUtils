@@ -8,34 +8,32 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// <summary>
 /// Motion feedback for the extreme speeds (1000+ px/frame) tech and gimmick maps
 /// reach, where vanilla effects read as teleportation: an additive motion ribbon
-/// in world space, a screen warp driven through vanilla Distort.Anxiety, a
-/// shader-free chromatic-aberration + radial-ghost pass on the level buffer, and
-/// comic-style speed lines over gameplay. Purely visual; physics are untouched.
+/// in world space, chromatic aberration with radial ghosting on the level buffer,
+/// and a space-crush wake — the world along the player's recent path is pushed
+/// aside through vanilla's displacement map, like field lines bending around a
+/// wire. Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
-    private const float MaxWarp = 0.30f;
+    private const int CrushTextureWidth = 128;
+    private const int CrushTextureHeight = 64;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
+        public readonly float[] Speeds = new float[TrailSamples];
         public int Count;
         public int Head;
         public float Heat;
         public Vector2 LastDirection = new(1f, 0f);
+        // Anchor for the qol_speedfx preview: a virtual head that actually travels
+        // so a stationary player still ploughs a corridor through the world.
+        public Vector2 VirtualPosition;
     }
 
     // Trail history keyed weakly so respawned players never leak.
     private static readonly ConditionalWeakTable<Player, PlayerFx> Fx = new();
 
-    // Deterministic RNG owned by the render hooks; Calc.Random must stay untouched
-    // here or replay/TAS gameplay rolls would depend on the draw rate.
-    private static readonly Random Random = new();
-
-    // Distort.Anxiety is shared with vanilla cutscenes (Gondola darkness, seekers).
-    // Only steer it while our speed owns a non-zero value; fade it out from the
-    // render hook once the player stops updating with a warp-worthy speed.
-    private static float ownedAnxiety;
-    private static ulong anxietyOwnerFrame = ulong.MaxValue;
+    private static Texture2D? crushTexture;
 
     // Debug override driven by the qol_speedfx command: fakes the given speed on
     // the local player so every layer of the effect can be eyeballed in any map.
@@ -46,18 +44,18 @@ public static class HighSpeedEffects {
         On.Celeste.Player.Update += PlayerUpdate;
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
-        On.Celeste.HudRenderer.RenderContent += HudRenderContent;
+        Everest.Events.Level.OnLoadLevel += OnLoadLevel;
     }
 
     public static void Unload() {
         On.Celeste.Player.Update -= PlayerUpdate;
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
-        On.Celeste.HudRenderer.RenderContent -= HudRenderContent;
+        Everest.Events.Level.OnLoadLevel -= OnLoadLevel;
         Fx.Clear();
         DebugSpeed = null;
-        if (ownedAnxiety > 0f) Distort.Anxiety = 0f;
-        ownedAnxiety = 0f;
+        crushTexture?.Dispose();
+        crushTexture = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -66,14 +64,29 @@ public static class HighSpeedEffects {
 
     private static float Intensity => Settings.HighSpeedEffectIntensity / 100f;
 
+    private static void OnLoadLevel(Level level, Player.IntroTypes intro, bool fromLoader) {
+        if (level.Tracker.GetEntity<SpaceCrushHook>() is null) level.Add(new SpaceCrushHook());
+    }
+
+    // Carries the displacement hook; vanilla's DisplacementRenderer collects one
+    // callback per hook component while filling the displacement buffer.
+    private sealed class SpaceCrushHook : Entity {
+        public SpaceCrushHook() => Add(new DisplacementRenderHook(RenderCrush));
+
+        private void RenderCrush() => RenderSpaceCrush(Engine.Scene as Level);
+    }
+
     private static void PlayerUpdate(On.Celeste.Player.orig_Update orig, Player self) {
         orig(self);
         PlayerFx fx = Fx.GetOrCreateValue(self);
+        if (fx.Count == 0) fx.VirtualPosition = self.Center;
+        if (self.Speed.LengthSquared() > 1f) fx.LastDirection = Vector2.Normalize(self.Speed);
         if (DebugSpeed is float debugSpeed) {
             DebugSpeedTimer -= Engine.RawDeltaTime;
             if (DebugSpeedTimer <= 0f) DebugSpeed = null;
             fx.Heat = Calc.Approach(fx.Heat, 1f, 8f * Engine.DeltaTime);
-            UpdateMotion(fx, self, debugSpeed);
+            fx.VirtualPosition += fx.LastDirection * debugSpeed * Engine.DeltaTime;
+            PushSample(fx, fx.VirtualPosition, debugSpeed);
         } else {
             float speed = self.Speed.Length();
             float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
@@ -81,26 +94,15 @@ public static class HighSpeedEffects {
                 ? MathHelper.Clamp((speed - threshold) / threshold, 0f, 1f)
                 : 0f;
             fx.Heat = Calc.Approach(fx.Heat, target, (target > fx.Heat ? 10f : 3.5f) * Engine.DeltaTime);
-            UpdateMotion(fx, self, speed);
-        }
-
-        if (fx.Heat > 0f && Active && Settings.HighSpeedWarp
-            && self.Scene is Level level && !level.FrozenOrPaused) {
-            Camera camera = level.Camera;
-            Distort.AnxietyOrigin = new Vector2(
-                MathHelper.Clamp((self.Center.X - camera.X) / 320f, 0f, 1f),
-                MathHelper.Clamp((self.Center.Y - camera.Y) / 180f, 0f, 1f));
-            ownedAnxiety = MaxWarp * fx.Heat * Intensity;
-            Distort.Anxiety = ownedAnxiety;
-            anxietyOwnerFrame = Engine.FrameCounter;
+            PushSample(fx, self.Position, speed);
         }
     }
 
-    private static void UpdateMotion(PlayerFx fx, Player player, float speed) {
-        fx.Positions[fx.Head] = player.Position;
+    private static void PushSample(PlayerFx fx, Vector2 position, float speed) {
+        fx.Positions[fx.Head] = position;
+        fx.Speeds[fx.Head] = speed;
         fx.Head = (fx.Head + 1) % TrailSamples;
         if (fx.Count < TrailSamples) fx.Count++;
-        if (player.Speed.LengthSquared() > 1f) fx.LastDirection = Vector2.Normalize(player.Speed);
     }
 
     private static void PlayerRender(On.Celeste.Player.orig_Render orig, Player self) {
@@ -142,7 +144,7 @@ public static class HighSpeedEffects {
         if (speed > 1f) {
             // Streaks shooting off the sprite keep the direction legible even when
             // the ribbon itself has already left the visible area.
-            Vector2 direction = MotionDirection(player, fx, false);
+            Vector2 direction = player.Speed.LengthSquared() > 1f ? Vector2.Normalize(player.Speed) : fx.LastDirection;
             float streak = MathHelper.Clamp((speed - 400f) * 0.05f, 10f, 90f) * heat * intensity;
             for (int i = 0; i < 3; i++) {
                 Vector2 side = new Vector2(-direction.Y, direction.X) * ((i - 1) * 7f);
@@ -160,7 +162,6 @@ public static class HighSpeedEffects {
     private static void GlitchApply(On.Celeste.Glitch.orig_Apply orig, VirtualRenderTarget source,
         float timer, float seed, float amplitude) {
         orig(source, timer, seed, amplitude);
-        ReleaseStaleAnxiety();
         if (source != GameplayBuffers.Level || !Active || !Settings.HighSpeedAberration)
             return;
         Level? level = Engine.Scene as Level;
@@ -173,7 +174,7 @@ public static class HighSpeedEffects {
         if (heat <= 0f || speed < 1f) return;
 
         float intensity = Intensity;
-        Vector2 direction = MotionDirection(player, fx, true);
+        Vector2 direction = ScreenDirection(player, fx);
         Vector2 focus = player.Center - level.Camera.Position;
         if (SaveData.Instance.Assists.MirrorMode) focus.X = 320f - focus.X;
         float offset = MathF.Max(0.75f, (0.5f + 3f * heat) * intensity);
@@ -208,49 +209,67 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
     }
 
-    private static void ReleaseStaleAnxiety() {
-        if (ownedAnxiety <= 0f || Engine.FrameCounter == anxietyOwnerFrame) return;
-        // The player no longer updates with warp-worthy speed (death, cutscene,
-        // pause); fade our value out so vanilla sequences can reclaim the shader.
-        ownedAnxiety = Calc.Approach(ownedAnxiety, 0f, 6f * Engine.RawDeltaTime);
-        Distort.Anxiety = ownedAnxiety;
-    }
-
-    // Vanilla RenderContent opens and closes its own sprite batch, so drawing in
-    // a prefix lands the lines over the gameplay but under every HUD element, on
-    // both the buffer and direct-render paths.
-    private static void HudRenderContent(On.Celeste.HudRenderer.orig_RenderContent orig, HudRenderer self, Scene scene) {
-        DrawSpeedLines(scene as Level);
-        orig(self, scene);
-    }
-
-    private static void DrawSpeedLines(Level? level) {
-        if (level is null || !Active || !Settings.HighSpeedLines || level.FrozenOrPaused) return;
-        Player? player = FindFocusPlayer(level);
-        if (player is null) return;
-        PlayerFx fx = Fx.GetOrCreateValue(player);
-        if (fx.Heat <= 0f) return;
-
-        float heat = fx.Heat;
+    // The space-crush wake: for every segment of the player's recent path, push
+    // the world sideways through the displacement map — perpendicular to the
+    // motion at that point, scaled by the speed at that point, decaying as the
+    // segment ages. Space "bends around" the traversed path and closes back up.
+    private static void RenderSpaceCrush(Level? level) {
+        if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
         float intensity = Intensity;
-        Vector2 screenDirection = MotionDirection(player, fx, true);
-        float baseAngle = MathF.Atan2(screenDirection.Y, screenDirection.X);
-        Vector2 center = new Vector2(960f, 540f) - screenDirection * (90f * heat);
-        Color tint = Color.Lerp(Color.White, Color.Cyan, 0.25f);
-        float strength = heat * heat * intensity;
+        float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
+        Texture2D texture = GetCrushTexture();
 
-        HiresRenderer.BeginRender(BlendState.Additive);
-        for (int i = 0; i < 24; i++) {
-            float angle = i % 10 < 7
-                ? baseAngle + MathF.PI + Triangular() * 0.9f
-                : (float)(Random.NextDouble() * MathF.PI * 2f);
-            float distance = 200f + 340f * NextFloat();
-            float length = (160f + 520f * NextFloat()) * (0.6f + 0.4f * heat);
-            float alpha = (0.05f + 0.22f * NextFloat()) * strength;
-            Vector2 radial = Calc.AngleToVector(angle, 1f);
-            Draw.Line(center + radial * distance, center + radial * (distance + length), tint * alpha, 1f + 2f * NextFloat());
+        foreach (Player player in level.Tracker.GetEntities<Player>()) {
+            PlayerFx fx = Fx.GetOrCreateValue(player);
+            if (fx.Heat <= 0f || fx.Count < 2) continue;
+            for (int i = 0; i < fx.Count - 1; i++) {
+                Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
+                Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
+                Vector2 delta = newer - older;
+                float length = delta.Length();
+                if (length < 2f) continue;
+                Vector2 direction = delta / length;
+
+                float speed = fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
+                float speedFactor = MathHelper.Clamp(speed / threshold, 0f, 2.5f);
+                if (speedFactor <= 0.3f) continue;
+                float age = i / (float)(fx.Count - 1);
+                float halfWidth = 4f + 9f * speedFactor;
+                float alpha = fx.Heat * MathF.Pow(1f - age, 1.3f)
+                    * MathHelper.Clamp(speedFactor, 0f, 1.6f) * 0.5f * intensity;
+                if (alpha <= 0.01f) continue;
+
+                Vector2 scale = new(length / CrushTextureWidth * 1.12f, halfWidth * 2f / CrushTextureHeight);
+                Draw.SpriteBatch.Draw(texture, (newer + older) * 0.5f, null, Color.White * alpha,
+                    MathF.Atan2(direction.Y, direction.X),
+                    new Vector2(CrushTextureWidth, CrushTextureHeight) * 0.5f, scale, SpriteEffects.None, 0f);
+            }
         }
-        HiresRenderer.EndRender();
+    }
+
+    // A sideways-push displacement strip: neutral on the centre line, pushing
+    // outward on both sides (peak at mid-radius, gone at the rim), with a slight
+    // along-path drag that stretches the wake. The vanilla distort shader reads
+    // this as a UV offset of (channel - 0.5).
+    private static Texture2D GetCrushTexture() {
+        if (crushTexture is { } texture) return texture;
+        Color[] pixels = new Color[CrushTextureWidth * CrushTextureHeight];
+        for (int y = 0; y < CrushTextureHeight; y++) {
+            float across = (y - (CrushTextureHeight - 1) * 0.5f) / ((CrushTextureHeight - 1) * 0.5f);
+            float acrossAbs = MathF.Abs(across);
+            float push = acrossAbs * (1f - acrossAbs) * 4f;
+            for (int x = 0; x < CrushTextureWidth; x++) {
+                float along = x / (float)(CrushTextureWidth - 1);
+                float cap = MathF.Pow(MathF.Sin(MathF.PI * along), 0.35f);
+                float sideways = MathF.Sign(across) * push * cap;
+                float drag = -0.28f * (1f - acrossAbs) * cap;
+                pixels[y * CrushTextureWidth + x] = new Color(new Vector4(
+                    0.5f + 0.5f * drag, 0.5f + 0.5f * sideways, 0f, 1f));
+            }
+        }
+        crushTexture = new Texture2D(Engine.Instance.GraphicsDevice, CrushTextureWidth, CrushTextureHeight);
+        crushTexture.SetData(pixels);
+        return crushTexture;
     }
 
     private static Player? FindFocusPlayer(Level? level) {
@@ -270,13 +289,9 @@ public static class HighSpeedEffects {
     private static float MotionSpeed(Player player, PlayerFx fx)
         => DebugSpeed is float debugSpeed ? debugSpeed : player.Speed.Length();
 
-    private static Vector2 MotionDirection(Player player, PlayerFx fx, bool screenSpace) {
+    private static Vector2 ScreenDirection(Player player, PlayerFx fx) {
         Vector2 direction = player.Speed.LengthSquared() > 1f ? Vector2.Normalize(player.Speed) : fx.LastDirection;
-        if (screenSpace && SaveData.Instance?.Assists.MirrorMode == true) direction.X = -direction.X;
+        if (SaveData.Instance?.Assists.MirrorMode == true) direction.X = -direction.X;
         return direction;
     }
-
-    private static float NextFloat() => (float)Random.NextDouble();
-
-    private static float Triangular() => NextFloat() + NextFloat() - 1f;
 }

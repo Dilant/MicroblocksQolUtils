@@ -39,28 +39,25 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(true)]
     public bool Enabled { get; set; } = true;
 
-        [DefaultValue(true)]
-        public bool HighSpeedEffects { get; set; } = true;
+    [DefaultValue(true)]
+    public bool HighSpeedEffects { get; set; } = true;
 
-        [SettingRange(200, 2000)]
-        [DefaultValue(600)]
-        public int HighSpeedThreshold { get; set; } = 600;
+    [SettingRange(200, 2000)]
+    [DefaultValue(600)]
+    public int HighSpeedThreshold { get; set; } = 600;
 
-        [SettingRange(25, 200)]
-        [DefaultValue(100)]
-        public int HighSpeedEffectIntensity { get; set; } = 100;
+    [SettingRange(25, 200)]
+    [DefaultValue(100)]
+    public int HighSpeedEffectIntensity { get; set; } = 100;
 
-        [DefaultValue(true)]
-        public bool HighSpeedTrail { get; set; } = true;
+    [DefaultValue(true)]
+    public bool HighSpeedTrail { get; set; } = true;
 
-        [DefaultValue(true)]
-        public bool HighSpeedWarp { get; set; } = true;
+    [DefaultValue(true)]
+    public bool HighSpeedWarp { get; set; } = true;
 
-        [DefaultValue(true)]
-        public bool HighSpeedAberration { get; set; } = true;
-
-        [DefaultValue(true)]
-        public bool HighSpeedLines { get; set; } = true;
+    [DefaultValue(true)]
+    public bool HighSpeedAberration { get; set; } = true;
 
     [SettingNeedsRelaunch]
     [DefaultValue(true)]
