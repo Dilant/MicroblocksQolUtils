@@ -39,6 +39,20 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(true)]
     public bool Enabled { get; set; } = true;
 
+    [DefaultValue(true)]
+    [SettingName("高速特效")]
+    public bool HighSpeedEffects { get; set; } = true;
+
+    [SettingRange(200, 2000)]
+    [DefaultValue(600)]
+    [SettingName("高速阈值")]
+    public int HighSpeedThreshold { get; set; } = 600;
+
+    [SettingRange(25, 200)]
+    [DefaultValue(100)]
+    [SettingName("高速特效强度")]
+    public int HighSpeedEffectIntensity { get; set; } = 100;
+
     [SettingNeedsRelaunch]
     [DefaultValue(true)]
     public bool HiDpiFix { get; set; } = true;
