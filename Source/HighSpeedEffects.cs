@@ -79,6 +79,17 @@ public static class HighSpeedEffects {
     // it follows the wake's own fade-out instead of the player's speed.
     private static float fieldActivity;
 
+    // Background warp: vanilla applies the displacement map only to the entity
+    // layer, so the freshly drawn backdrop gets its own pass through a warped
+    // vertex mesh (UVs perturbed straight from the wake field, no shader).
+    private const int MeshCellsX = 40;
+    private const int MeshCellsY = 24;
+    private const float BackgroundWarpScale = 0.06f;
+    private static VertexPositionTexture[]? meshVertices;
+    private static short[]? meshIndices;
+    private static IndexBuffer? meshIndexBuffer;
+    private static BasicEffect? meshEffect;
+
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
     // player's actual path.
@@ -100,6 +111,7 @@ public static class HighSpeedEffects {
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
         On.Celeste.Level.LoadLevel += LevelLoadLevel;
+        On.Celeste.BackdropRenderer.Render += BackdropRender;
     }
 
     public static void Unload() {
@@ -107,6 +119,7 @@ public static class HighSpeedEffects {
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
         On.Celeste.Level.LoadLevel -= LevelLoadLevel;
+        On.Celeste.BackdropRenderer.Render -= BackdropRender;
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
@@ -114,6 +127,12 @@ public static class HighSpeedEffects {
         fieldTexture = null;
         caMaskTexture?.Dispose();
         caMaskTexture = null;
+        meshEffect?.Dispose();
+        meshEffect = null;
+        meshIndexBuffer?.Dispose();
+        meshIndexBuffer = null;
+        meshVertices = null;
+        meshIndices = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -406,6 +425,85 @@ public static class HighSpeedEffects {
                 sum += scratch[Math.Clamp(y + radius + 1, 0, height - 1) * stride + x];
             }
         }
+    }
+
+    // Vanilla applies the displacement map only to the entity layer; the
+    // backdrop needs its own pass. Right after BackdropRenderer draws into the
+    // level buffer, snapshot it and redraw it through a mesh whose UVs are
+    // perturbed by the wake field — warping the background with the same waves.
+    private static void BackdropRender(On.Celeste.BackdropRenderer.orig_Render orig,
+        BackdropRenderer self, Scene scene) {
+        orig(self, scene);
+        if (scene is not Level || !Active || !Settings.HighSpeedWarp || fieldActivity <= 0.01f) return;
+        GraphicsDevice device = Engine.Instance.GraphicsDevice;
+        RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
+        RenderTarget2D tempA = (RenderTarget2D)GameplayBuffers.TempA;
+
+        device.SetRenderTarget(tempA);
+        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp,
+            DepthStencilState.None, RasterizerState.CullNone);
+        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
+        Draw.SpriteBatch.End();
+        WarpBackdropMesh(device, tempA, levelBuffer);
+    }
+
+    private static void WarpBackdropMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
+        if (meshVertices is null || meshIndices is null || meshIndexBuffer is null) BuildBackdropMesh(device);
+        meshEffect ??= new BasicEffect(device) {
+            TextureEnabled = true,
+            VertexColorEnabled = false,
+            World = Matrix.Identity,
+            View = Matrix.Identity,
+            Projection = Matrix.CreateOrthographicOffCenter(0f, FieldWidth, FieldHeight, 0f, 0f, 1f),
+        };
+
+        int vertex = 0;
+        for (int j = 0; j <= MeshCellsY; j++) {
+            int sampleY = Math.Min(j * FieldHeight / MeshCellsY, FieldHeight - 1);
+            for (int i = 0; i <= MeshCellsX; i++) {
+                int sampleX = Math.Min(i * FieldWidth / MeshCellsX, FieldWidth - 1);
+                int index = sampleY * FieldWidth + sampleX;
+                float x = (float)Math.Min(i * FieldWidth / MeshCellsX, FieldWidth);
+                float y = (float)Math.Min(j * FieldHeight / MeshCellsY, FieldHeight);
+                meshVertices[vertex].Position = new Vector3(x, y, 0f);
+                meshVertices[vertex].TextureCoordinate = new Vector2(
+                    x / FieldWidth + WakeVecX[index] * BackgroundWarpScale,
+                    y / FieldHeight + WakeVecY[index] * BackgroundWarpScale);
+                vertex++;
+            }
+        }
+
+        device.SetRenderTarget(target);
+        device.Clear(Color.Transparent);
+        device.Indices = meshIndexBuffer;
+        meshEffect.Texture = source;
+        foreach (EffectPass pass in meshEffect.CurrentTechnique.Passes) {
+            pass.Apply();
+            device.DrawUserIndexedPrimitives(PrimitiveType.TriangleList,
+                meshVertices, 0, meshVertices.Length, meshIndices, 0, meshIndices.Length / 3);
+        }
+    }
+
+    private static void BuildBackdropMesh(GraphicsDevice device) {
+        int columns = MeshCellsX + 1;
+        int rows = MeshCellsY + 1;
+        meshVertices = new VertexPositionTexture[columns * rows];
+        meshIndices = new short[MeshCellsX * MeshCellsY * 6];
+        int index = 0;
+        for (int j = 0; j < MeshCellsY; j++) {
+            for (int i = 0; i < MeshCellsX; i++) {
+                int a = j * columns + i;
+                meshIndices[index++] = (short)a;
+                meshIndices[index++] = (short)(a + 1);
+                meshIndices[index++] = (short)(a + columns);
+                meshIndices[index++] = (short)(a + 1);
+                meshIndices[index++] = (short)(a + columns + 1);
+                meshIndices[index++] = (short)(a + columns);
+            }
+        }
+        meshIndexBuffer = new IndexBuffer(device, IndexElementSize.SixteenBits,
+            meshIndices.Length, BufferUsage.WriteOnly);
+        meshIndexBuffer.SetData(meshIndices);
     }
 
     // Runs right after the level buffer is finished (bloom, glitch, foreground):
