@@ -23,7 +23,7 @@ MusicCapture: 主/alt 音乐状态快照 + managed command hooks
             CaptureSubscription（各自队列、各自串行 callback worker）
                    /              |              \
              全程录制          死亡回放          第三方消费者
-          NativeCaptureSession：独立编码、原点、PCM 文件及事件日志
+          NativeCaptureSession：独立编码、原点及事件日志；PCM 只在最终化期间生成
                                   ↓
             视频/SFX 剪辑时间线 + music 输出时间线 → FFmpeg 输出
 ```
@@ -213,7 +213,7 @@ SFX 按源视频片段裁切，music 按输出时间线连续重放，再交给 
   请求第一张保留画面时才恢复。Studio pause/resume 命令会 flush，取消和失败路径仍解除暂停。
 - 离线 FMOD 输出与 BGM 使用浮点余量，所有贡献相加后在送入 AAC 时限幅，避免逐次限幅破坏叠加/相消。
   有效硬切处若存在异常波形阶跃，仅在两侧各最多 1ms 做 SFX 去爆音；不借用被删死亡区间的样本，
-  不改视频时长或加入画面 crossfade。正常连续波形、纯 metadata 分段不动，独立 BGM 在此步骤后混入。
+  不改视频时长或加入画面 crossfade。正常连续波形、纯 metadata 分段不动，event-rendered BGM 在此步骤后混入。
   旧的混合 BGM sidecar 无法分离时不做这项 SFX 去爆音，避免误伤音乐。
 
 ### 死亡回放快速最终化
