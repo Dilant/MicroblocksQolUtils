@@ -21,9 +21,12 @@ public static class HighSpeedEffects {
     // Water surface simulation resolution matches the displacement buffer 1:1.
     private const int FieldWidth = 320;
     private const int FieldHeight = 180;
-    private const float FieldDamping = 0.982f;
+    private const float FieldDamping = 0.960f;
     private const float FieldGradientScale = 9f;
     private const int FieldStepsPerFrame = 2;
+    // Gradient magnitudes below this fade out of the displacement map entirely,
+    // so distant worn-out ripples vanish instead of lingering.
+    private const float FieldVisibilityGate = 0.14f;
     // Waves entering this margin get progressively swallowed instead of
     // reflecting off the field borders.
     private const int FieldAbsorbMargin = 14;
@@ -68,7 +71,11 @@ public static class HighSpeedEffects {
     private static Texture2D? fieldTexture;
     private static Vector2 fieldCamera;
 
-    private static Texture2D? wakeMaskTexture;
+    // The aberration mask: the visibility gate of the water field, cached while
+    // generating the displacement map so the chromatic fringes follow the living
+    // waves exactly — including bends, spread and fade-out.
+    private static Texture2D? caMaskTexture;
+    private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
 
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
@@ -105,8 +112,8 @@ public static class HighSpeedEffects {
         Array.Clear(WavePrevious);
         fieldTexture?.Dispose();
         fieldTexture = null;
-        wakeMaskTexture?.Dispose();
-        wakeMaskTexture = null;
+        caMaskTexture?.Dispose();
+        caMaskTexture = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -255,6 +262,11 @@ public static class HighSpeedEffects {
         float intensity = Intensity;
         Vector2 direction = ScreenDirection(player, fx);
         float offset = MathF.Max(0.5f, (0.2f + 1.1f * heat) * intensity);
+        // The aberration region is the water surface itself: wherever the trail's
+        // waves are still alive, encoded in the field mask generated alongside
+        // the displacement map.
+        if (caMaskTexture is null) return;
+        Vector2 maskPosition = fieldCamera - level.Camera.Position;
 
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
@@ -268,19 +280,19 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
 
         // Rebuild the level as the clean image plus wake-masked copies. Each
-        // masked layer is composed in tempB as: clear, draw the mask chain (black
-        // outside the wake), multiply the shifted copy — so nothing leaks outside
-        // the wake region, then it is accumulated additively into the level.
+        // masked layer is composed in tempB as: clear, draw the field mask (black
+        // outside the living waves), multiply the shifted copy — so nothing leaks
+        // outside the wake region, then it is accumulated additively into the level.
         device.SetRenderTarget(levelBuffer);
         device.Clear(Color.Transparent);
         BeginSprite(BlendState.Additive, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(tempA, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        DrawMaskedLayer(device, tempB, tempA, direction * offset, level, fx, heat, new Color(255, 0, 0, 255));
-        DrawMaskedLayer(device, tempB, tempA, -direction * offset, level, fx, heat, new Color(0, 0, 255, 255));
+        DrawMaskedLayer(device, tempB, tempA, direction * offset, maskPosition, new Color(255, 0, 0, 255));
+        DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 255, 255));
         // A faint self-overlap copy inside the wake acts as a saturation boost.
-        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, level, fx, heat, new Color(52, 52, 52, 255));
+        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(52, 52, 52, 255));
     }
 
     private static void BeginSprite(BlendState blend, SamplerState sampler)
@@ -288,11 +300,11 @@ public static class HighSpeedEffects {
             DepthStencilState.None, RasterizerState.CullNone);
 
     private static void DrawMaskedLayer(GraphicsDevice device, RenderTarget2D work, RenderTarget2D source,
-        Vector2 shift, Level level, PlayerFx fx, float heat, Color tint) {
+        Vector2 shift, Vector2 maskPosition, Color tint) {
         device.SetRenderTarget(work);
         device.Clear(Color.Transparent);
-        BeginSprite(BlendState.Additive, SamplerState.LinearClamp);
-        DrawWakeMasks(level, fx, heat);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(caMaskTexture, maskPosition, Color.White);
         Draw.SpriteBatch.End();
         BeginSprite(MultiplyBlend, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(source, shift, tint);
@@ -304,50 +316,22 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
     }
 
-    // The aberration region follows the trail itself: one small fan per recent
-    // trail point, aimed along that segment's direction and dimming with age —
-    // the chromatic fringe traces the path the player actually took.
-    private static void DrawWakeMasks(Level level, PlayerFx fx, float heat) {
-        Texture2D mask = GetWakeMaskTexture();
-        bool mirror = SaveData.Instance?.Assists.MirrorMode == true;
-        for (int i = 0; i < fx.Count; i++) {
-            int index = (fx.Head - 1 - i + TrailSamples * 2) % TrailSamples;
-            int older = (fx.Head - 2 - i + TrailSamples * 2) % TrailSamples;
-            Vector2 point = fx.Positions[index];
-            Vector2 delta = point - fx.Positions[older];
-            if (delta.LengthSquared() < 1f) continue;
-            Vector2 direction = Vector2.Normalize(delta);
-            float age = i / (float)TrailSamples;
-            Vector2 focus = point - level.Camera.Position;
-            if (mirror) {
-                focus.X = 320f - focus.X;
-                direction.X = -direction.X;
-            }
-            float segment = MathHelper.Clamp(delta.Length() * 1.4f, 26f, 72f);
-            float spread = (9f + 18f * heat) * (0.5f + 0.5f * (1f - age));
-            float brightness = MathF.Pow(1f - age, 1.2f) * 0.9f;
-            Draw.SpriteBatch.Draw(mask, focus, null, Color.White * brightness,
-                MathF.Atan2(direction.Y, direction.X),
-                new Vector2(mask.Width, mask.Height * 0.5f),
-                new Vector2(segment / mask.Width, spread / (mask.Height * 0.5f)),
-                SpriteEffects.None, 0f);
-        }
-    }
-
     // The water surface: propagate the classic two-buffer wave simulation, then
     // encode the height gradient as the displacement map. The field is anchored
     // to the world (shifted with the camera) so ripples stay where they were
     // stirred and spread outward on their own. The player is punched back out of
-    // the field so the sprite is not smeared by its own wake.
+    // the field so the sprite is not smeared by its own wake, and absorbs the
+    // water ahead of it like a bow, so waves never overtake a running player.
     private static void RenderWaterField(Level? level) {
         if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
         Texture2D texture = fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+        caMaskTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
 
         ShiftField(level.Camera.Position);
+        List<Entity> players = level.Tracker.GetEntities<Player>();
+        AbsorbAheadOfPlayers(players);
         for (int step = 0; step < FieldStepsPerFrame; step++)
             PropagateWave();
-
-        List<Entity> players = level.Tracker.GetEntities<Player>();
 
         float gradientScale = FieldGradientScale * Intensity;
         for (int y = 0; y < FieldHeight; y++) {
@@ -372,17 +356,52 @@ public static class HighSpeedEffects {
                     }
                 }
                 float weight = gradientScale * shield;
+                // A soft visibility gate fades distant, worn-out ripples out of
+                // the displacement map entirely so old waves do not linger.
+                float magnitude = MathF.Abs(gradientX) + MathF.Abs(gradientY);
+                float gate = MathHelper.Clamp(magnitude / FieldVisibilityGate, 0f, 1f);
+                gate = gate * gate * (3f - 2f * gate);
+                weight *= gate;
                 FieldPixels[index] = new Color(new Vector4(
                     0.5f + gradientX * weight,
                     0.5f + gradientY * weight,
                     0f, 1f));
+                float mask = gate * shield;
+                CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
             }
         }
         texture.SetData(FieldPixels);
+        caMaskTexture.SetData(CaMaskPixels);
 
         // The hook's sprite batch is already begun with the camera transform and
         // alpha blending; draw the full field at its world anchor.
         Draw.SpriteBatch.Draw(texture, fieldCamera, Color.White);
+    }
+
+    // A moving player swallows the surface ahead of it, like a bow cutting
+    // through water: forward-travelling ripples are damped inside an ellipse in
+    // front of the sprite, so the wake stays behind even at extreme speeds.
+    private static void AbsorbAheadOfPlayers(List<Entity> players) {
+        for (int p = 0; p < players.Count; p++) {
+            Player player = (Player)players[p];
+            PlayerFx fx = Fx.GetOrCreateValue(player);
+            if (fx.Heat <= 0.05f) continue;
+            Vector2 direction = fx.LastDirection;
+            Vector2 centre = player.Center - fieldCamera + direction * 13f;
+            for (int y = Math.Max(0, (int)(centre.Y - 12f)); y <= Math.Min(FieldHeight - 1, (int)(centre.Y + 12f)); y++) {
+                for (int x = Math.Max(0, (int)(centre.X - 18f)); x <= Math.Min(FieldWidth - 1, (int)(centre.X + 18f)); x++) {
+                    float along = (x - centre.X) * direction.X + (y - centre.Y) * direction.Y;
+                    float side = -(x - centre.X) * direction.Y + (y - centre.Y) * direction.X;
+                    float ellipse = MathF.Sqrt((along * along) / (18f * 18f) + (side * side) / (9f * 9f));
+                    if (ellipse < 1f) {
+                        int index = y * FieldWidth + x;
+                        float absorb = MathHelper.Lerp(0.78f, 1f, MathHelper.Clamp(ellipse, 0f, 1f));
+                        WaveCurrent[index] *= absorb;
+                        WavePrevious[index] *= absorb;
+                    }
+                }
+            }
+        }
     }
 
     // Keeps the simulation anchored to the world when the camera scrolls.
@@ -465,9 +484,10 @@ public static class HighSpeedEffects {
                 float falloff = MathHelper.Clamp(1f - distance / radius, 0f, 1f);
                 if (falloff <= 0f) continue;
                 if (directional && distance > 0.5f) {
-                    // 1 straight behind, 0.25 straight ahead.
+                    // ~1 straight behind, ~0 straight ahead: the wake is born
+                    // behind the player, not ahead of it.
                     float behind = 0.5f - 0.5f * (offsetX * normalized.X + offsetY * normalized.Y) / distance;
-                    falloff *= 0.25f + 0.75f * MathHelper.Clamp(behind, 0f, 1f);
+                    falloff *= 0.05f + 0.95f * MathHelper.Clamp(behind, 0f, 1f);
                 }
                 WaveCurrent[y * FieldWidth + x] += strength * falloff;
             }
@@ -545,29 +565,6 @@ public static class HighSpeedEffects {
                 Draw.Rect(particle.Position - Vector2.One * size * 0.5f, size, size, particle.Tint * (0.6f * alpha));
             }
         }
-    }
-
-    // A fan-shaped mask: bright at the apex (right edge midpoint), fading toward
-    // the left opening, black everywhere else.
-    private static Texture2D GetWakeMaskTexture() {
-        if (wakeMaskTexture is { } texture) return texture;
-        const int size = 64;
-        Color[] pixels = new Color[size * size];
-        Vector2 apex = new(size - 1f, (size - 1f) * 0.5f);
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size; x++) {
-                Vector2 offset = new(x - apex.X, y - apex.Y);
-                float distance = offset.Length() / (size - 1f);
-                float angle = MathF.Atan2(MathF.Abs(offset.Y), -offset.X);
-                float wedge = MathHelper.Clamp(1f - (angle - MathF.PI / 8f) / (MathF.PI / 8f), 0f, 1f);
-                float brightness = MathHelper.Clamp(1f - distance, 0f, 1f);
-                brightness = MathF.Pow(brightness, 0.8f) * wedge;
-                pixels[y * size + x] = new Color(new Vector4(brightness, brightness, brightness, 1f));
-            }
-        }
-        wakeMaskTexture = new Texture2D(Engine.Instance.GraphicsDevice, size, size);
-        wakeMaskTexture.SetData(pixels);
-        return wakeMaskTexture;
     }
 
     private static Player? FindFocusPlayer(Level? level) {
