@@ -482,10 +482,11 @@ public static class HighSpeedEffects {
             DepthStencilState.None, RasterizerState.CullNone);
 
     // Redraws the composed level through a pure-spritebatch tile grid: every
-    // small tile samples the snapshot with its source rectangle shifted by the
-    // wake vector, and the tint carries the wake strength so the warp lerps in
-    // from the sharp image at the rim. Same drawing path as every other layer
-    // here — no custom vertex pipeline to go wrong.
+    // tile samples the snapshot with its source rectangle shifted by the wake
+    // vector. All tiles are drawn — outside the wake the vector is zero, so the
+    // pass re-placed the untouched image pixel-perfect, and the clear above
+    // never leaves a hole. Same drawing path as every other layer here — no
+    // custom vertex pipeline to go wrong.
     private static void WarpComposedMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
         device.SetRenderTarget(target);
         device.Clear(Color.Transparent);
@@ -493,15 +494,10 @@ public static class HighSpeedEffects {
         for (int y = 0; y < FieldHeight; y += WarpTileSize) {
             for (int x = 0; x < FieldWidth; x += WarpTileSize) {
                 int index = y * FieldWidth + x;
-                float strength = WakeStrength[index];
-                byte alpha = (byte)(strength * 255f);
-                if (alpha == 0) continue;
                 int shiftX = (int)MathF.Round(WakeVecX[index] * MeshWarpScale);
                 int shiftY = (int)MathF.Round(WakeVecY[index] * MeshWarpScale);
                 Rectangle sourceRect = new(x + shiftX, y + shiftY, WarpTileSize, WarpTileSize);
-                // rgb mirrors alpha so alpha blending lerps sharp -> warped.
-                Draw.SpriteBatch.Draw(source, new Vector2(x, y), sourceRect,
-                    new Color(alpha, alpha, alpha, alpha));
+                Draw.SpriteBatch.Draw(source, new Vector2(x, y), sourceRect, Color.White);
             }
         }
         Draw.SpriteBatch.End();
