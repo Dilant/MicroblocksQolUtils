@@ -22,6 +22,10 @@ public static class QolCommands {
     [Command("qol_wakestat", "Log high-speed wake diagnostics (camera, segments, field activity)")]
     public static void WakeStat() => HighSpeedEffects.DumpWakeStats();
 
+    [Command("qol_framestat", "Report high-frame-rate presentation compatibility and MotionSmoothing state")]
+    public static void FrameStat() => Engine.Commands.Log(MotionSmoothingBridge.Describe()
+        + " Hardware frame generation (FSR/DLSS) is unavailable through Celeste's renderer; use MotionSmoothing for this game.");
+
     [Command("qol_speedfx", "Preview the high-speed effects while you move: qol_speedfx <speed> [seconds] (0 to stop)")]
     public static void SpeedFx(string speedText, string secondsText = "4") {
         if (!float.TryParse(speedText, System.Globalization.CultureInfo.InvariantCulture, out float speed)

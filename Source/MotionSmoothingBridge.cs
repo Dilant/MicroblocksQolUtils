@@ -11,6 +11,14 @@ internal static class MotionSmoothingBridge {
 
     public static bool Available => Resolve();
 
+    public static string Describe() {
+        if (!Resolve() || module is null)
+            return "MotionSmoothing is not installed; Celeste is limited to its normal presentation rate.";
+        return Enabled
+            ? $"MotionSmoothing {module.Metadata.VersionString} is active (interpolated presentation)."
+            : $"MotionSmoothing {module.Metadata.VersionString} is installed but disabled or not using decoupled ticks.";
+    }
+
     public static bool Enabled {
         get {
             if (!Resolve() || module is null) return false;

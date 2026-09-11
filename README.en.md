@@ -34,6 +34,31 @@ and SpeedrunTool are optional runtime integrations rather than hard dependencies
 
 ### HUD and minimap
 
+### High-frame-rate presentation
+
+Celeste's simulation remains fixed at 60 Hz. When the optional MotionSmoothing mod is
+installed and its decoupled tick mode is enabled, this mod detects it and keeps its
+recording and HUD integrations compatible with the interpolated presentation. Use
+`qol_framestat` in the Everest console to inspect the detected state.
+
+FSR Frame Generation and NVIDIA DLSS Frame Generation are not implemented as a
+post-process toggle here. They require the renderer to provide a swapchain plus color,
+depth, and motion-vector textures for every frame. Celeste's FNA/XNA 2D renderer does
+not expose that integration point, and interpolating the final image would corrupt
+pixel-art edges, menus, particles, and game timing. Driver-level frame generation may
+still be used externally where the GPU driver supports it, but it is outside this mod.
+
+The native capture hook already observes D3D11 `IDXGISwapChain::Present`, which is the
+right boundary for diagnostics but too late for a correct FSR/DLSS integration: only
+the composited backbuffer remains. Adding another Present hook would duplicate that
+image rather than provide the depth and motion-vector inputs required by frame
+generation.
+
+For Celeste, MotionSmoothing is the supported in-game route: it interpolates the
+camera and actor presentation while preserving the 60 Hz physics contract. Do not
+enable two interpolation layers at once; if an external driver frame generator is
+active, disable it when visual artifacts or added latency appear.
+
 - Rolling FPS, CPU frame time, and—when Motion Smoothing is available—separate
   physics and render FPS.
 - Optional frame-spike notices and a lightweight frame-profiler HUD.

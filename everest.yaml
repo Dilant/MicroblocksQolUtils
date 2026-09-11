@@ -7,4 +7,6 @@
   OptionalDependencies:
     - Name: SpeedrunTool
       Version: 3.0.0
+    - Name: MotionSmoothing
+      Version: 1.0.0
 
