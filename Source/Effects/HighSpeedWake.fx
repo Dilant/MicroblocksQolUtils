@@ -42,17 +42,19 @@ float2 CaShift;
 float BrightnessLift;
 float BlurAmount;
 float2 PlayerUV;
-float PlayerRadiusUV;
+float2 PlayerRadiusUV;
 float2 ScreenTexel;
 
 float Smoothstep01(float x) { return x * x * (3.0 - 2.0 * x); }
 
-// Pushes a sample position out of the player's ellipse so the sprite is never
-// smeared into the wake by displaced sampling. Branch-free.
+// Pushes a sample position out of the player's ellipse (sized from the hitbox)
+// so the sprite is never smeared into the wake by displaced sampling.
+// Branch-free: inside the ellipse the position is projected onto its rim,
+// outside it is left untouched.
 float2 AvoidPlayer(float2 uv) {
     float2 delta = uv - PlayerUV;
-    float len = max(length(delta), 1e-5);
-    float scale = min(len, PlayerRadiusUV) / len;
+    float len = length(delta / PlayerRadiusUV);
+    float scale = 1.0 / min(1.0, max(len, 1e-5));
     return PlayerUV + delta * scale;
 }
 

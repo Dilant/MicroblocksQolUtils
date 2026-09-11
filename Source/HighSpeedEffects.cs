@@ -457,11 +457,14 @@ public static class HighSpeedEffects {
             ? direction * offsetPixels / new Vector2(width, height)
             : Vector2.Zero);
         effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
-        // Keep displaced sampling away from the player's sprite.
+        // Keep displaced sampling away from the player's sprite: an ellipse
+        // sized from the hitbox with a little padding for hair and limbs.
         Vector2 playerLocal = player.Center - level.Camera.Position;
         if (SaveData.Instance.Assists.MirrorMode) playerLocal.X = 320f - playerLocal.X;
         effect.Parameters["PlayerUV"].SetValue(playerLocal / new Vector2(FieldWidth, FieldHeight));
-        effect.Parameters["PlayerRadiusUV"].SetValue(20f / FieldWidth);
+        float halfWidth = (player.Collider?.Width ?? 8f) * 0.5f * 1.8f + 3f;
+        float halfHeight = (player.Collider?.Height ?? 11f) * 0.5f * 1.8f + 3f;
+        effect.Parameters["PlayerRadiusUV"].SetValue(new Vector2(halfWidth / FieldWidth, halfHeight / FieldHeight));
         bool diagnose = !diagnosedWake;
         diagnosedWake = true;
         device.SetRenderTarget(screenWork);
