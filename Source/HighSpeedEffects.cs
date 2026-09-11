@@ -8,28 +8,32 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// <summary>
 /// Motion feedback for the extreme speeds tech and gimmick maps reach, where
 /// vanilla effects read as teleportation: an additive motion ribbon in world
-/// space, a CPU-simulated water surface (classic two-buffer wave propagation —
-/// the player's path stirs the field and the ripples spread, oscillate and
-/// decay on their own) feeding vanilla's displacement map, wake-local
-/// chromatic aberration with a saturation boost, scattering sparks and
-/// wall-impact shockwaves. Purely visual; physics are untouched.
+/// space, a wake computed analytically from the trail — capsule-shaped wave
+/// bands around each trail segment that thicken and spread as they age, with
+/// the forward half cut away so the wake opens backward like a boat's V and can
+/// never overtake the player — feeding vanilla's displacement map, plus
+/// wake-local chromatic aberration, motion blur and a saturation boost driven
+/// by the same field, scattering sparks and wall-impact shockwaves.
+/// Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
     private const int ParticleCapacity = 160;
 
-    // Water surface simulation resolution matches the displacement buffer 1:1.
+    // The wake field resolution matches the displacement buffer 1:1.
     private const int FieldWidth = 320;
     private const int FieldHeight = 180;
-    private const float FieldDamping = 0.960f;
-    private const float FieldGradientScale = 9f;
-    private const int FieldStepsPerFrame = 2;
-    // Gradient magnitudes below this fade out of the displacement map entirely,
-    // so distant worn-out ripples vanish instead of lingering.
-    private const float FieldVisibilityGate = 0.14f;
-    // Waves entering this margin get progressively swallowed instead of
-    // reflecting off the field borders.
-    private const int FieldAbsorbMargin = 14;
+
+    // Wake band shaping: a fresh segment wears a thin tight band hugging the
+    // path; as it ages the band travels outward (radius grows), widens and
+    // fades. Everything is a direct function of segment age, so the field is
+    // born behind the player and shrinks away — nothing propagates forward.
+    private const float WakeRadiusBase = 5f;
+    private const float WakeRadiusGrowth = 58f;
+    private const float WakeBandBase = 4.5f;
+    private const float WakeBandGrow = 6f;
+    private const float WakePushScale = 0.6f;
+    private const float WakeForwardCut = 0.45f;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -60,22 +64,16 @@ public static class HighSpeedEffects {
     // untouched here or gameplay rolls would depend on this mod's activity.
     private static readonly Random Random = new();
 
-    // Two-buffer wave height field: current and previous step. The next buffer
-    // is scratch for the propagation pass (the three rotate every step).
-    private static float[] WaveCurrent = new float[FieldWidth * FieldHeight];
-    private static float[] WavePrevious = new float[FieldWidth * FieldHeight];
-    private static float[] WaveScratch = new float[FieldWidth * FieldHeight];
+    // Per-pixel wake accumulation: displacement vector and normalized strength
+    // (the strength doubles as the aberration/blur mask, giving those layers a
+    // continuous fade that tracks the wake exactly).
+    private static readonly float[] WakeVecX = new float[FieldWidth * FieldHeight];
+    private static readonly float[] WakeVecY = new float[FieldWidth * FieldHeight];
+    private static readonly float[] WakeStrength = new float[FieldWidth * FieldHeight];
     private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
-    private static readonly float[] EdgeDampX = BuildEdgeDamp(FieldWidth);
-    private static readonly float[] EdgeDampY = BuildEdgeDamp(FieldHeight);
-    private static Texture2D? fieldTexture;
-    private static Vector2 fieldCamera;
-
-    // The aberration mask: the visibility gate of the water field, cached while
-    // generating the displacement map so the chromatic fringes follow the living
-    // waves exactly — including bends, spread and fade-out.
-    private static Texture2D? caMaskTexture;
     private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
+    private static Texture2D? fieldTexture;
+    private static Texture2D? caMaskTexture;
 
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
@@ -108,8 +106,6 @@ public static class HighSpeedEffects {
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
-        Array.Clear(WaveCurrent);
-        Array.Clear(WavePrevious);
         fieldTexture?.Dispose();
         fieldTexture = null;
         caMaskTexture?.Dispose();
@@ -137,7 +133,7 @@ public static class HighSpeedEffects {
     private sealed class SpaceCrushHook : Entity {
         public SpaceCrushHook() => Add(new DisplacementRenderHook(RenderCrush));
 
-        private void RenderCrush() => RenderWaterField(Engine.Scene as Level);
+        private void RenderCrush() => RenderTrailWake(Engine.Scene as Level);
     }
 
     private static void PlayerUpdate(On.Celeste.Player.orig_Update orig, Player self) {
@@ -155,25 +151,14 @@ public static class HighSpeedEffects {
         PushSample(fx, self.Center, speed);
 
         if (Active && self.Scene is Level level && !level.FrozenOrPaused) {
-            if (Settings.HighSpeedWarp) {
-                // Stir the water surface just behind the player; the amplitude
-                // scales with speed so slow movement only dimples the surface.
-                float excess = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
-                if (excess > 0f) {
-                    Vector2 behind = self.Center - fx.LastDirection * MathHelper.Clamp(2f + speed * 0.02f, 2f, 24f);
-                    InjectWave(level, behind, fx.LastDirection,
-                        -(1.5f + 8f * excess * excess) * Intensity, 2.5f + 3.5f * excess);
-                }
-                // A sudden stop (wall impact, ground slam) dumps the built-up
-                // momentum into the surface plus a vanilla-style burst.
-                float drop = fx.PreviousSpeed - speed;
-                if (drop > 400f && fx.PreviousSpeed > threshold * 1.1f) {
-                    float power = MathHelper.Clamp(drop / 900f, 0.25f, 1.25f) * Intensity;
-                    InjectWave(level, self.Center, Vector2.Zero, -14f * power, 7f);
-                    level.Displacement.AddBurst(self.Center, 0.55f, 4f, 40f + 48f * power,
-                        0.45f * power, Ease.QuadOut, Ease.QuadOut);
-                    SpawnImpactSparks(self.Center, fx.LastDirection, power);
-                }
+            // A sudden stop (wall impact, ground slam) releases a vanilla-style
+            // displacement burst plus sparks.
+            float drop = fx.PreviousSpeed - speed;
+            if (drop > 400f && fx.PreviousSpeed > threshold * 1.1f && Settings.HighSpeedWarp) {
+                float power = MathHelper.Clamp(drop / 900f, 0.25f, 1.25f) * Intensity;
+                level.Displacement.AddBurst(self.Center, 0.55f, 4f, 40f + 48f * power,
+                    0.45f * power, Ease.QuadOut, Ease.QuadOut);
+                SpawnImpactSparks(self.Center, fx.LastDirection, power);
             }
             if (Settings.HighSpeedParticles)
                 SpawnTrailParticles(self, fx, speed, threshold);
@@ -242,6 +227,132 @@ public static class HighSpeedEffects {
         GameplayRenderer.Begin();
     }
 
+    // The wake, computed analytically from the trail every frame. Each segment
+    // contributes a capsule band: the set of pixels at distance ~radius(age)
+    // from the segment, pushed radially outward. Bands from neighbouring
+    // segments overlap into a continuous wave front; the forward half of every
+    // band is cut away so the wake opens backward and can never overtake the
+    // player, and when the player stops the trail ages out and the whole wake
+    // shrinks away — no propagation, no damping, no absorbing borders.
+    private static void RenderTrailWake(Level? level) {
+        if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
+        Texture2D texture = fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+        caMaskTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+
+        Array.Clear(WakeVecX);
+        Array.Clear(WakeVecY);
+        Array.Clear(WakeStrength);
+
+        Vector2 camera = level.Camera.Position;
+        float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
+        float intensity = Intensity;
+        List<Entity> players = level.Tracker.GetEntities<Player>();
+
+        foreach (Entity entity in players) {
+            Player player = (Player)entity;
+            PlayerFx fx = Fx.GetOrCreateValue(player);
+            if (fx.Heat <= 0f || fx.Count < 2) continue;
+            for (int i = 0; i < fx.Count - 1; i++) {
+                Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
+                Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
+                Vector2 segment = newer - older;
+                float segmentLength = segment.Length();
+                if (segmentLength < 2f) continue;
+                Vector2 direction = segment / segmentLength;
+
+                float speed = fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
+                float speedFactor = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
+                if (speedFactor <= 0.03f) continue;
+                float age = i / (float)(fx.Count - 1);
+                float radius = WakeRadiusBase + WakeRadiusGrowth * age;
+                float band = WakeBandBase + WakeBandGrow * (1f - age);
+                float reach = radius + band;
+                float fade = MathF.Pow(1f - age, 1.6f) * speedFactor * WakePushScale * intensity;
+
+                float minX = MathF.Min(newer.X, older.X) - reach;
+                float maxX = MathF.Max(newer.X, older.X) + reach;
+                float minY = MathF.Min(newer.Y, older.Y) - reach;
+                float maxY = MathF.Max(newer.Y, older.Y) + reach;
+                int x0 = Math.Max(0, (int)(minX - camera.X));
+                int x1 = Math.Min(FieldWidth - 1, (int)(maxX - camera.X));
+                int y0 = Math.Max(0, (int)(minY - camera.Y));
+                int y1 = Math.Min(FieldHeight - 1, (int)(maxY - camera.Y));
+                if (x0 > x1 || y0 > y1) continue;
+                float segmentLengthSquared = segmentLength * segmentLength;
+
+                for (int y = y0; y <= y1; y++) {
+                    for (int x = x0; x <= x1; x++) {
+                        Vector2 pixel = new(x + camera.X, y + camera.Y);
+                        // Closest point on the segment, then the capsule band test.
+                        float t = MathHelper.Clamp(Vector2.Dot(pixel - older, segment) / segmentLengthSquared, 0f, 1f);
+                        Vector2 closest = older + segment * t;
+                        Vector2 offset = pixel - closest;
+                        float distance = offset.Length();
+                        float fromBand = MathF.Abs(distance - radius);
+                        if (fromBand > band) continue;
+                        float bandShape = 1f - fromBand / band;
+                        if (bandShape <= 0f || distance < 0.01f) continue;
+                        Vector2 radial = offset / distance;
+                        // Cut away the forward half: the wake only opens backward.
+                        float forwardness = radial.X * direction.X + radial.Y * direction.Y;
+                        if (forwardness >= WakeForwardCut) continue;
+                        float cut = forwardness <= 0.1f
+                            ? 1f
+                            : 1f - (forwardness - 0.1f) / (WakeForwardCut - 0.1f);
+                        float amplitude = fade * bandShape * cut;
+                        if (amplitude <= 0.004f) continue;
+                        int index = y * FieldWidth + x;
+                        WakeVecX[index] += radial.X * amplitude;
+                        WakeVecY[index] += radial.Y * amplitude;
+                        float strength = MathHelper.Clamp(amplitude / (WakePushScale * intensity), 0f, 1f);
+                        if (strength > WakeStrength[index]) WakeStrength[index] = strength;
+                    }
+                }
+            }
+        }
+
+        // Bake the accumulated field into the displacement map; the player is
+        // punched back out so the sprite stays crisp.
+        for (int p = 0; p < players.Count; p++) {
+            Player player = (Player)players[p];
+            PlayerFx fx = Fx.GetOrCreateValue(player);
+            if (fx.Heat <= 0f) continue;
+            Vector2 local = player.Center - camera;
+            int x0 = Math.Max(0, (int)(local.X - 13f));
+            int x1 = Math.Min(FieldWidth - 1, (int)(local.X + 13f));
+            int y0 = Math.Max(0, (int)(local.Y - 13f));
+            int y1 = Math.Min(FieldHeight - 1, (int)(local.Y + 13f));
+            for (int y = y0; y <= y1; y++) {
+                for (int x = x0; x <= x1; x++) {
+                    float distance = MathF.Sqrt((x - local.X) * (x - local.X) + (y - local.Y) * (y - local.Y));
+                    float falloff = MathHelper.Clamp(distance / 12f, 0f, 1f);
+                    if (falloff >= 1f) continue;
+                    falloff = falloff * falloff * (3f - 2f * falloff);
+                    int index = y * FieldWidth + x;
+                    WakeVecX[index] *= falloff;
+                    WakeVecY[index] *= falloff;
+                    WakeStrength[index] *= falloff;
+                }
+            }
+        }
+
+        for (int index = 0; index < FieldPixels.Length; index++) {
+            float strength = WakeStrength[index];
+            FieldPixels[index] = new Color(new Vector4(
+                0.5f + WakeVecX[index],
+                0.5f + WakeVecY[index],
+                0f, 1f));
+            float mask = MathF.Pow(strength, 0.8f);
+            CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
+        }
+        texture.SetData(FieldPixels);
+        caMaskTexture.SetData(CaMaskPixels);
+
+        // The hook's sprite batch is already begun with the camera transform and
+        // alpha blending; draw the field over the camera's view of the world.
+        Draw.SpriteBatch.Draw(texture, camera, Color.White);
+    }
+
     // Runs right after the level buffer is finished (bloom, glitch, foreground):
     // the level render target is still bound, which is exactly where a fullscreen
     // pass can rebuild the image with speed-driven aberration and ghosting.
@@ -262,11 +373,13 @@ public static class HighSpeedEffects {
         float intensity = Intensity;
         Vector2 direction = ScreenDirection(player, fx);
         float offset = MathF.Max(0.5f, (0.2f + 1.1f * heat) * intensity);
-        // The aberration region is the water surface itself: wherever the trail's
-        // waves are still alive, encoded in the field mask generated alongside
-        // the displacement map.
+        // The aberration region is the wake field itself: the strength mask
+        // generated alongside the displacement map fades in and out with the
+        // waves, so the fringes appear and vanish smoothly.
         if (caMaskTexture is null) return;
-        Vector2 maskPosition = fieldCamera - level.Camera.Position;
+        // The field is regenerated in camera space each frame, so it lines up
+        // with the level buffer one to one.
+        Vector2 maskPosition = Vector2.Zero;
 
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
@@ -279,10 +392,6 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        // Rebuild the level as the clean image plus wake-masked copies. Each
-        // masked layer is composed in tempB as: clear, draw the field mask (black
-        // outside the living waves), multiply the shifted copy — so nothing leaks
-        // outside the wake region, then it is accumulated additively into the level.
         device.SetRenderTarget(levelBuffer);
         device.Clear(Color.Transparent);
         BeginSprite(BlendState.Additive, SamplerState.PointClamp);
@@ -293,6 +402,9 @@ public static class HighSpeedEffects {
         DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 255, 255));
         // A faint self-overlap copy inside the wake acts as a saturation boost.
         DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(52, 52, 52, 255));
+        // Two slight along-motion copies soften the wake with directional blur.
+        DrawMaskedLayer(device, tempB, tempA, direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
+        DrawMaskedLayer(device, tempB, tempA, -direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
     }
 
     private static void BeginSprite(BlendState blend, SamplerState sampler)
@@ -314,184 +426,6 @@ public static class HighSpeedEffects {
         BeginSprite(BlendState.Additive, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(work, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
-    }
-
-    // The water surface: propagate the classic two-buffer wave simulation, then
-    // encode the height gradient as the displacement map. The field is anchored
-    // to the world (shifted with the camera) so ripples stay where they were
-    // stirred and spread outward on their own. The player is punched back out of
-    // the field so the sprite is not smeared by its own wake, and absorbs the
-    // water ahead of it like a bow, so waves never overtake a running player.
-    private static void RenderWaterField(Level? level) {
-        if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
-        Texture2D texture = fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
-        caMaskTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
-
-        ShiftField(level.Camera.Position);
-        List<Entity> players = level.Tracker.GetEntities<Player>();
-        AbsorbAheadOfPlayers(players);
-        for (int step = 0; step < FieldStepsPerFrame; step++)
-            PropagateWave();
-
-        float gradientScale = FieldGradientScale * Intensity;
-        for (int y = 0; y < FieldHeight; y++) {
-            int row = y * FieldWidth;
-            for (int x = 0; x < FieldWidth; x++) {
-                int index = row + x;
-                float wave = WaveCurrent[index];
-                float gradientX = 0f, gradientY = 0f;
-                if (x > 0 && x < FieldWidth - 1 && y > 0 && y < FieldHeight - 1 && wave != 0f) {
-                    gradientX = WaveCurrent[index - 1] - WaveCurrent[index + 1];
-                    gradientY = WaveCurrent[index - FieldWidth] - WaveCurrent[index + FieldWidth];
-                }
-                float shield = 1f;
-                for (int p = 0; p < players.Count; p++) {
-                    Player player = (Player)players[p];
-                    Vector2 local = player.Center - fieldCamera;
-                    float distanceX = x - local.X, distanceY = y - local.Y;
-                    float distanceSquared = distanceX * distanceX + distanceY * distanceY;
-                    if (distanceSquared < 121f) {
-                        float falloff = MathF.Sqrt(distanceSquared) / 11f;
-                        shield *= MathHelper.Clamp(falloff, 0f, 1f);
-                    }
-                }
-                float weight = gradientScale * shield;
-                // A soft visibility gate fades distant, worn-out ripples out of
-                // the displacement map entirely so old waves do not linger.
-                float magnitude = MathF.Abs(gradientX) + MathF.Abs(gradientY);
-                float gate = MathHelper.Clamp(magnitude / FieldVisibilityGate, 0f, 1f);
-                gate = gate * gate * (3f - 2f * gate);
-                weight *= gate;
-                FieldPixels[index] = new Color(new Vector4(
-                    0.5f + gradientX * weight,
-                    0.5f + gradientY * weight,
-                    0f, 1f));
-                float mask = gate * shield;
-                CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
-            }
-        }
-        texture.SetData(FieldPixels);
-        caMaskTexture.SetData(CaMaskPixels);
-
-        // The hook's sprite batch is already begun with the camera transform and
-        // alpha blending; draw the full field at its world anchor.
-        Draw.SpriteBatch.Draw(texture, fieldCamera, Color.White);
-    }
-
-    // A moving player swallows the surface ahead of it, like a bow cutting
-    // through water: forward-travelling ripples are damped inside an ellipse in
-    // front of the sprite, so the wake stays behind even at extreme speeds.
-    private static void AbsorbAheadOfPlayers(List<Entity> players) {
-        for (int p = 0; p < players.Count; p++) {
-            Player player = (Player)players[p];
-            PlayerFx fx = Fx.GetOrCreateValue(player);
-            if (fx.Heat <= 0.05f) continue;
-            Vector2 direction = fx.LastDirection;
-            Vector2 centre = player.Center - fieldCamera + direction * 13f;
-            for (int y = Math.Max(0, (int)(centre.Y - 12f)); y <= Math.Min(FieldHeight - 1, (int)(centre.Y + 12f)); y++) {
-                for (int x = Math.Max(0, (int)(centre.X - 18f)); x <= Math.Min(FieldWidth - 1, (int)(centre.X + 18f)); x++) {
-                    float along = (x - centre.X) * direction.X + (y - centre.Y) * direction.Y;
-                    float side = -(x - centre.X) * direction.Y + (y - centre.Y) * direction.X;
-                    float ellipse = MathF.Sqrt((along * along) / (18f * 18f) + (side * side) / (9f * 9f));
-                    if (ellipse < 1f) {
-                        int index = y * FieldWidth + x;
-                        float absorb = MathHelper.Lerp(0.78f, 1f, MathHelper.Clamp(ellipse, 0f, 1f));
-                        WaveCurrent[index] *= absorb;
-                        WavePrevious[index] *= absorb;
-                    }
-                }
-            }
-        }
-    }
-
-    // Keeps the simulation anchored to the world when the camera scrolls.
-    private static void ShiftField(Vector2 camera) {
-        int deltaX = (int)MathF.Floor(camera.X - fieldCamera.X);
-        int deltaY = (int)MathF.Floor(camera.Y - fieldCamera.Y);
-        if (deltaX == 0 && deltaY == 0) return;
-        ShiftBuffer(WaveCurrent, deltaX, deltaY);
-        ShiftBuffer(WavePrevious, deltaX, deltaY);
-        fieldCamera += new Vector2(deltaX, deltaY);
-    }
-
-    // Camera-space index i maps to world i + camera. After the camera moves by
-    // delta, the new buffer must therefore read from the OLD index i + delta so
-    // the waves stay anchored to the world instead of sliding with the screen.
-    private static void ShiftBuffer(float[] buffer, int deltaX, int deltaY) {
-        Array.Clear(WaveScratch);
-        for (int y = 0; y < FieldHeight; y++) {
-            int sourceY = y + deltaY;
-            if (sourceY < 0 || sourceY >= FieldHeight) continue;
-            for (int x = 0; x < FieldWidth; x++) {
-                int sourceX = x + deltaX;
-                if (sourceX < 0 || sourceX >= FieldWidth) continue;
-                WaveScratch[y * FieldWidth + x] = buffer[sourceY * FieldWidth + sourceX];
-            }
-        }
-        Array.Copy(WaveScratch, buffer, buffer.Length);
-    }
-
-    // Classic two-buffer wave propagation: the next height is the neighbourhood
-    // average minus the previous step, damped over time. Ripples spread,
-    // oscillate through zero and fade out entirely on their own. A margin of
-    // extra damping absorbs waves at the borders so they do not bounce back.
-    private static void PropagateWave() {
-        for (int y = 1; y < FieldHeight - 1; y++) {
-            int row = y * FieldWidth;
-            float dampY = EdgeDampY[y];
-            for (int x = 1; x < FieldWidth - 1; x++) {
-                int index = row + x;
-                float value = (WaveCurrent[index - 1] + WaveCurrent[index + 1]
-                    + WaveCurrent[index - FieldWidth] + WaveCurrent[index + FieldWidth]) * 0.5f
-                    - WavePrevious[index];
-                WaveScratch[index] = value * FieldDamping * dampY * EdgeDampX[x];
-            }
-        }
-        float[] swap = WavePrevious;
-        WavePrevious = WaveCurrent;
-        WaveCurrent = WaveScratch;
-        WaveScratch = swap;
-        // Edges stay at zero; the loop above never writes them.
-    }
-
-    private static float[] BuildEdgeDamp(int size) {
-        float[] factors = new float[size];
-        for (int i = 0; i < size; i++) {
-            int edge = Math.Min(i, size - 1 - i);
-            factors[i] = edge >= FieldAbsorbMargin
-                ? 1f
-                : MathHelper.Clamp(0.55f + 0.45f * edge / FieldAbsorbMargin, 0f, 1f);
-        }
-        return factors;
-    }
-
-    // Drops a disturbance into the field. A non-zero direction biases the blob
-    // backwards: the leading edge is weakened so the wake stays behind the
-    // player instead of chasing it.
-    private static void InjectWave(Level level, Vector2 world, Vector2 direction, float strength, float radius) {
-        ShiftField(level.Camera.Position);
-        Vector2 local = world - fieldCamera;
-        bool directional = direction.LengthSquared() > 0.1f;
-        Vector2 normalized = directional ? Vector2.Normalize(direction) : Vector2.Zero;
-        int x0 = Math.Max(1, (int)(local.X - radius));
-        int x1 = Math.Min(FieldWidth - 2, (int)(local.X + radius));
-        int y0 = Math.Max(1, (int)(local.Y - radius));
-        int y1 = Math.Min(FieldHeight - 2, (int)(local.Y + radius));
-        for (int y = y0; y <= y1; y++) {
-            for (int x = x0; x <= x1; x++) {
-                float offsetX = x - local.X, offsetY = y - local.Y;
-                float distance = MathF.Sqrt(offsetX * offsetX + offsetY * offsetY);
-                float falloff = MathHelper.Clamp(1f - distance / radius, 0f, 1f);
-                if (falloff <= 0f) continue;
-                if (directional && distance > 0.5f) {
-                    // ~1 straight behind, ~0 straight ahead: the wake is born
-                    // behind the player, not ahead of it.
-                    float behind = 0.5f - 0.5f * (offsetX * normalized.X + offsetY * normalized.Y) / distance;
-                    falloff *= 0.05f + 0.95f * MathHelper.Clamp(behind, 0f, 1f);
-                }
-                WaveCurrent[y * FieldWidth + x] += strength * falloff;
-            }
-        }
     }
 
     private static void SpawnTrailParticles(Player player, PlayerFx fx, float speed, float threshold) {
