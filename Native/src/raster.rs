@@ -59,6 +59,13 @@ impl RasterState {
     fn new() -> Self {
         let mut database = Database::new();
         database.load_system_fonts();
+        // fontdb intentionally skips Android's fontconfig scan. The game host
+        // exposes the platform fonts at these stable paths; loading them keeps
+        // the material UI usable without requiring a user supplied font file.
+        #[cfg(target_os = "android")]
+        for directory in ["/system/fonts", "/system/product/fonts", "/product/fonts"] {
+            database.load_fonts_dir(directory);
+        }
         Self {
             database,
             fonts: HashMap::new(),
