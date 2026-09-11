@@ -76,13 +76,8 @@ public static class HighSpeedEffects {
     private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
     private static Texture2D? fieldTexture;
 
-    // Render-resolution scratch: the shader output plus the three-level blur
-    // pyramid (the pyramid is field-sized; the shader resolves it at output
-    // resolution through linear sampling).
+    // Render-resolution scratch for the shader output.
     private static RenderTarget2D? screenWork;
-    private static RenderTarget2D? screenHalf;
-    private static RenderTarget2D? screenQuarter;
-    private static RenderTarget2D? screenEighth;
     // The player rendered alone into transparency — its alpha channel is the
     // exact wake-avoidance mask (follows the current animation frame).
     private static RenderTarget2D? playerMaskRT;
@@ -119,12 +114,6 @@ public static class HighSpeedEffects {
         fieldTexture = null;
         screenWork?.Dispose();
         screenWork = null;
-        screenHalf?.Dispose();
-        screenHalf = null;
-        screenQuarter?.Dispose();
-        screenQuarter = null;
-        screenEighth?.Dispose();
-        screenEighth = null;
         playerMaskRT?.Dispose();
         playerMaskRT = null;
         wakeEffect?.Dispose();
@@ -354,7 +343,7 @@ public static class HighSpeedEffects {
         // Blur the strength so the shader's graded blur and fringes ease in over
         // a wide slope; normalize against the surviving peak because the blur
         // dilutes it, otherwise the heavy tier never reaches its threshold.
-        BlurStrength(4);
+        BlurStrength(8);
         float blurredPeak = 0f;
         for (int index = 0; index < WakeStrength.Length; index++)
             if (WakeStrength[index] > blurredPeak) blurredPeak = WakeStrength[index];
@@ -429,52 +418,42 @@ public static class HighSpeedEffects {
         if (player is null) return;
         PlayerFx fx = Fx.GetOrCreateValue(player);
 
-        // Blur pyramid from the level buffer (half/quarter/eighth of its real
-        // size — high resolution under MotionSmoothing, field-sized otherwise).
-        device.SetRenderTarget(screenHalf);
-        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-        device.SetRenderTarget(screenQuarter);
-        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(screenHalf, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-        device.SetRenderTarget(screenEighth);
-        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(screenQuarter, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-
-        // One shader pass: warp + graded blur + aberration + brightness lift,
-        // self-composited over a nearest-neighbour copy of the frame.
+        // One shader pass: warp + continuous disk blur + aberration + brightness
+        // lift, self-composited over a nearest-neighbour copy of the frame.
         float activity = MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f);
         float intensity = Intensity;
         Effect effect = GetWakeEffect();
         effect.Parameters["ScreenTex"].SetValue(levelBuffer);
         effect.Parameters["FieldTex"].SetValue(fieldTexture);
-        effect.Parameters["BlurHalfTex"].SetValue(screenHalf);
-        effect.Parameters["BlurQuarterTex"].SetValue(screenQuarter);
-        effect.Parameters["BlurEighthTex"].SetValue(screenEighth);
         effect.Parameters["ScreenTexel"].SetValue(new Vector2(1f / width, 1f / height));
         effect.Parameters["WarpScale"].SetValue(Settings.HighSpeedWarp ? 0.06f : 0f);
         effect.Parameters["BlurAmount"].SetValue(Settings.HighSpeedBlur ? 1f : 0f);
+        // Full blur radius at the wake core, expressed against a 1920-wide
+        // frame so the on-screen size is consistent regardless of buffer size.
+        effect.Parameters["BlurRadiusUV"].SetValue(20f / 1920f);
         Vector2 direction = ScreenDirection(player, fx);
         float offsetPixels = MathF.Max(1f, (0.2f + 1.1f * activity) * intensity);
         effect.Parameters["CaShift"].SetValue(Settings.HighSpeedAberration
             ? direction * offsetPixels / new Vector2(width, height)
             : Vector2.Zero);
-        effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
+        effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.60f * activity : 0f);
         // Exact player mask: render the player (current animation frame, hair,
         // facing) into a small transparent texture; the shader samples its
         // alpha so the wake never covers or samples the sprite.
         RenderTarget2D playerMask = playerMaskRT ??= new RenderTarget2D(device, PlayerMaskSize, PlayerMaskSize,
             false, SurfaceFormat.Color, DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        Vector2 playerLocal = player.Center - level.Camera.Position;
         device.SetRenderTarget(playerMask);
         device.Clear(Color.Transparent);
+        // Render through the camera transform shifted so the player lands at
+        // the centre of the small mask texture (a plain camera matrix would
+        // clip the player outside the texture's top-left 64x64 window).
+        Matrix maskMatrix = Matrix.CreateTranslation(
+            PlayerMaskSize * 0.5f - playerLocal.X, PlayerMaskSize * 0.5f - playerLocal.Y, 0f) * level.Camera.Matrix;
         Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp,
-            DepthStencilState.None, RasterizerState.CullNone, null, level.Camera.Matrix);
+            DepthStencilState.None, RasterizerState.CullNone, null, maskMatrix);
         player.Render();
         Draw.SpriteBatch.End();
-        Vector2 playerLocal = player.Center - level.Camera.Position;
         if (SaveData.Instance.Assists.MirrorMode) playerLocal.X = 320f - playerLocal.X;
         effect.Parameters["PlayerUV"].SetValue(playerLocal / new Vector2(FieldWidth, FieldHeight));
         effect.Parameters["PlayerMaskSpan"].SetValue(
@@ -516,19 +495,10 @@ public static class HighSpeedEffects {
     private static void EnsureScreenTargets(GraphicsDevice device, int width, int height) {
         if (screenWidth == width && screenHeight == height) return;
         screenWork?.Dispose();
-        screenHalf?.Dispose();
-        screenQuarter?.Dispose();
-        screenEighth?.Dispose();
         screenWidth = width;
         screenHeight = height;
         Logger.Log(LogLevel.Info, "MicroblocksQolUtils", $"waketargets: {width}x{height}");
         screenWork = new RenderTarget2D(device, width, height, false, SurfaceFormat.Color,
-            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
-        screenHalf = new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
-            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
-        screenQuarter = new RenderTarget2D(device, FieldWidth / 4, FieldHeight / 4, false, SurfaceFormat.Color,
-            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
-        screenEighth = new RenderTarget2D(device, FieldWidth / 8, FieldHeight / 8, false, SurfaceFormat.Color,
             DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
     }
 
