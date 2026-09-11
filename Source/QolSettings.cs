@@ -43,8 +43,8 @@ public sealed class QolSettings : EverestModuleSettings {
     public bool HighSpeedEffects { get; set; } = true;
 
     [SettingRange(200, 2000)]
-    [DefaultValue(600)]
-    public int HighSpeedThreshold { get; set; } = 600;
+    [DefaultValue(300)]
+    public int HighSpeedThreshold { get; set; } = 300;
 
     [SettingRange(25, 200)]
     [DefaultValue(100)]
