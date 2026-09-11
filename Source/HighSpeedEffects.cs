@@ -12,7 +12,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// bands around each trail segment that thicken and spread as they age, with
 /// the forward half cut away so the wake opens backward like a boat's V and can
 /// never overtake the player — feeding vanilla's displacement map, plus
-/// wake-local chromatic aberration, motion blur and a saturation boost driven
+/// wake-local chromatic aberration, motion blur and a brightness lift driven
 /// by the same field, scattering sparks and wall-impact shockwaves.
 /// Purely visual; physics are untouched.
 /// </summary>
@@ -353,8 +353,10 @@ public static class HighSpeedEffects {
                 0.5f + WakeVecX[index],
                 0.5f + WakeVecY[index],
                 0f, 1f));
-            // Steeper curve: the fringes/blur ramp gently near the edges.
-            float mask = MathF.Pow(strength, 1.25f);
+            // Wide taper: strengths up to 0.6 spread across the whole fade, so
+            // the fringe edges ease out over a broad band instead of a rim.
+            float ramp = MathHelper.Clamp(strength / 0.6f, 0f, 1f);
+            float mask = ramp * ramp * (3f - 2f * ramp);
             CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
         }
         fieldActivity = peakStrength;
@@ -417,8 +419,8 @@ public static class HighSpeedEffects {
 
         DrawMaskedLayer(device, tempB, tempA, direction * offset, maskPosition, new Color(255, 0, 0, 255));
         DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 255, 255));
-        // A faint self-overlap copy inside the wake acts as a saturation boost.
-        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(52, 52, 52, 255));
+        // A faint uniform white copy inside the wake acts as a brightness lift.
+        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(60, 60, 60, 255));
         // Two slight along-motion copies soften the wake with directional blur.
         DrawMaskedLayer(device, tempB, tempA, direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
         DrawMaskedLayer(device, tempB, tempA, -direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
