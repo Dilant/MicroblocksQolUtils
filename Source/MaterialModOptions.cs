@@ -75,6 +75,9 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     private float ease;
     private bool display;
     private float inputDelay;
+    internal bool AcceptsTouch => Visible && Active && display && inputDelay <= 0 && ease > 0.99f
+        && (pauseLevel is not null || Selected && Focused);
+    private string TouchContext => $"mods:{selectedTab}:{tabSearchText}:{settingSearchText}:{dropdownItem?.GetHashCode()}:{compositePopupItem?.GetHashCode()}";
     private CloseDestination closeDestination;
     private bool saveStarted;
     private string? savedTabId;
@@ -184,6 +187,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     }
 
     public override void Update() {
+        MaterialTouch.BeginUpdate(this);
         base.Update();
         ModOptionsLayout layout = ModOptionsLayout.Create(1f - Ease.CubeOut(ease));
         tabScroll.Update(MaxTabScroll(layout));
@@ -328,7 +332,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         RenderRows(layout, palette, alpha);
         if (dropdownItem is not null) RenderDropdown(layout, palette, alpha);
         if (compositePopupItem is not null) RenderCompositePopup(layout, palette, alpha);
-        MaterialUiKit.Cursor(MInput.Mouse.Position, palette, alpha);
+        MaterialUiKit.Cursor(MaterialTouch.Position, palette, alpha);
     }
 
     private void BuildMenu(bool inGame) {
@@ -568,8 +572,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     }
 
     private bool UpdateSearchInput(ModOptionsLayout layout) {
-        Vector2 mouse = MInput.Mouse.Position;
-        if (MInput.Mouse.PressedLeftButton) {
+        Vector2 mouse = MaterialTouch.Position;
+        if (MaterialTouch.PressedLeftButton) {
             if (layout.TabSearch.Contains(mouse)) {
                 SetSearchTarget(SearchTarget.Tabs);
                 Audio.Play("event:/ui/main/button_select");
@@ -597,7 +601,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
             SetSearchTarget(SearchTarget.None);
             return true;
         }
-        if (MInput.Mouse.PressedLeftButton
+        if (MaterialTouch.PressedLeftButton
             && !layout.TabSearch.Contains(mouse)
             && !layout.SettingSearch.Contains(mouse)) {
             SetSearchTarget(SearchTarget.None);
@@ -743,10 +747,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
 
     private void UpdateMouse(ModOptionsLayout layout) {
         if (menu is null) return;
-        Vector2 mouse = MInput.Mouse.Position;
+        Vector2 mouse = MaterialTouch.Position;
         bool scrolled = false;
-        if (MInput.Mouse.WheelDelta != 0) {
-            float direction = -Math.Sign(MInput.Mouse.WheelDelta);
+        if (MaterialTouch.WheelDelta != 0) {
+            float direction = -Math.Sign(MaterialTouch.WheelDelta);
             if (layout.Navigation.Contains(mouse)) {
                 tabScroll.Scroll(direction * 180f, MaxTabScroll(layout));
                 scrolled = true;
@@ -760,14 +764,14 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         // selection in that frame: selecting the row that was under the pointer before the
         // scroll would immediately pull the scroll target back toward it.
         if (scrolled) return;
-        if (!MInput.Mouse.WasMoved && !MInput.Mouse.PressedLeftButton) return;
+        if (!MaterialTouch.WasMoved && !MaterialTouch.PressedLeftButton) return;
         int tabIndex = TabIndexAt(mouse, layout);
         if (tabIndex >= 0) {
             ModTab tab = tabs[tabIndex];
             MaterialRect tabRect = layout.Tab(FilteredTabIndices().IndexOf(tabIndex), tabScroll.Offset);
-            if (MInput.Mouse.PressedLeftButton && tab.Pinnable && TabPinRect(tabRect).Contains(mouse)) {
+            if (MaterialTouch.PressedLeftButton && tab.Pinnable && TabPinRect(tabRect).Contains(mouse)) {
                 ToggleTabPin(tab);
-            } else if (MInput.Mouse.PressedLeftButton && tabIndex != selectedTab) {
+            } else if (MaterialTouch.PressedLeftButton && tabIndex != selectedTab) {
                 SelectTab(tabIndex);
             }
             return;
@@ -776,7 +780,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         RowPlacement? placement = RowAt(mouse, layout);
         if (placement is null || !placement.Value.Item.Hoverable) return;
         SelectItem(placement.Value.Item);
-        if (!MInput.Mouse.PressedLeftButton) return;
+        if (!MaterialTouch.PressedLeftButton) return;
         TextMenu.Item item = placement.Value.Item;
         if (CanFavorite(item) && FavoriteRect(PrimaryRect(placement.Value)).Contains(mouse)) {
             ToggleFavorite(item);
@@ -845,25 +849,25 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
 
         MaterialRect dropdown = DropdownRect(layout, item, option.Options.Count);
         int visibleCount = DropdownVisibleCount(option.Options.Count);
-        if (MInput.Mouse.WheelDelta != 0 && dropdown.Contains(MInput.Mouse.Position)) {
+        if (MaterialTouch.WheelDelta != 0 && dropdown.Contains(MaterialTouch.Position)) {
             dropdownFirstVisible = Math.Clamp(
-                dropdownFirstVisible - Math.Sign(MInput.Mouse.WheelDelta),
+                dropdownFirstVisible - Math.Sign(MaterialTouch.WheelDelta),
                 0,
                 Math.Max(0, option.Options.Count - visibleCount)
             );
             dropdownHighlight = Math.Clamp(dropdownHighlight, dropdownFirstVisible,
                 dropdownFirstVisible + visibleCount - 1);
         }
-        if (MInput.Mouse.WasMoved || MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.WasMoved || MaterialTouch.PressedLeftButton) {
             for (int visibleIndex = 0; visibleIndex < visibleCount; visibleIndex++) {
                 MaterialRect row = DropdownItemRect(dropdown, visibleIndex);
-                if (!row.Contains(MInput.Mouse.Position)) continue;
+                if (!row.Contains(MaterialTouch.Position)) continue;
                 dropdownHighlight = dropdownFirstVisible + visibleIndex;
-                if (MInput.Mouse.PressedLeftButton) CommitDropdown(option);
+                if (MaterialTouch.PressedLeftButton) CommitDropdown(option);
                 return;
             }
         }
-        if (MInput.Mouse.PressedLeftButton) CloseDropdown();
+        if (MaterialTouch.PressedLeftButton) CloseDropdown();
     }
 
     private void OpenDropdown(TextMenu.Item item, OptionSnapshot option) {
@@ -921,12 +925,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         MaterialRect popup = CompositePopupRect(layout);
         MaterialRect body = CompositePopupBody(layout);
         MaterialRect close = CompositePopupCloseRect(layout);
-        Vector2 mouse = MInput.Mouse.Position;
-        if (MInput.Mouse.WheelDelta != 0 && body.Contains(mouse)) {
-            compositePopupScroll.Scroll(-Math.Sign(MInput.Mouse.WheelDelta) * 220f,
+        Vector2 mouse = MaterialTouch.Position;
+        if (MaterialTouch.WheelDelta != 0 && body.Contains(mouse)) {
+            compositePopupScroll.Scroll(-Math.Sign(MaterialTouch.WheelDelta) * 220f,
                 MaxCompositePopupScroll(layout));
         }
-        if (MInput.Mouse.PressedLeftButton && (close.Contains(mouse) || !popup.Contains(mouse))) {
+        if (MaterialTouch.PressedLeftButton && (close.Contains(mouse) || !popup.Contains(mouse))) {
             CloseCompositePopup();
             return;
         }
@@ -1032,10 +1036,19 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     private void UpdateInteractions(ModOptionsLayout layout) {
         List<MaterialInteractionTarget> targets = [
             new MaterialInteractionTarget("mod-options.search.tabs", layout.TabSearch,
-                Focused: searchTarget == SearchTarget.Tabs),
+                Focused: searchTarget == SearchTarget.Tabs, TouchKind: "text", TouchText: tabSearchText,
+                TouchMaxLength: SearchTextLimit, TouchTextChanged: value => TouchSearch(SearchTarget.Tabs, value)),
             new MaterialInteractionTarget("mod-options.search.settings", layout.SettingSearch,
-                Focused: searchTarget == SearchTarget.Settings)
+                Focused: searchTarget == SearchTarget.Settings, TouchKind: "text", TouchText: settingSearchText,
+                TouchMaxLength: SearchTextLimit, TouchTextChanged: value => TouchSearch(SearchTarget.Settings, value))
         ];
+        // Modal popups own their entire input surface. Their existing hit testing
+        // handles taps/scrolls; do not expose text fields underneath the popup.
+        if (dropdownItem is not null || compositePopupItem is not null) {
+            MaterialTouch.Publish(this, [], TouchContext);
+            motion.Update([]);
+            return;
+        }
         List<int> visibleTabs = FilteredTabIndices();
         for (int position = 0; position < visibleTabs.Count; position++) {
             int index = visibleTabs[position];
@@ -1051,15 +1064,29 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         if (menu is not null && tabs.Count > 0) {
             foreach (RowPlacement placement in RowPlacements(layout)) {
                 if (!placement.Item.Hoverable) continue;
+                if (placement.Rect.Bottom < layout.Rows.Y || placement.Rect.Y > layout.Rows.Bottom) continue;
                 targets.Add(new MaterialInteractionTarget(ItemKey(placement.Item), placement.Rect,
                     Focused: menu.Current == placement.Item));
+                if (placement.Item is TextMenu.Slider) {
+                    targets.Add(new MaterialInteractionTarget(ItemKey(placement.Item) + ".touch-slider",
+                        SliderControlRect(PrimaryRect(placement)), TouchKind: "slider"));
+                }
                 if (CanFavorite(placement.Item)) {
                     targets.Add(new MaterialInteractionTarget(FavoriteKey(placement.Item),
                         FavoriteRect(PrimaryRect(placement)), Focused: IsFavorite(placement.Item)));
                 }
             }
         }
+        MaterialTouch.Publish(this, targets, TouchContext);
         motion.Update(targets);
+    }
+
+    private void TouchSearch(SearchTarget target, string value) {
+        SetSearchTarget(target);
+        if (target == SearchTarget.Tabs) tabSearchText = value;
+        else settingSearchText = value;
+        SearchChanged();
+        SetSearchTarget(SearchTarget.None);
     }
 
     private void RenderTabs(ModOptionsLayout layout, MaterialPalette palette, float alpha) {

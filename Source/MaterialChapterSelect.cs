@@ -49,6 +49,8 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
     private bool display;
     private Color paletteSeed = new(126, 99, 184);
     private string searchText = "";
+    internal bool AcceptsTouch => Visible && Active && Focused && display && ease > 0.99f;
+    private string TouchContext => $"chapters:{selectedLevelSet}:{searchText}";
     private string imeText = "";
     private bool searchFocused;
 
@@ -117,6 +119,7 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
     }
 
     public override void Update() {
+        MaterialTouch.BeginUpdate(this);
         ChapterLayout layout = ChapterLayout.Create(0f);
         cardScroll.Update(MaxCardScroll(layout));
         levelSetScroll.Update(MaxLevelSetScroll(layout));
@@ -167,8 +170,8 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
 
     private void UpdateInput() {
         ChapterLayout layout = ChapterLayout.Create(0f);
-        Vector2 mouse = MInput.Mouse.Position;
-        if (MInput.Mouse.PressedLeftButton && layout.Search.Contains(mouse)) {
+        Vector2 mouse = MaterialTouch.Position;
+        if (MaterialTouch.PressedLeftButton && layout.Search.Contains(mouse)) {
             SetSearchFocused(true);
             Audio.Play("event:/ui/main/button_select");
             return;
@@ -183,7 +186,7 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
                 SetSearchFocused(false);
             } else if (MaterialTextInputFocus.Pressed(Keys.Enter)) {
                 SetSearchFocused(false);
-            } else if (MInput.Mouse.PressedLeftButton && !layout.Search.Contains(mouse)) {
+            } else if (MaterialTouch.PressedLeftButton && !layout.Search.Contains(mouse)) {
                 SetSearchFocused(false);
             }
             return;
@@ -207,24 +210,24 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
         }
 
         bool inSidebar = layout.Sidebar.Contains(mouse);
-        if (MInput.Mouse.WheelDelta != 0) {
+        if (MaterialTouch.WheelDelta != 0) {
             if (inSidebar) {
-                levelSetScroll.Scroll(-Math.Sign(MInput.Mouse.WheelDelta) * 150f,
+                levelSetScroll.Scroll(-Math.Sign(MaterialTouch.WheelDelta) * 150f,
                     MaxLevelSetScroll(layout));
             } else {
-                cardScroll.Scroll(-Math.Sign(MInput.Mouse.WheelDelta) * 220f,
+                cardScroll.Scroll(-Math.Sign(MaterialTouch.WheelDelta) * 220f,
                     MaxCardScroll(layout));
             }
         }
 
-        if (MInput.Mouse.WasMoved || MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.WasMoved || MaterialTouch.PressedLeftButton) {
             int sidebar = SidebarIndexAt(mouse, layout);
             if (sidebar >= 0) {
-                if (MInput.Mouse.PressedLeftButton) SelectLevelSet(sidebar);
+                if (MaterialTouch.PressedLeftButton) SelectLevelSet(sidebar);
                 return;
             }
             int header = SectionHeaderIndexAt(mouse, layout);
-            if (header >= 0 && MInput.Mouse.PressedLeftButton) {
+            if (header >= 0 && MaterialTouch.PressedLeftButton) {
                 ToggleSection(header);
                 return;
             }
@@ -234,17 +237,21 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
                     selectedIndex = card;
                     Audio.Play("event:/ui/world_map/icon/roll_right");
                 }
-                if (MInput.Mouse.PressedLeftButton) ActivateSelected();
+                if (MaterialTouch.PressedLeftButton) ActivateSelected();
             }
         }
     }
 
     private void UpdateInteractions(ChapterLayout layout) {
         List<MaterialInteractionTarget> targets = [
-            new MaterialInteractionTarget("chapter.search", layout.Search, Focused: searchFocused)
+            new MaterialInteractionTarget("chapter.search", layout.Search, Focused: searchFocused,
+                TouchKind: "text", TouchText: searchText, TouchTextChanged: value => {
+                    searchText = value; SetSearchFocused(false); RebuildEntries();
+                })
         ];
         if (!Visible || !display || searchFocused) {
-            motion.Update(targets);
+            MaterialTouch.Publish(this, targets, TouchContext);
+        motion.Update(targets);
             return;
         }
 
@@ -272,6 +279,7 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
                 Focused: placement.EntryIndex == selectedIndex
             ));
         }
+        MaterialTouch.Publish(this, targets, TouchContext);
         motion.Update(targets);
     }
 
@@ -837,7 +845,7 @@ public sealed class MaterialChapterSelect : Oui, IMaterialAcrylicPage {
     }
 
     private static void RenderMouseCursor(MaterialPalette palette, float alpha) {
-        Vector2 mouse = MInput.Mouse.Position;
+        Vector2 mouse = MaterialTouch.Position;
         MaterialUiKit.Cursor(mouse, palette, alpha);
     }
 

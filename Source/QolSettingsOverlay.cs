@@ -32,6 +32,9 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     private int selectedTab;
     private int selectedRow;
     private float inputDelay = 0.16f;
+    internal bool AcceptsTouch => Visible && Active && bindingConfig is null && inputDelay <= 0
+        && closeDestination == CloseDestination.None && ease > 0.99f;
+    private string TouchContext => $"qol:{selectedTab}:{recorderSettingsSection}:{recordingLibraryKind}:{dropdownRow?.GetHashCode()}:{pendingRecordingDelete?.GetHashCode()}";
     private float ease;
     private float contentEase = 1f;
     private Entity? bindingConfig;
@@ -95,6 +98,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     public override void Update() {
+        MaterialTouch.BeginUpdate(this);
         base.Update();
         ease = Calc.Approach(ease, closeDestination == CloseDestination.None ? 1f : 0f,
             Engine.RawDeltaTime * 7.5f);
@@ -199,7 +203,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         if (dropdownRow is not null) RenderDropdown(layout, palette);
 
         if (pendingRecordingDelete is not null) RenderRecordingDeleteModal(palette);
-        MaterialUiKit.Cursor(MInput.Mouse.Position, palette, ease);
+        MaterialUiKit.Cursor(MaterialTouch.Position, palette, ease);
     }
 
     private void RenderNavigation(OverlayLayout layout, MaterialPalette palette) {
@@ -764,8 +768,8 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void UpdateRecorderPage(OverlayLayout layout) {
-        if (MInput.Mouse.WheelDelta != 0 && layout.Body.Contains(MInput.Mouse.Position)) {
-            rowScroll.Scroll(-Math.Sign(MInput.Mouse.WheelDelta) * 178f, MaxRowScroll(layout));
+        if (MaterialTouch.WheelDelta != 0 && layout.Body.Contains(MaterialTouch.Position)) {
+            rowScroll.Scroll(-Math.Sign(MaterialTouch.WheelDelta) * 178f, MaxRowScroll(layout));
         }
 
         if (MInput.Keyboard.Pressed(Keys.F)) OpenRecordingFolder();
@@ -795,18 +799,18 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void UpdateRecorderMouse(OverlayLayout layout) {
-        Vector2 mouse = MInput.Mouse.Position;
-        if (!MInput.Mouse.WasMoved && !MInput.Mouse.PressedLeftButton) return;
+        Vector2 mouse = MaterialTouch.Position;
+        if (!MaterialTouch.WasMoved && !MaterialTouch.PressedLeftButton) return;
 
         for (int index = 0; index < tabs.Count; index++) {
             if (!layout.Tab(index, tabs.Count).Contains(mouse)) continue;
-            if (MInput.Mouse.PressedLeftButton) SelectTab(index);
+            if (MaterialTouch.PressedLeftButton) SelectTab(index);
             return;
         }
         if (!layout.Rows.Contains(mouse)) return;
 
         MaterialRect hero = RecorderHeroRect(layout);
-        if (MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.PressedLeftButton) {
             if (RecorderButtonRect(hero, 0).Contains(mouse)) {
                 OpenRecordingFolder();
                 return;
@@ -824,14 +828,14 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
 
         foreach (RecorderSettingsSection section in Enum.GetValues<RecorderSettingsSection>()) {
             if (!RecorderSectionTabRect(layout, section).Contains(mouse)) continue;
-            if (MInput.Mouse.PressedLeftButton) SelectRecorderSection((int)section);
+            if (MaterialTouch.PressedLeftButton) SelectRecorderSection((int)section);
             return;
         }
         if (!RecorderViewport(layout).Contains(mouse)) return;
 
         for (int index = 0; IsRecorderLibrary && index < 3; index++) {
             if (!RecorderLibraryTabRect(layout, index).Contains(mouse)) continue;
-            if (MInput.Mouse.PressedLeftButton)
+            if (MaterialTouch.PressedLeftButton)
                 SelectRecordingLibraryKind((RecordingLibraryKind)index, layout);
             return;
         }
@@ -840,7 +844,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             MaterialRect rect = RecorderSettingRect(layout, index);
             if (!rect.Contains(mouse)) continue;
             recorderSelectedItem = index;
-            if (MInput.Mouse.PressedLeftButton) ActivateMouse(CurrentRows[index], rect, mouse);
+            if (MaterialTouch.PressedLeftButton) ActivateMouse(CurrentRows[index], rect, mouse);
             return;
         }
 
@@ -848,7 +852,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             MaterialRect rect = RecorderFileRect(layout, index);
             if (!rect.Contains(mouse)) continue;
             recorderSelectedItem = CurrentRows.Count + index;
-            if (!MInput.Mouse.PressedLeftButton) return;
+            if (!MaterialTouch.PressedLeftButton) return;
             if (IsRecordingFinalizing(recordingFiles[index])) {
                 Audio.Play("event:/ui/main/button_invalid");
                 return;
@@ -873,12 +877,12 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             ConfirmRecordingDelete();
             return;
         }
-        if (!MInput.Mouse.PressedLeftButton) return;
+        if (!MaterialTouch.PressedLeftButton) return;
         MaterialRect modal = RecordingDeleteModalRect();
-        if (RecordingDeleteCancelRect(modal).Contains(MInput.Mouse.Position)) {
+        if (RecordingDeleteCancelRect(modal).Contains(MaterialTouch.Position)) {
             pendingRecordingDelete = null;
             Audio.Play("event:/ui/main/button_back");
-        } else if (RecordingDeleteConfirmRect(modal).Contains(MInput.Mouse.Position)) {
+        } else if (RecordingDeleteConfirmRect(modal).Contains(MaterialTouch.Position)) {
             ConfirmRecordingDelete();
         }
     }
@@ -1014,20 +1018,20 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     }
 
     private void UpdateMouse(OverlayLayout layout) {
-        Vector2 mouse = MInput.Mouse.Position;
-        if (MInput.Mouse.WheelDelta != 0 && layout.Body.Contains(mouse)) {
+        Vector2 mouse = MaterialTouch.Position;
+        if (MaterialTouch.WheelDelta != 0 && layout.Body.Contains(mouse)) {
             float step = IsProfilerTab ? ProfilerScrollStep : 178f;
-            rowScroll.Scroll(-Math.Sign(MInput.Mouse.WheelDelta) * step, MaxRowScroll(layout));
+            rowScroll.Scroll(-Math.Sign(MaterialTouch.WheelDelta) * step, MaxRowScroll(layout));
         }
-        if (!MInput.Mouse.WasMoved && !MInput.Mouse.PressedLeftButton) return;
+        if (!MaterialTouch.WasMoved && !MaterialTouch.PressedLeftButton) return;
 
         for (int index = 0; index < tabs.Count; index++) {
             if (!layout.Tab(index, tabs.Count).Contains(mouse)) continue;
-            if (MInput.Mouse.PressedLeftButton) SelectTab(index);
+            if (MaterialTouch.PressedLeftButton) SelectTab(index);
             return;
         }
         if (IsProfilerTab) {
-            if (MInput.Mouse.PressedLeftButton) {
+            if (MaterialTouch.PressedLeftButton) {
                 if (ProfilerStartRect(layout).Contains(mouse)) StartProfilerSampling();
                 else if (ProfilerSimpleModeRect(layout).Contains(mouse)) SetProfilerSimpleMode(true);
                 else if (ProfilerProfessionalModeRect(layout).Contains(mouse)) SetProfilerSimpleMode(false);
@@ -1040,7 +1044,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             if (!rect.Contains(mouse)) continue;
             selectedRow = index;
             SettingRow row = CurrentRows[index];
-            if (MInput.Mouse.PressedLeftButton) ActivateMouse(row, rect, mouse);
+            if (MaterialTouch.PressedLeftButton) ActivateMouse(row, rect, mouse);
             return;
         }
     }
@@ -1076,24 +1080,24 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         }
 
         MaterialRect menu = DropdownRect(layout, row);
-        if (MInput.Mouse.WheelDelta != 0 && menu.Contains(MInput.Mouse.Position)) {
+        if (MaterialTouch.WheelDelta != 0 && menu.Contains(MaterialTouch.Position)) {
             int visibleCount = DropdownVisibleCount(row);
             int maximum = Math.Max(0, row.Options.Count - visibleCount);
             dropdownFirstVisible = Math.Clamp(
-                dropdownFirstVisible - Math.Sign(MInput.Mouse.WheelDelta), 0, maximum);
+                dropdownFirstVisible - Math.Sign(MaterialTouch.WheelDelta), 0, maximum);
             dropdownHighlight = Math.Clamp(dropdownHighlight, dropdownFirstVisible,
                 dropdownFirstVisible + visibleCount - 1);
         }
-        if (MInput.Mouse.WasMoved || MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.WasMoved || MaterialTouch.PressedLeftButton) {
             int visibleCount = DropdownVisibleCount(row);
             for (int visibleIndex = 0; visibleIndex < visibleCount; visibleIndex++) {
-                if (!DropdownItemRect(menu, visibleIndex).Contains(MInput.Mouse.Position)) continue;
+                if (!DropdownItemRect(menu, visibleIndex).Contains(MaterialTouch.Position)) continue;
                 dropdownHighlight = dropdownFirstVisible + visibleIndex;
-                if (MInput.Mouse.PressedLeftButton) CommitDropdown();
+                if (MaterialTouch.PressedLeftButton) CommitDropdown();
                 return;
             }
         }
-        if (MInput.Mouse.PressedLeftButton) CloseDropdown();
+        if (MaterialTouch.PressedLeftButton) CloseDropdown();
     }
 
     private void OpenDropdown(SettingRow row) {
@@ -1170,15 +1174,15 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
     private void UpdateSliderDrag(OverlayLayout layout) {
         SettingRow row = draggedSlider!;
         int index = CurrentRows.IndexOf(row);
-        if (index < 0 || !MInput.Mouse.CheckLeftButton) {
+        if (index < 0 || !MaterialTouch.CheckLeftButton) {
             draggedSlider = null;
             return;
         }
         MaterialRect rect = IsRecorderTab
             ? RecorderSettingRect(layout, index)
             : layout.Row(index, rowScroll.Offset);
-        ApplySliderMouse(row, SliderRect(rect), MInput.Mouse.Position.X);
-        if (MInput.Mouse.ReleasedLeftButton) draggedSlider = null;
+        ApplySliderMouse(row, SliderRect(rect), MaterialTouch.Position.X);
+        if (MaterialTouch.ReleasedLeftButton) draggedSlider = null;
     }
 
     private static void ApplySliderMouse(SettingRow row, MaterialRect track, float mouseX) {
@@ -1196,7 +1200,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             CommitEdit();
             return;
         }
-        if (MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.PressedLeftButton) {
             int index = CurrentRows.IndexOf(editingRow!);
             MaterialRect control = index < 0
                 ? default
@@ -1207,7 +1211,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                     : WideControlRect(IsRecorderTab
                         ? RecorderSettingRect(layout, index)
                         : layout.Row(index, rowScroll.Offset));
-            if (index < 0 || !control.Contains(MInput.Mouse.Position)) CommitEdit();
+            if (index < 0 || !control.Contains(MaterialTouch.Position)) CommitEdit();
         }
     }
 
@@ -1344,7 +1348,8 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 RecordingDeleteCancelRect(modal)));
             targets.Add(new MaterialInteractionTarget("settings.delete.confirm",
                 RecordingDeleteConfirmRect(modal)));
-            motion.Update(targets);
+            MaterialTouch.Publish(this, targets, TouchContext);
+        motion.Update(targets);
             return;
         }
 
@@ -1359,7 +1364,8 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                     Focused: optionIndex == dropdownHighlight
                 ));
             }
-            motion.Update(targets);
+            MaterialTouch.Publish(this, targets, TouchContext);
+        motion.Update(targets);
             return;
         }
 
@@ -1424,11 +1430,30 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             }
         }
 
+        if (!IsProfilerTab) {
+            for (int index = 0; index < CurrentRows.Count; index++) {
+                SettingRow row = CurrentRows[index];
+                if (!row.Enabled()) continue;
+                MaterialRect rect = IsRecorderTab ? RecorderSettingRect(layout, index) : layout.Row(index, rowScroll.Offset);
+                if (rect.Y < layout.Rows.Y || rect.Bottom > layout.Rows.Bottom) continue;
+                string key = $"settings.editor.{selectedTab}.{index}";
+                if (row.Kind == SettingKind.Range)
+                    targets.Add(new(key + ".slider", SliderRect(rect), TouchKind: "slider"));
+                if (row.Kind is SettingKind.Range or SettingKind.Text && row.EditValue is not null && row.CommitEdit is not null) {
+                    targets.Add(new(key + ".text", row.Kind == SettingKind.Range ? RangeValueRect(rect) : rect,
+                        TouchKind: row.Kind == SettingKind.Range ? "number" : "text", TouchText: row.EditValue(),
+                        TouchMaxLength: row.MaxInputLength, TouchTextChanged: value => {
+                            StartEdit(row); editBuffer = value; CommitEdit();
+                        }));
+                }
+            }
+        }
+        MaterialTouch.Publish(this, targets, TouchContext);
         motion.Update(targets);
     }
 
     private void UpdateRowAnimations(OverlayLayout layout) {
-        Vector2 mouse = MInput.Mouse.Position;
+        Vector2 mouse = MaterialTouch.Position;
         for (int tabIndex = 0; tabIndex < tabs.Count; tabIndex++) {
             List<SettingRow> animatedRows = tabIndex == selectedTab ? CurrentRows : tabs[tabIndex].Rows;
             for (int index = 0; index < animatedRows.Count; index++) {
