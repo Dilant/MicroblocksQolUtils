@@ -8,14 +8,15 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// <summary>
 /// Motion feedback for the extreme speeds tech and gimmick maps reach, where
 /// vanilla effects read as teleportation: an additive motion ribbon in world
-/// space, a wake computed analytically from the trail — capsule-shaped wave
+/// space plus a wake computed analytically from the trail — capsule-shaped wave
 /// bands around each trail segment that thicken and spread as they age, with
 /// the forward half cut away so the wake opens backward like a boat's V and can
-/// never overtake the player — applied after the level buffer is composed via a
-/// warped vertex mesh so background and entities transform together, plus
-/// wake-local graded blur (mipmap-style downsample pyramid), chromatic
-/// aberration and a brightness lift driven by the same field, scattering
-/// sparks and wall-impact shockwaves. Purely visual; physics are untouched.
+/// never overtake the player. The finished frame is then post-processed at
+/// render resolution by a single pixel shader driven by the field texture
+/// (displacement vectors + strength): warp, a graded blur whose radius follows
+/// the wake strength through a downsample pyramid, wake-local chromatic
+/// aberration and a brightness lift. Scattering sparks and wall-impact
+/// shockwaves round it off. Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
@@ -35,12 +36,6 @@ public static class HighSpeedEffects {
     private const float WakeBandGrow = 6f;
     private const float WakePushScale = 0.6f;
     private const float WakeForwardCut = 0.45f;
-
-    // Wake warp: how strongly the wake vectors displace the composed image. The
-    // warp runs as a pure-spritebatch tile grid — the same drawing path as every
-    // other layer here, no custom vertex pipeline involved.
-    private const int WarpTileSize = 4;
-    private const float MeshWarpScale = 6f;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -71,29 +66,29 @@ public static class HighSpeedEffects {
     // untouched here or gameplay rolls would depend on this mod's activity.
     private static readonly Random Random = new();
 
-    // Per-pixel wake accumulation: displacement vector, normalized strength and
-    // the graded blur masks (light near the wake rim, heavy at its core) that
-    // also gate the aberration layers, giving every post effect a continuous
-    // fade that tracks the wake exactly.
+    // The field texture: R/G carry the displacement vector around the neutral
+    // 0.5, B carries the (blurred, peak-normalized) wake strength that drives
+    // the shader's graded blur, aberration and brightness.
     private static readonly float[] WakeVecX = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeVecY = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeStrength = new float[FieldWidth * FieldHeight];
     private static readonly float[] ScratchField = new float[FieldWidth * FieldHeight];
-    private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
-    private static readonly Color[] BlurNearPixels = new Color[FieldWidth * FieldHeight];
-    private static readonly Color[] BlurFarPixels = new Color[FieldWidth * FieldHeight];
-    private static Texture2D? caMaskTexture;
-    private static Texture2D? blurNearTexture;
-    private static Texture2D? blurFarTexture;
+    private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
+    private static Texture2D? fieldTexture;
 
-    // Blur pyramid: successive downsamples of the composed image act as cheap
-    // box-filter mip levels; radius is chosen by which level (or mix of levels)
-    // a pixel's mask allows, giving a graded blur.
-    private static RenderTarget2D? blurHalf;
-    private static RenderTarget2D? blurQuarter;
+    // Render-resolution scratch: the shader output plus the two-level blur
+    // pyramid (the pyramid is field-sized; the shader resolves it at output
+    // resolution through linear sampling).
+    private static RenderTarget2D? screenWork;
+    private static RenderTarget2D? screenHalf;
+    private static RenderTarget2D? screenQuarter;
+    private static int screenWidth;
+    private static int screenHeight;
 
-    // Peak wake strength from the last field build; gates the post passes so
-    // they follow the wake's own fade-out instead of the player's speed.
+    private static Effect? wakeEffect;
+
+    // Peak wake strength from the last field build; gates the post pass so it
+    // follows the wake's own fade-out instead of the player's speed.
     private static float fieldActivity;
 
     // Debug override driven by the qol_speedfx command: feeds the given speed to
@@ -102,41 +97,33 @@ public static class HighSpeedEffects {
     internal static float? DebugSpeed;
     internal static float DebugSpeedTimer;
 
-    // Multiplies colour copy into the wake mask (src.rgb * dst.rgb) while
-    // keeping the destination alpha, so masked results stay premultiplied and
-    // can be composed as a lerp (sharp -> blurred) with plain alpha blending.
-    private static readonly BlendState MultiplyBlend = new() {
-        ColorBlendFunction = BlendFunction.Add,
-        ColorSourceBlend = Blend.DestinationColor,
-        ColorDestinationBlend = Blend.Zero,
-        AlphaBlendFunction = BlendFunction.Add,
-        AlphaSourceBlend = Blend.Zero,
-        AlphaDestinationBlend = Blend.DestinationAlpha,
-    };
-
     public static void Load() {
         On.Celeste.Player.Update += PlayerUpdate;
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
+        On.Celeste.HudRenderer.RenderContent += HudRenderContent;
     }
 
     public static void Unload() {
         On.Celeste.Player.Update -= PlayerUpdate;
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
+        On.Celeste.HudRenderer.RenderContent -= HudRenderContent;
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
-        caMaskTexture?.Dispose();
-        caMaskTexture = null;
-        blurNearTexture?.Dispose();
-        blurNearTexture = null;
-        blurFarTexture?.Dispose();
-        blurFarTexture = null;
-        blurHalf?.Dispose();
-        blurHalf = null;
-        blurQuarter?.Dispose();
-        blurQuarter = null;
+        fieldTexture?.Dispose();
+        fieldTexture = null;
+        screenWork?.Dispose();
+        screenWork = null;
+        screenHalf?.Dispose();
+        screenHalf = null;
+        screenQuarter?.Dispose();
+        screenQuarter = null;
+        wakeEffect?.Dispose();
+        wakeEffect = null;
+        screenWidth = 0;
+        screenHeight = 0;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -248,13 +235,9 @@ public static class HighSpeedEffects {
     // band is cut away so the wake opens backward and can never overtake the
     // player, and when the player stops the trail ages out and the whole wake
     // shrinks away — no propagation, no damping, no absorbing borders.
-    // The result feeds every post effect: mesh warp vectors, graded blur masks
-    // and the aberration mask.
     private static void BuildWakeField(Level? level) {
         if (level is null) return;
-        caMaskTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
-        blurNearTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
-        blurFarTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+        fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
 
         Array.Clear(WakeVecX);
         Array.Clear(WakeVecY);
@@ -360,32 +343,23 @@ public static class HighSpeedEffects {
             }
         }
 
-        // Blur the strength so the post masks are wider than the displacement
-        // band itself — fringes and blur then ease in over a 10px+ slope.
+        // Blur the strength so the shader's graded blur and fringes ease in over
+        // a wide slope; normalize against the surviving peak because the blur
+        // dilutes it, otherwise the heavy tier never reaches its threshold.
         BlurStrength(4);
-        for (int index = 0; index < CaMaskPixels.Length; index++) {
-            float strength = WakeStrength[index];
-            // Wide taper for the aberration mask.
-            float ramp = MathHelper.Clamp((strength - 0.12f) / 0.58f, 0f, 1f);
-            float mask = ramp * ramp * (3f - 2f * ramp);
-            CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
-            // Graded blur: the rim gets the light level, the core also gets the
-            // heavy one — radius grows with wake strength. Alpha carries the
-            // coverage so masked layers can be composed as a sharp->blur lerp.
-            float near = SmoothStep(0.10f, 0.45f, strength);
-            float far = SmoothStep(0.40f, 0.80f, strength);
-            BlurNearPixels[index] = new Color(new Vector4(near, near, near, near));
-            BlurFarPixels[index] = new Color(new Vector4(far, far, far, far));
+        float blurredPeak = 0f;
+        for (int index = 0; index < WakeStrength.Length; index++)
+            if (WakeStrength[index] > blurredPeak) blurredPeak = WakeStrength[index];
+        float normalize = blurredPeak > 0.01f ? 1f / blurredPeak : 0f;
+        for (int index = 0; index < FieldPixels.Length; index++) {
+            FieldPixels[index] = new Color(new Vector4(
+                0.5f + WakeVecX[index],
+                0.5f + WakeVecY[index],
+                MathHelper.Clamp(WakeStrength[index] * normalize, 0f, 1f),
+                1f));
         }
         fieldActivity = peakStrength;
-        caMaskTexture.SetData(CaMaskPixels);
-        blurNearTexture.SetData(BlurNearPixels);
-        blurFarTexture.SetData(BlurFarPixels);
-    }
-
-    private static float SmoothStep(float edge0, float edge1, float value) {
-        float t = MathHelper.Clamp((value - edge0) / (edge1 - edge0), 0f, 1f);
-        return t * t * (3f - 2f * t);
+        fieldTexture.SetData(FieldPixels);
     }
 
     // Separable box blur over the wake strength, in place.
@@ -417,157 +391,110 @@ public static class HighSpeedEffects {
         }
     }
 
-    // Runs right after the level buffer is fully composed (background,
-    // entities, bloom, glitch, foreground): the wake transform is applied to
-    // the finished image so every layer warps together, then the graded blur
-    // and wake-local aberration stack on top.
+    // The level buffer is finished here; only the field is built at this point,
+    // the actual post processing runs at render resolution once the frame is
+    // composed to the backbuffer.
     private static void GlitchApply(On.Celeste.Glitch.orig_Apply orig, VirtualRenderTarget source,
         float timer, float seed, float amplitude) {
         orig(source, timer, seed, amplitude);
-        BuildWakeField(Engine.Scene as Level);
-        if (source != GameplayBuffers.Level || !Active) return;
-        Level? level = Engine.Scene as Level;
-        if (level is null || level.FrozenOrPaused) return;
+        if (source == GameplayBuffers.Level) BuildWakeField(Engine.Scene as Level);
+    }
+
+    // Runs right before the HUD content: the composed frame sits in the
+    // backbuffer, so the wake shader runs at full render resolution.
+    private static void HudRenderContent(On.Celeste.HudRenderer.orig_RenderContent orig,
+        HudRenderer self, Scene scene) {
+        RenderScreenEffects(scene as Level);
+        orig(self, scene);
+    }
+
+    private static void RenderScreenEffects(Level? level) {
+        if (level is null || !Active || fieldActivity <= 0.01f || HiresRenderer.DrawToBuffer) return;
+        if (!Settings.HighSpeedWarp && !Settings.HighSpeedBlur && !Settings.HighSpeedAberration) return;
+        GraphicsDevice device = Engine.Instance.GraphicsDevice;
+        Viewport viewport = device.Viewport;
+        if (viewport.Width < 16 || viewport.Height < 16) return;
+        EnsureScreenTargets(device, viewport.Width, viewport.Height);
+
         List<Entity> players = level.Tracker.GetEntities<Player>();
-        // Prefer the hottest player for direction; fall back to any player so the
-        // fringes keep their heading while the wake fades out after a stop.
         Player? player = FindFocusPlayer(level)
             ?? (players.Count > 0 ? (Player)players[0] : null);
         if (player is null) return;
         PlayerFx fx = Fx.GetOrCreateValue(player);
-        // Follow the wake, not the current speed: the post effects stay alive
-        // (and fade out with the field) after the player has already stopped.
-        if (fieldActivity <= 0.01f) return;
 
-        float intensity = Intensity;
-        Vector2 direction = ScreenDirection(player, fx);
-        float offset = MathF.Max(0.5f, (0.2f + 1.1f * MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f)) * intensity);
-
-        GraphicsDevice device = Engine.Instance.GraphicsDevice;
+        // The blur pyramid comes from the level buffer; the shader then renders
+        // at full resolution, warping and blurring through linear sampling of
+        // the field-sized sources — smooth output instead of magnified pixels.
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
-        RenderTarget2D tempA = (RenderTarget2D)GameplayBuffers.TempA;
-        RenderTarget2D tempB = (RenderTarget2D)GameplayBuffers.TempB;
+        device.SetRenderTarget(screenHalf);
+        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
+        Draw.SpriteBatch.End();
+        device.SetRenderTarget(screenQuarter);
+        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(screenHalf, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
+        Draw.SpriteBatch.End();
 
-        device.SetRenderTarget(tempA);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.PointClamp);
+        // One shader pass: warp + graded blur + aberration + brightness lift,
+        // premultiplied by wake coverage so only the wake region is replaced.
+        float activity = MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f);
+        float intensity = Intensity;
+        Effect effect = GetWakeEffect();
+        effect.Parameters["ScreenTex"].SetValue(levelBuffer);
+        effect.Parameters["FieldTex"].SetValue(fieldTexture);
+        effect.Parameters["BlurHalfTex"].SetValue(screenHalf);
+        effect.Parameters["BlurQuarterTex"].SetValue(screenQuarter);
+        effect.Parameters["WarpScale"].SetValue(Settings.HighSpeedWarp ? 0.06f : 0f);
+        effect.Parameters["BlurAmount"].SetValue(Settings.HighSpeedBlur ? 1f : 0f);
+        Vector2 direction = ScreenDirection(player, fx);
+        float offsetPixels = MathF.Max(1f, (0.2f + 1.1f * activity) * intensity);
+        effect.Parameters["CaShift"].SetValue(Settings.HighSpeedAberration
+            ? direction * offsetPixels / new Vector2(viewport.Width, viewport.Height)
+            : Vector2.Zero);
+        effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
+        device.SetRenderTarget(screenWork);
+        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp,
+            DepthStencilState.None, RasterizerState.CullNone, effect);
         Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        // 1. Wake warp: redraw the composed image through the warped mesh; the
-        //    vertex alpha carries the wake strength so the displacement itself
-        //    eases in and out at the wake's rim.
-        if (Settings.HighSpeedWarp)
-            WarpComposedMesh(device, tempA, levelBuffer);
+        // Blend the processed wake over the composed frame in the viewport.
+        device.SetRenderTarget(null);
+        device.Viewport = viewport;
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(screenWork, Vector2.Zero, Color.White);
+        Draw.SpriteBatch.End();
+    }
 
-        // 2. Graded blur: build the downsample pyramid from the (warped) image
-        //    and blend each level in with its mask, light rim first, heavy core
-        //    on top — blur radius grows with wake strength.
-        if (Settings.HighSpeedBlur) {
-            BuildBlurPyramid(device);
-            DrawBlurredLevel(device, tempB, levelBuffer);
-        }
+    private static void EnsureScreenTargets(GraphicsDevice device, int width, int height) {
+        if (screenWidth == width && screenHeight == height) return;
+        screenWork?.Dispose();
+        screenHalf?.Dispose();
+        screenQuarter?.Dispose();
+        screenWidth = width;
+        screenHeight = height;
+        screenWork = new RenderTarget2D(device, width, height, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        screenHalf = new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        screenQuarter = new RenderTarget2D(device, FieldWidth / 4, FieldHeight / 4, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+    }
 
-        // 3. Wake-local chromatic aberration and brightness lift, stacked on the
-        //    current (warped and blurred) image.
-        if (!Settings.HighSpeedAberration) return;
-        DrawMaskedLayer(device, tempB, levelBuffer, direction * offset, Vector2.Zero, new Color(170, 0, 0, 255));
-        DrawMaskedLayer(device, tempB, levelBuffer, -direction * offset, Vector2.Zero, new Color(0, 0, 170, 255));
-        // A faint uniform white copy inside the wake acts as a brightness lift.
-        DrawMaskedLayer(device, tempB, levelBuffer, Vector2.Zero, Vector2.Zero, new Color(85, 85, 85, 255));
+    private static Effect GetWakeEffect() {
+        if (wakeEffect is { } effect) return effect;
+        using Stream stream = typeof(HighSpeedEffects).Assembly
+            .GetManifestResourceStream("Celeste.Mod.MicroblocksQolUtils.Effects.HighSpeedWake.fxb")
+            ?? throw new InvalidOperationException("Embedded HighSpeedWake.fxb is missing");
+        using MemoryStream memory = new();
+        stream.CopyTo(memory);
+        wakeEffect = new Effect(Engine.Instance.GraphicsDevice, memory.ToArray());
+        return wakeEffect;
     }
 
     private static void BeginSprite(BlendState blend, SamplerState sampler)
         => Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, blend, sampler,
             DepthStencilState.None, RasterizerState.CullNone);
-
-    // Redraws the composed level through a pure-spritebatch tile grid: every
-    // tile samples the snapshot with its source rectangle shifted by the wake
-    // vector. All tiles are drawn — outside the wake the vector is zero, so the
-    // pass re-placed the untouched image pixel-perfect, and the clear above
-    // never leaves a hole. Same drawing path as every other layer here — no
-    // custom vertex pipeline to go wrong.
-    private static void WarpComposedMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
-        device.SetRenderTarget(target);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        for (int y = 0; y < FieldHeight; y += WarpTileSize) {
-            for (int x = 0; x < FieldWidth; x += WarpTileSize) {
-                int index = y * FieldWidth + x;
-                int shiftX = (int)MathF.Round(WakeVecX[index] * MeshWarpScale);
-                int shiftY = (int)MathF.Round(WakeVecY[index] * MeshWarpScale);
-                Rectangle sourceRect = new(x + shiftX, y + shiftY, WarpTileSize, WarpTileSize);
-                Draw.SpriteBatch.Draw(source, new Vector2(x, y), sourceRect, Color.White);
-            }
-        }
-        Draw.SpriteBatch.End();
-    }
-
-    // The blur pyramid: two successive halvings of the composed level, each
-    // sampled linearly, act as cheap box-filter mip levels.
-    private static void BuildBlurPyramid(GraphicsDevice device) {
-        blurHalf ??= new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
-            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
-        blurQuarter ??= new RenderTarget2D(device, FieldWidth / 4, FieldHeight / 4, false, SurfaceFormat.Color,
-            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
-        RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
-
-        device.SetRenderTarget(blurHalf);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-        device.SetRenderTarget(blurQuarter);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(blurHalf, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-    }
-
-    // Composes the graded blur: each pyramid level is multiplied by its graded
-    // mask in the work buffer (which keeps the mask in alpha), then alpha
-    // blended over the level — a true sharp->blurred lerp whose radius follows
-    // the wake strength.
-    private static void DrawBlurredLevel(GraphicsDevice device, RenderTarget2D work, RenderTarget2D levelBuffer) {
-        DrawMaskedReplace(device, work, blurHalf!, blurNearTexture!, levelBuffer);
-        DrawMaskedReplace(device, work, blurQuarter!, blurFarTexture!, levelBuffer);
-    }
-
-    private static void DrawMaskedReplace(GraphicsDevice device, RenderTarget2D work, Texture2D source,
-        Texture2D mask, RenderTarget2D target) {
-        device.SetRenderTarget(work);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        // The mask is drawn with its alpha as coverage; colour is white so the
-        // multiply below only scales the blurred copy.
-        Draw.SpriteBatch.Draw(mask, Vector2.Zero, Color.White);
-        Draw.SpriteBatch.End();
-        BeginSprite(MultiplyBlend, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(source, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, target.Width / (float)source.Width,
-            SpriteEffects.None, 0f);
-        Draw.SpriteBatch.End();
-
-        device.SetRenderTarget(target);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        // work is premultiplied (rgb and alpha both carry the mask).
-        Draw.SpriteBatch.Draw(work, Vector2.Zero, Color.White);
-        Draw.SpriteBatch.End();
-    }
-
-    private static void DrawMaskedLayer(GraphicsDevice device, RenderTarget2D work, RenderTarget2D source,
-        Vector2 shift, Vector2 maskPosition, Color tint) {
-        device.SetRenderTarget(work);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        Draw.SpriteBatch.Draw(caMaskTexture, maskPosition, Color.White);
-        Draw.SpriteBatch.End();
-        BeginSprite(MultiplyBlend, SamplerState.PointClamp);
-        Draw.SpriteBatch.Draw(source, shift, tint);
-        Draw.SpriteBatch.End();
-
-        device.SetRenderTarget((RenderTarget2D)GameplayBuffers.Level);
-        BeginSprite(BlendState.Additive, SamplerState.PointClamp);
-        Draw.SpriteBatch.Draw(work, Vector2.Zero, Color.White);
-        Draw.SpriteBatch.End();
-    }
 
     private static void SpawnTrailParticles(Player player, PlayerFx fx, float speed, float threshold) {
         float excess = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
