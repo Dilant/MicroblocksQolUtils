@@ -118,6 +118,15 @@ public static class AutoRecorder {
         description = "";
         return false;
     }
+    internal static IReadOnlyList<(string Path, DateTime StartedAt)> FinalizingOutputs {
+        get {
+            lock (FinalizationProgressLock) {
+                return ActiveFinalizationOutputs
+                    .Select(pair => (pair.Key, pair.Value.StartedAt))
+                    .ToArray();
+            }
+        }
+    }
     public static string RecordingRoot => ResolveRecordingRoot();
     public static string FullRecordingRoot => Path.Combine(ResolveRecordingRoot(), FullRecordingsDirectory);
     public static string AutoRecordingRoot => Path.Combine(ResolveRecordingRoot(), "auto");
@@ -1089,6 +1098,11 @@ public static class AutoRecorder {
                 ).ConfigureAwait(false)) {
                     completed = false;
                 }
+                lock (FinalizationProgressLock) {
+                    string path = Path.GetFullPath(job.Output);
+                    if (ActiveFinalizationOutputs.TryGetValue(path, out FinalizationOutputProgressState? state)
+                        && state.FinalizationId == finalizationId) ActiveFinalizationOutputs.Remove(path);
+                }
                 completedWeight += job.Weight;
             }
             if (completed) DeleteTemporaryFiles(temporaryFiles);
@@ -1298,6 +1312,7 @@ public static class AutoRecorder {
         string description,
         long finalizationId
     ) {
+        public DateTime StartedAt { get; } = DateTime.Now;
         public double Progress { get; set; } = progress;
         public string Description { get; set; } = description;
         public long FinalizationId { get; } = finalizationId;
