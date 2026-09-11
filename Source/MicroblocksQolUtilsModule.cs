@@ -20,6 +20,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
 
     public override void Load() {
         Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "Loading microblock's QoL Utils");
+        NativeCaptureBridge.InitializeFromMod(Metadata);
         FrameRateCounter.Reset();
         WindowsInputLanguage.Load();
         MaterialTextInputFocus.Load();
@@ -29,7 +30,6 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         QolPauseMenu.Load();
         MaterialAcrylicRenderer.Load();
         MaterialUiSmoke.Load();
-        NativeCaptureBridge.InitializeFromMod(Metadata);
         CaptureSource.Load();
         NativeCaptureSmoke.Load();
         FrameProfiler.Load();
