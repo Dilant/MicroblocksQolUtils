@@ -2,7 +2,8 @@ using System.Runtime.InteropServices;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
-/// <summary>The only acquisition owner: one native frame pipeline and one DSP per FMOD bus.</summary>
+/// <summary>The only acquisition owner: one native frame pipeline and a music-only FMOD tap.
+/// Gameplay/UI SFX are captured as commands and never as realtime PCM.</summary>
 public static class CaptureSource {
     private static readonly object gate = new();
     private static CaptureSubscription[] subscriptions = [];
@@ -13,7 +14,7 @@ public static class CaptureSource {
     private static long retryAudioAt;
     private static bool loaded;
     private static string? workerError;
-    private static FmodPcmQueue[] audioRings = [];
+    private static FmodPcmQueue? musicRing;
     private static CaptureFramePool framePool = new();
     private static long sourceFrameDrops;
     private static long sourceAudioDrops;
@@ -63,11 +64,12 @@ public static class CaptureSource {
             if (loaded) return;
             if (!NativeCaptureBridge.Available) return;
             workerError = null;
-            audioRings = [new(), new(), new()];
+            musicRing = new();
             framePool = new();
             musicSnapshots = [];
             SdlFrameSource.Load();
             MusicCapture.Load();
+            AudioEventCapture.Load();
             cancellation = new();
             loaded = true;
             CancellationToken token = cancellation.Token;
@@ -94,9 +96,9 @@ public static class CaptureSource {
     }
     // FMOD real-time producer: preallocated bus-local ring, no worker locks or allocations.
     internal static unsafe void PublishAudio(float* input, int count, int rate, int channels, int bus, ulong dspClock, ulong timestamp) {
-        var rings = audioRings;
-        if (input == null || count <= 0 || count > FmodPcmQueue.MaxSamples || bus < 1 || bus > rings.Length
-            || !rings[bus - 1].TryWrite(new ReadOnlySpan<float>(input, count), rate, channels, dspClock, timestamp))
+        var ring = musicRing;
+        if (input == null || count <= 0 || count > FmodPcmQueue.MaxSamples || bus != 3 || ring is null
+            || !ring.TryWrite(new ReadOnlySpan<float>(input, count), rate, channels, dspClock, timestamp))
             Interlocked.Increment(ref sourceAudioDrops);
     }
     private static async Task PumpAsync(CancellationToken token) {
@@ -125,8 +127,8 @@ public static class CaptureSource {
                         } finally { lease.Release(); }
                     } finally { SdlFrameSource.Free(native.Pixels, native.Length); }
                 }
-                for (int bus = 1; bus <= audioRings.Length; bus++) {
-                    for (int i = 0; i < FmodPcmQueue.Capacity && audioRings[bus - 1].TryRead(bus, out var chunk); i++) {
+                if (musicRing is { } ring) {
+                    for (int i = 0; i < FmodPcmQueue.Capacity && ring.TryRead(3, out var chunk); i++) {
                         work = true;
                         foreach (var subscription in Volatile.Read(ref subscriptions)) subscription.Offer(chunk!);
                     }
@@ -146,9 +148,10 @@ public static class CaptureSource {
         Interlocked.Exchange(ref tap, null)?.Dispose();
         SdlFrameSource.Unload();
         MusicCapture.Unload();
+        AudioEventCapture.Unload();
         cancellation?.Cancel();
         worker?.GetAwaiter().GetResult();
         cancellation?.Dispose(); cancellation = null; worker = null;
-        audioRings = [];
+        musicRing = null;
     }
 }

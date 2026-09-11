@@ -1,12 +1,13 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 public static class NativeCaptureBridge {
     private const string LibraryName = "microblocks_qol_native";
-    private const uint ExpectedAbiVersion = 10;
+    private const uint ExpectedAbiVersion = 11;
     private static bool initialized;
     private static bool available;
     private static string? loadError;
@@ -44,10 +45,9 @@ public static class NativeCaptureBridge {
         string outputPath,
         string encoder,
         int bitrateKbps,
-        int queueCapacity = 3,
-        bool includeUiSfx = true
+        int queueCapacity = 3
     ) {
-        return StartCore(fps, queueCapacity, Path.GetFullPath(outputPath), encoder, bitrateKbps, includeUiSfx);
+        return StartCore(fps, queueCapacity, Path.GetFullPath(outputPath), encoder, bitrateKbps);
     }
 
     private static NativeCaptureSession StartCore(
@@ -55,8 +55,7 @@ public static class NativeCaptureBridge {
         int queueCapacity,
         string? outputPath,
         string encoder,
-        int bitrateKbps,
-        bool includeUiSfx = true
+        int bitrateKbps
     ) {
         EnsureAvailable();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(new {
@@ -70,7 +69,7 @@ public static class NativeCaptureBridge {
         ThrowIfFailed(status, "create");
         try {
             ThrowIfFailed(CaptureStart(handle), "start");
-            return new NativeCaptureSession(handle, includeUiSfx, outputPath, (uint)fps);
+            return new NativeCaptureSession(handle, outputPath, (uint)fps);
         } catch {
             CaptureDestroy(handle);
             throw;
@@ -127,23 +126,98 @@ public static class NativeCaptureBridge {
         return Task.Run(() => {
             GCHandle progressHandle = default;
             FinalizeProgressCallback? callback = null;
+            GCHandle sfxHandle = default;
+            FinalizeSfxCallback? sfxCallback = null;
+            SfxRenderContext? sfxContext = null;
             try {
                 if (progress is not null) {
                     progressHandle = GCHandle.Alloc(progress);
                     callback = ReportFinalizeProgress;
                 }
+                if (clips.Any(clip => File.Exists(Path.GetFullPath(clip.Source) + ".sfxevents")
+                    || File.Exists(Path.GetFullPath(clip.Source) + ".music.jsonl"))) {
+                    sfxContext = new SfxRenderContext(reconstructBgm);
+                    sfxHandle = GCHandle.Alloc(sfxContext);
+                    sfxCallback = RenderSfx;
+                }
                 ThrowIfFailed(RecordingFinalizeWithProgress(
                     json,
                     (nuint)json.Length,
                     callback,
-                    progressHandle.IsAllocated ? GCHandle.ToIntPtr(progressHandle) : IntPtr.Zero
-                ), "finalize");
+                    progressHandle.IsAllocated ? GCHandle.ToIntPtr(progressHandle) : IntPtr.Zero,
+                    sfxCallback,
+                    sfxHandle.IsAllocated ? GCHandle.ToIntPtr(sfxHandle) : IntPtr.Zero
+                ), sfxContext?.Error is Exception error ? $"finalize SFX ({error.Message})" : "finalize");
                 progress?.Invoke(1d);
                 GC.KeepAlive(callback);
+                GC.KeepAlive(sfxCallback);
             } finally {
                 if (progressHandle.IsAllocated) progressHandle.Free();
+                if (sfxHandle.IsAllocated) sfxHandle.Free();
             }
         });
+    }
+
+    private sealed class SfxRenderContext {
+        internal SfxRenderContext(bool reconstructBgm) => ReconstructBgm = reconstructBgm;
+        public bool ReconstructBgm { get; }
+        public Exception? Error;
+    }
+
+    private sealed record FinalizeClipDto(
+        [property: JsonPropertyName("source")] string Source,
+        [property: JsonPropertyName("start_seconds")] double StartSeconds,
+        [property: JsonPropertyName("duration_seconds")] double DurationSeconds,
+        [property: JsonPropertyName("music_event")] string? MusicEvent = null,
+        [property: JsonPropertyName("music_timeline_milliseconds")] int MusicTimelineMilliseconds = 0,
+        [property: JsonPropertyName("seamless_from_previous")] bool SeamlessFromPrevious = false,
+        [property: JsonPropertyName("bgm_follows_video")] bool BgmFollowsVideo = false
+    );
+
+    private static int RenderSfx(
+        IntPtr clipsJson,
+        nuint clipsLength,
+        IntPtr sidecarPath,
+        nuint sidecarLength,
+        IntPtr context
+    ) {
+        try {
+            if (context == IntPtr.Zero) return 1;
+            SfxRenderContext renderContext = (SfxRenderContext?)GCHandle.FromIntPtr(context).Target
+                ?? throw new InvalidOperationException("SFX renderer context was lost");
+            if (clipsLength > int.MaxValue || sidecarLength > int.MaxValue)
+                throw new InvalidDataException("native SFX render request is too large");
+            byte[] json = new byte[(int)clipsLength];
+            Marshal.Copy(clipsJson, json, 0, json.Length);
+            string sidecar = Encoding.UTF8.GetString(ReadNativeBytes(sidecarPath, (int)sidecarLength));
+            FinalizeClipDto[] effective = JsonSerializer.Deserialize<FinalizeClipDto[]>(json)
+                ?? throw new InvalidDataException("native SFX render clip list is empty");
+            RecordingClip[] clips = effective.Select(clip => new RecordingClip(
+                Path.GetFullPath(clip.Source), clip.StartSeconds, clip.DurationSeconds,
+                clip.MusicEvent ?? string.Empty, clip.MusicTimelineMilliseconds,
+                clip.SeamlessFromPrevious, clip.BgmFollowsVideo)).ToArray();
+            if (clips.Length == 0) throw new InvalidDataException("native SFX render clip list is empty");
+            string journal = clips[0].Source + ".sfxevents";
+            if (File.Exists(journal) && !AudioEventReplayRenderer.RenderToSidecar(journal, sidecar, clips))
+                throw new InvalidDataException("offline FMOD SFX rendering produced no samples");
+            string musicJournal = clips[0].Source + ".music.jsonl";
+            string musicSidecar = Path.ChangeExtension(sidecar, "bgmchunks");
+            if (File.Exists(musicJournal) && !MusicEventReplayRenderer.RenderToSidecar(
+                    musicJournal, musicSidecar, clips, renderContext.ReconstructBgm))
+                throw new InvalidDataException("offline FMOD music rendering produced no samples");
+            return 0;
+        } catch (Exception exception) {
+            if (context != IntPtr.Zero && GCHandle.FromIntPtr(context).Target is SfxRenderContext renderContext)
+                renderContext.Error = exception;
+            Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/EventReplay");
+            return 1;
+        }
+    }
+
+    private static byte[] ReadNativeBytes(IntPtr pointer, int length) {
+        byte[] bytes = new byte[length];
+        if (length != 0) Marshal.Copy(pointer, bytes, 0, length);
+        return bytes;
     }
 
     private static void ReportFinalizeProgress(float value, IntPtr context) {
@@ -269,13 +343,24 @@ public static class NativeCaptureBridge {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void FinalizeProgressCallback(float progress, IntPtr context);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int FinalizeSfxCallback(
+        IntPtr clipsJson,
+        nuint clipsLength,
+        IntPtr sidecarPath,
+        nuint sidecarLength,
+        IntPtr context
+    );
+
     [DllImport(LibraryName, EntryPoint = "mqol_recording_finalize_with_progress",
         CallingConvention = CallingConvention.Cdecl)]
     private static extern int RecordingFinalizeWithProgress(
         byte[] plan,
         nuint planLength,
         FinalizeProgressCallback? progress,
-        IntPtr context
+        IntPtr context,
+        FinalizeSfxCallback? renderSfx,
+        IntPtr renderSfxContext
     );
 }
 
@@ -285,7 +370,6 @@ public sealed class NativeCaptureSession : IDisposable {
     private readonly CaptureSubscription subscription;
     private readonly object gate = new();
     private readonly object stopGate = new();
-    private readonly Queue<CaptureAudio> preroll = new(32);
     private bool videoStarted;
     private ulong origin;
     private ulong keyframeRequestedAt, keyframeAcceptedAt;
@@ -309,15 +393,19 @@ public sealed class NativeCaptureSession : IDisposable {
         return start == 0 ? null : CaptureFrameClock.SecondsAt(timestamp, start, fps, roundUp);
     }
     private readonly MusicJournal? musicJournal;
+    private readonly AudioEventJournal? audioEventJournal;
     private int stopped;
-    internal NativeCaptureSession(ulong handle, bool includeUiSfx, string? outputPath, uint fps) {
+    internal NativeCaptureSession(ulong handle, string? outputPath, uint fps) {
         this.handle = handle;
         musicJournal = outputPath is null ? null : new MusicJournal(outputPath + ".music.jsonl");
+        audioEventJournal = outputPath is null ? null : new AudioEventJournal(outputPath + ".sfxevents");
+        if (audioEventJournal is not null) AudioEventCapture.SeedListener(audioEventJournal);
         try {
-            subscription = CaptureSource.SubscribeRecording(fps, PushFrame, outputPath is not null ? chunk => {
-                if (includeUiSfx || chunk.BusId != 2) PushAudio(chunk);
-            } : null, musicJournal is null ? null : musicJournal.Accept);
-        } catch { musicJournal?.Dispose(); throw; }
+            // New recordings are fully event-only. No FMOD PCM callback is attached;
+            // both SFX and music are rendered after the retained video branch is known.
+            subscription = CaptureSource.SubscribeRecording(fps, PushFrame, null,
+                musicJournal is null ? null : musicJournal.Accept);
+        } catch { musicJournal?.Dispose(); audioEventJournal?.Dispose(); throw; }
     }
     public CaptureStatistics Statistics { get { lock (gate) return handle == 0 ? default : NativeCaptureBridge.GetStats(handle); } }
     public CaptureDeliveryStatistics DeliveryStatistics => new(subscription.DroppedFrames,
@@ -338,12 +426,19 @@ public sealed class NativeCaptureSession : IDisposable {
             subscription.Complete();
             subscription.Completion.GetAwaiter().GetResult();
             lock (gate) {
-                preroll.Clear();
                 try {
                     if (handle != 0) NativeCaptureBridge.Stop(handle);
-                    musicJournal?.Finish(subscription.DroppedMusicEvents == 0 && subscription.CallbackErrors == 0
-                        && CaptureSource.MusicError is null && videoStarted);
-                } finally { musicJournal?.Dispose(); }
+                    bool complete = subscription.DroppedMusicEvents == 0 && subscription.CallbackErrors == 0
+                        && CaptureSource.MusicError is null && videoStarted;
+                    // Finish both journals even if one reports an incomplete stream. This
+                    // preserves an explicit footer for every sidecar and avoids leaving the
+                    // event journal open when the legacy music journal rejects its input.
+                    Exception? journalError = null;
+                    try { musicJournal?.Finish(complete); } catch (Exception e) { journalError = e; }
+                    try { audioEventJournal?.Finish(complete && AudioEventCapture.Failure is null); }
+                    catch (Exception e) { journalError ??= e; }
+                    if (journalError is not null) throw journalError;
+                } finally { musicJournal?.Dispose(); audioEventJournal?.Dispose(); }
             }
         }
     }
@@ -357,24 +452,11 @@ public sealed class NativeCaptureSession : IDisposable {
             videoStarted = true;
             Volatile.Write(ref origin, frame.TimestampNanos);
             musicJournal?.Start(origin);
-            // PBO delivery is late: retain eligible PCM while waiting, but discard pre-video PCM.
-            while (preroll.TryDequeue(out var chunk))
-                if (chunk.TimestampNanos >= frame.TimestampNanos) PushAudio(chunk);
+            audioEventJournal?.Start(origin);
         }
         ulong requested = Volatile.Read(ref keyframeRequestedAt);
         if (requested != 0 && frame.TimestampNanos >= requested)
             Interlocked.CompareExchange(ref keyframeAcceptedAt, frame.TimestampNanos, 0);
-    }
-    private unsafe void PushAudio(CaptureAudio chunk) {
-        if (!videoStarted) {
-            if (preroll.Count == 32) preroll.Dequeue();
-            preroll.Enqueue(chunk); return;
-        }
-        fixed (float* samples = chunk.Samples.Span) {
-            int status = NativeCaptureBridge.CapturePushAudio(handle, samples, (nuint)chunk.Samples.Length,
-                (uint)chunk.SampleRate, (ushort)chunk.Channels, (ushort)chunk.BusId, chunk.TimestampNanos);
-            if (status != 0) throw new InvalidOperationException(NativeCaptureBridge.LastError());
-        }
     }
     public void Dispose() {
         try { Stop(); }

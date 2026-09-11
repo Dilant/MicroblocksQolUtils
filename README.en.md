@@ -117,16 +117,16 @@ See [capture architecture and testing](docs/capture-architecture.md).
 - Video prefers the platform H.264 encoder (Media Foundation on Windows,
   VideoToolbox on macOS, and NVENC/QSV on Linux). Linux falls back to MPEG-4 Part 2
   in the MP4 container when no directly usable H.264 encoder is available. Audio
-  uses AAC. Frame rate, bitrate, encoder preference, UI SFX capture, and retention
+  uses AAC. Frame rate, bitrate, encoder preference, and retention
   limits are configurable.
-- One set of FMOD DSP taps captures gameplay_sfx, music, and ui_sfx (filtered per consumer). Chunks are
-  streamed by bus to an .sfxchunks sidecar, then SFX edits and the BGM post-mix
-  timeline are handled separately during finalization instead of buffering an
-  entire run in memory. MKV files under `.working` are therefore silent
+- Gameplay, UI SFX, and music are recorded as timestamped FMOD event commands in `.sfxevents` and
+  `.music.jsonl`; no audio PCM is stored during capture. During finalization, Celeste's FMOD banks replay
+  both journals in a separate offline NRT system: SFX follows retained source clips while music is rendered
+  on a continuous output timeline before AAC mixing. MKV files under `.working` are therefore silent
   intermediates; play the finalized MP4 files under `full` or `deaths` instead.
 - BGM can use the captured game mix or SfxOnlyWithPostMix. The latter edits only
-  gameplay/UI SFX against the video timeline and lays the separately captured
-  music bus onto a continuous post-mix timeline across deaths and pauses. A clean
+  gameplay/UI SFX against the video timeline and lays the event-rendered
+  music onto a continuous post-mix timeline across deaths and pauses. A clean
   mapped file replaces only its matching event segment. Maps containing cassette
   blocks, rhythm entities, or music-sync entities automatically retain the
   captured game mix to preserve timing.
@@ -140,7 +140,7 @@ directory containing the JSON file:
 }
 ~~~
 
-Without a mapping, the separately captured music bus is used as the post-mix BGM source.
+Without a mapping, Celeste's FMOD music events are used as the post-mix BGM source.
 
 The recording setting **Remove freeze frames** is disabled by default. When enabled, finalization
 detects stalls in the captured timeline and removes those intervals from the video, audio, and BGM
@@ -173,7 +173,7 @@ Each user slot binds an immutable video prefix and its automatic fallback versio
 references; it never immediately saves, loads, or replaces the active video branch.
 Internal saving freezes gameplay until clean resume frames reach both recordings. It reuses SRT's save/preclone indicator
 when available, with our own indicator only as a fallback.
-Video/audio sources live on disk under `.working/<area>` in the recording directory. Branches share these files; RAM holds
+Video and event sources live on disk under `.working/<area>` in the recording directory. Branches share these files; RAM holds
 buffers, edit references and retained game snapshots. Branch restoration is limited to the same full-recording session;
 loading an older save without matching footage starts a fresh prefix rather than fabricating a seamless connection.
 It preserves user slots/selection, existing marks and normal death/time statistics, adds no timer/golden-berry

@@ -1,4 +1,4 @@
-# 共享采集架构（native ABI 10）
+# 共享采集架构（native ABI 11）
 
 ## 数据路径
 
@@ -10,10 +10,9 @@ SDL/FNA 呈现：按真实后端路由，不更改游戏 renderer
         ↓ 后续帧非阻塞检查 GPU 完成；保持原始提交时间戳与接收者信息
         ↓ 有界 CPU 队列（3 帧）；worker 转为 top-down BGRA8
 
-FMOD: gameplay_sfx / ui_sfx / music 各一个 pass-through DSP
-        ↓ 原始 interleaved float PCM、声道/采样率、bus、DSP clock
-        ↓ 每 bus 一个预分配 SPSC ring（64 块）；mixer 不拿 worker 的锁
-        ↓ 唯一 source worker
+FMOD: gameplay_sfx / ui_sfx / music 记录 EventInstance 命令；录制阶段不启用 PCM tap
+        ↓ SFX 事件路径、实例、时间、参数、位置和生命周期 → .sfxevents
+        ↓ music event state、切换、参数、seek、pause 和位置 → .music.jsonl
 
 MusicCapture: 主/alt 音乐状态快照 + managed command hooks
         ↓ switch / start / stop / pause / resume / seek / parameter / seek-or-loop
@@ -26,7 +25,7 @@ MusicCapture: 主/alt 音乐状态快照 + managed command hooks
              全程录制          死亡回放          第三方消费者
           NativeCaptureSession：独立编码、原点、PCM 文件及事件日志
                                   ↓
-             视频/SFX 剪辑时间线 + 独立 BGM 时间线 → FFmpeg 输出
+            视频/SFX 剪辑时间线 + music 输出时间线 → FFmpeg 输出
 ```
 
 PR #2 仅引入音频首视频帧原点/reset 的同步处理；未合并其录制、授权及 UI 实现。
@@ -42,8 +41,8 @@ CaptureSubscription registration = CaptureSource.Subscribe(
     },
     fmod: audio => {
         // ReadOnlyMemory<float> Samples；SampleRate、Channels、BusId、BusPath；
-        // DspClock、TimestampNanos。1=游戏音效，2=UI音效，3=BGM。
-        // 原始多声道数据保留，不在 callback 前混成 stereo。
+        // DspClock、TimestampNanos。录制内置消费者不注册 PCM callback；
+        // gameplay/UI SFX 和 music 都写入事件日志。
     },
     music: change => {
         // Track(main/alt)、Kind、Event、InstanceId、TimelineMilliseconds；
@@ -81,15 +80,15 @@ worker 完成 owned copy 后才归还 slot。普通读写竞争不再丢音频�
 ## 每个录制会话的文件
 
 - `run.mkv`：连续视频。
-- `run.mkv.sfxchunks`：游戏音效及可选 UI 音效，**不含 BGM**。
-- `run.mkv.bgmchunks`：独立 music bus 原始 PCM，包含 FMOD 实际混出的主/alt 音乐及过渡。
-- `run.mkv.music.jsonl`：版本头、初始主/alt 状态、时间戳事件、完成标记。
+- `run.mkv.sfxevents`：游戏音效及 UI 音效的 FMOD 事件命令；录制期间不保存 SFX PCM。
+- `run.mkv.music.jsonl`：music 事件和主/alt 状态；录制阶段没有 BGM PCM，最终化时临时生成 `.bgmchunks`。
 - `run.mkv.capture.json`：排空后的目标/实际输入 FPS、native/订阅/source pool 丢失统计；导出后保存在 MP4 的 `.timeline.json` 的 `captureReports` 中。
 
-PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时将 FMOD 标准
+最终化期间的临时 PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时将 FMOD 标准
 1/2/4/5/6/8 声道折叠为双声道。中心/环绕分配到左右，LFE 不加入 stereo。
 不同 bus 的声道数可以不同；同一录制中采样率改变目前明确报错，不做隐式重采样。
-旧版本只有 `.sfxchunks` 的文件仍支持按 bus id 分离并使用旧 clip 元数据。
+最终化时加载 Celeste 安装目录的 FMOD banks，在独立的同步 NRT Studio system 中重放 SFX 和 music 事件；
+SFX 按源视频片段裁切，music 按输出时间线连续重放，再交给 AAC 混音。临时的 `.sfxchunks` 和 `.bgmchunks` 只在最终化期间存在。
 
 音乐观察器只有一份，不覆盖 FMOD 已有的 event callback。主/alt 切换在 Celeste 音乐命令边界观察；
 现有音乐实例的 start/stop/seek/pause/setParameterValue 另外 hook FMOD managed wrapper。
@@ -120,7 +119,7 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 需要保留游戏实际动态音乐时使用采集到的 BGM，不配置静态替换映射。
 剪辑不能凭空生成未采到的音乐，PCM 丢块仍按时间戳表现为缺口。
 
-## 录制启动、帧率与过载（ABI 10）
+## 录制启动、帧率与过载（ABI 11）
 
 - **只有采集层筛选帧**：`SubscribeRecording(fps, ...)` 注册目标速率，GL/D3D11 source 在 GPU 提交前，
   每种速率只做一次选择，同速率消费者共享同一张图像。只有任一接收者需要画面才提交读回；
@@ -146,8 +145,8 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 - 录制订阅队列为 5 帧（60 FPS 约 83ms），吸收启动/IO 的短突发；普通消费者仍是 3 帧。
   没有扩大共享 pool 或 native RAM cap。慢 callback、慢磁盘、持续低于实时速度的编码器仍可能耗尽有限缓冲。
   临时 IO 不在 render/FMOD 线程；这不是保证任何磁盘/任意分辨率都能满帧。
-- 音频 sink writer、各 bus 的预分配 ring、SFX/BGM/音乐事件分离、房间级 BGM 策略保持不变。
-  native 及订阅各容纳 256 PCM 块，native PCM 每 sink 最多 16 MiB；仍不阻塞 mixer。
+- 录制 sink 只写视频和事件日志；SFX/BGM 临时 PCM 由最终化阶段的独立 FMOD NRT renderer 产生，
+  不阻塞游戏 mixer，也不把音频副本留在 `.working` 目录。
 - 编码 PTS/剪辑边界使用与采集匹配的 tick 映射，这是时间换算，不是额外筛选。
   原始 GPU 提交时间、首帧音频原点不改写。
   `NativeCaptureSession.DeliveryStatistics` 报告订阅损失，`Statistics` 报告 native 损失；排空后写 capture report。
@@ -186,7 +185,7 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
 - beforeSave/beforeLoad 关闭两路录像分支，操作回调只暂存数据。实际 `SaveStateImpl/LoadStateImpl` 成功返回才提交，
   内部操作还必须等 pre-clone 成功。死亡先标记待切分支，正常复活时才使用复活前缀；成功 SL 则恢复精确存档前缀。
   手动 load 不排队自动保存，也不应用内部游戏冻结门。
-- 完整录像源持续追加写入磁盘 `.working/<区域>`，所有分支复用同一份 MKV/PCM/音乐事件；不因删槽提前清源文件。
+- 完整录像源持续追加写入磁盘 `.working/<区域>`，所有分支复用同一份 MKV 和事件日志；不因删槽提前清源文件。
   内存主要保存编码/采集缓冲、前缀引用和 SRT 游戏快照，而不是整段视频。完整录制结束后沿用导出完成后清理策略。
   恢复拒绝不匹配的源文件（包括空前缀和复活前缀）；无可用录像历史的旧会话存档从新前缀开始，不伪造无缝连接。
 - SRT 操作结束且玩家可录制后的第一次 source presentation 请求关键帧并重新打开录像分支，
@@ -212,7 +211,7 @@ PCM 文件保持 `MQOLAUD1` 格式及原始声道信息；只在导出混音时�
   后者会让恢复后的 SFX 时间戳提前，形成百毫秒级错位；不能靠 native 连续 PCM 计数补偿掉这个误差。
 - 内部保存到达视频 Boundary 时才暂停音效；保存/读档后的 Clean 等待不提前恢复音效，
   请求第一张保留画面时才恢复。Studio pause/resume 命令会 flush，取消和失败路径仍解除暂停。
-- SFX/UI/BGM 叠加使用浮点余量，所有贡献相加后在送入 AAC 时限幅，避免逐次限幅破坏叠加/相消。
+- 离线 FMOD 输出与 BGM 使用浮点余量，所有贡献相加后在送入 AAC 时限幅，避免逐次限幅破坏叠加/相消。
   有效硬切处若存在异常波形阶跃，仅在两侧各最多 1ms 做 SFX 去爆音；不借用被删死亡区间的样本，
   不改视频时长或加入画面 crossfade。正常连续波形、纯 metadata 分段不动，独立 BGM 在此步骤后混入。
   旧的混合 BGM sidecar 无法分离时不做这项 SFX 去爆音，避免误伤音乐。

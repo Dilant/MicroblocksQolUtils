@@ -36,7 +36,7 @@ internal sealed class FmodPcmQueue {
         if (read == Volatile.Read(ref write)) return false;
         Slot slot = slots[read];
         chunk = new(slot.Samples.AsMemory(0, slot.Count).ToArray(), slot.Rate, slot.Channels,
-            bus, bus switch { 1 => "bus:/gameplay_sfx", 2 => "bus:/ui_sfx", _ => "bus:/music" }, slot.Clock, slot.Timestamp);
+            bus, "bus:/music", slot.Clock, slot.Timestamp);
         Volatile.Write(ref read, (read + 1) % slots.Length);
         return true;
     }

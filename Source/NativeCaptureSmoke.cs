@@ -90,8 +90,10 @@ internal static class NativeCaptureSmoke {
             if (!File.Exists(path) || new FileInfo(path).Length < 1_000 || statistics.FramesCaptured < 10)
                 throw new Exception($"No captured video; {statistics}; source={CaptureSource.VideoError}; native={NativeCaptureBridge.LastError()}");
             if (visibleFrames < 10) throw new Exception($"Captured only {visibleFrames} visibly varied frames; a solid-color game window is not a successful visual smoke test.");
-            byte[] audio = File.ReadAllBytes(path + ".sfxchunks");
-            if (audio.Length < 8 || !audio.AsSpan(0,8).SequenceEqual("MQOLAUD1"u8)) throw new Exception("Invalid PCM sidecar");
+            if (!File.Exists(path + ".sfxevents") || !File.ReadLines(path + ".sfxevents").Last().Contains("\"complete\":true"))
+                throw new Exception("Invalid SFX event journal");
+            if (!File.Exists(path + ".music.jsonl") || !File.ReadLines(path + ".music.jsonl").Last().Contains("\"complete\":true"))
+                throw new Exception("Invalid music event journal");
             string finalized = path + ".final.mp4";
             await NativeCaptureBridge.FinalizeRecordingAsync(
                 [new RecordingClip(path, 0, Math.Max(0.1, statistics.MediaTimeSeconds), "", 0)],
