@@ -11,16 +11,17 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// space, a wake computed analytically from the trail — capsule-shaped wave
 /// bands around each trail segment that thicken and spread as they age, with
 /// the forward half cut away so the wake opens backward like a boat's V and can
-/// never overtake the player — feeding vanilla's displacement map, plus
-/// wake-local chromatic aberration, motion blur and a brightness lift driven
-/// by the same field, scattering sparks and wall-impact shockwaves.
-/// Purely visual; physics are untouched.
+/// never overtake the player — applied after the level buffer is composed via a
+/// warped vertex mesh so background and entities transform together, plus
+/// wake-local graded blur (mipmap-style downsample pyramid), chromatic
+/// aberration and a brightness lift driven by the same field, scattering
+/// sparks and wall-impact shockwaves. Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
     private const int ParticleCapacity = 160;
 
-    // The wake field resolution matches the displacement buffer 1:1.
+    // The wake field resolution matches the level buffer 1:1.
     private const int FieldWidth = 320;
     private const int FieldHeight = 180;
 
@@ -34,6 +35,11 @@ public static class HighSpeedEffects {
     private const float WakeBandGrow = 6f;
     private const float WakePushScale = 0.6f;
     private const float WakeForwardCut = 0.45f;
+
+    // Final mesh: how strongly the wake vectors displace the composed image.
+    private const int MeshCellsX = 40;
+    private const int MeshCellsY = 24;
+    private const float MeshWarpScale = 0.06f;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -64,28 +70,32 @@ public static class HighSpeedEffects {
     // untouched here or gameplay rolls would depend on this mod's activity.
     private static readonly Random Random = new();
 
-    // Per-pixel wake accumulation: displacement vector and normalized strength
-    // (the strength doubles as the aberration/blur mask, giving those layers a
-    // continuous fade that tracks the wake exactly).
+    // Per-pixel wake accumulation: displacement vector, normalized strength and
+    // the graded blur masks (light near the wake rim, heavy at its core) that
+    // also gate the aberration layers, giving every post effect a continuous
+    // fade that tracks the wake exactly.
     private static readonly float[] WakeVecX = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeVecY = new float[FieldWidth * FieldHeight];
     private static readonly float[] WakeStrength = new float[FieldWidth * FieldHeight];
     private static readonly float[] ScratchField = new float[FieldWidth * FieldHeight];
-    private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
     private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
-    private static Texture2D? fieldTexture;
+    private static readonly Color[] BlurNearPixels = new Color[FieldWidth * FieldHeight];
+    private static readonly Color[] BlurFarPixels = new Color[FieldWidth * FieldHeight];
     private static Texture2D? caMaskTexture;
-    // Peak wake strength from the last field build; gates the aberration pass so
-    // it follows the wake's own fade-out instead of the player's speed.
+    private static Texture2D? blurNearTexture;
+    private static Texture2D? blurFarTexture;
+
+    // Blur pyramid: successive downsamples of the composed image act as cheap
+    // box-filter mip levels; radius is chosen by which level (or mix of levels)
+    // a pixel's mask allows, giving a graded blur.
+    private static RenderTarget2D? blurHalf;
+    private static RenderTarget2D? blurQuarter;
+
+    // Peak wake strength from the last field build; gates the post passes so
+    // they follow the wake's own fade-out instead of the player's speed.
     private static float fieldActivity;
 
-    // Background warp: vanilla applies the displacement map only to the entity
-    // layer, so the freshly drawn backdrop gets its own pass through a warped
-    // vertex mesh (UVs perturbed straight from the wake field, no shader).
-    private const int MeshCellsX = 40;
-    private const int MeshCellsY = 24;
-    private const float BackgroundWarpScale = 0.06f;
-    private static VertexPositionTexture[]? meshVertices;
+    private static VertexPositionColorTexture[]? meshVertices;
     private static short[]? meshIndices;
     private static IndexBuffer? meshIndexBuffer;
     private static BasicEffect? meshEffect;
@@ -96,37 +106,41 @@ public static class HighSpeedEffects {
     internal static float? DebugSpeed;
     internal static float DebugSpeedTimer;
 
-    // Multiplies colour copy into the wake mask (src.rgb * dst.rgb).
+    // Multiplies colour copy into the wake mask (src.rgb * dst.rgb) while
+    // keeping the destination alpha, so masked results stay premultiplied and
+    // can be composed as a lerp (sharp -> blurred) with plain alpha blending.
     private static readonly BlendState MultiplyBlend = new() {
         ColorBlendFunction = BlendFunction.Add,
         ColorSourceBlend = Blend.DestinationColor,
         ColorDestinationBlend = Blend.Zero,
         AlphaBlendFunction = BlendFunction.Add,
-        AlphaSourceBlend = Blend.One,
-        AlphaDestinationBlend = Blend.Zero,
+        AlphaSourceBlend = Blend.Zero,
+        AlphaDestinationBlend = Blend.DestinationAlpha,
     };
 
     public static void Load() {
         On.Celeste.Player.Update += PlayerUpdate;
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
-        On.Celeste.Level.LoadLevel += LevelLoadLevel;
-        On.Celeste.BackdropRenderer.Render += BackdropRender;
     }
 
     public static void Unload() {
         On.Celeste.Player.Update -= PlayerUpdate;
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
-        On.Celeste.Level.LoadLevel -= LevelLoadLevel;
-        On.Celeste.BackdropRenderer.Render -= BackdropRender;
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
-        fieldTexture?.Dispose();
-        fieldTexture = null;
         caMaskTexture?.Dispose();
         caMaskTexture = null;
+        blurNearTexture?.Dispose();
+        blurNearTexture = null;
+        blurFarTexture?.Dispose();
+        blurFarTexture = null;
+        blurHalf?.Dispose();
+        blurHalf = null;
+        blurQuarter?.Dispose();
+        blurQuarter = null;
         meshEffect?.Dispose();
         meshEffect = null;
         meshIndexBuffer?.Dispose();
@@ -145,27 +159,6 @@ public static class HighSpeedEffects {
     // already stir a faint ripple and the wake reads clearly from the threshold.
     private static float HeatCurve(float speed, float threshold)
         => MathHelper.Clamp((speed - 0.5f * threshold) / (1.5f * threshold), 0f, 1f);
-
-    // Room transitions reuse the Level instance and clear non-persistent
-    // entities; attach the hook after every LoadLevel completes and keep it
-    // persistent so no transition path can leave the level without one.
-    private static void LevelLoadLevel(On.Celeste.Level.orig_LoadLevel orig, Level self,
-        Player.IntroTypes intro, bool fromLoader) {
-        orig(self, intro, fromLoader);
-        if (self.Tracker.GetEntity<SpaceCrushHook>() is null) self.Add(new SpaceCrushHook());
-    }
-
-    // Carries the displacement hook; vanilla's DisplacementRenderer collects one
-    // callback per hook component while filling the displacement buffer.
-    [Tracked] // Tracker.GetEntity<> throws for types that are not registered as tracked.
-    private sealed class SpaceCrushHook : Entity {
-        public SpaceCrushHook() {
-            Tag = Tags.Persistent;
-            Add(new DisplacementRenderHook(RenderCrush));
-        }
-
-        private void RenderCrush() => RenderTrailWake(Engine.Scene as Level);
-    }
 
     private static void PlayerUpdate(On.Celeste.Player.orig_Update orig, Player self) {
         orig(self);
@@ -265,10 +258,13 @@ public static class HighSpeedEffects {
     // band is cut away so the wake opens backward and can never overtake the
     // player, and when the player stops the trail ages out and the whole wake
     // shrinks away — no propagation, no damping, no absorbing borders.
-    private static void RenderTrailWake(Level? level) {
-        if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
-        Texture2D texture = fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+    // The result feeds every post effect: mesh warp vectors, graded blur masks
+    // and the aberration mask.
+    private static void BuildWakeField(Level? level) {
+        if (level is null) return;
         caMaskTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+        blurNearTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
+        blurFarTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
 
         Array.Clear(WakeVecX);
         Array.Clear(WakeVecY);
@@ -351,9 +347,8 @@ public static class HighSpeedEffects {
             }
         }
 
-        // Bake the accumulated field into the displacement map; every player is
-        // punched back out (even from other players' wakes) so sprites stay
-        // crisp.
+        // Every player is punched back out (even from other players' wakes) so
+        // sprites stay crisp.
         for (int p = 0; p < players.Count; p++) {
             Player player = (Player)players[p];
             Vector2 local = player.Center - camera;
@@ -375,27 +370,32 @@ public static class HighSpeedEffects {
             }
         }
 
-        // Blur the strength so the aberration mask is wider than the displacement
-        // band itself — the fringes then ease in over a 10px+ slope instead of
-        // hugging the wave's hard edge.
+        // Blur the strength so the post masks are wider than the displacement
+        // band itself — fringes and blur then ease in over a 10px+ slope.
         BlurStrength(4);
-        for (int index = 0; index < FieldPixels.Length; index++) {
+        for (int index = 0; index < CaMaskPixels.Length; index++) {
             float strength = WakeStrength[index];
-            FieldPixels[index] = new Color(new Vector4(
-                0.5f + WakeVecX[index],
-                0.5f + WakeVecY[index],
-                0f, 1f));
+            // Wide taper for the aberration mask.
             float ramp = MathHelper.Clamp((strength - 0.12f) / 0.58f, 0f, 1f);
             float mask = ramp * ramp * (3f - 2f * ramp);
             CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
+            // Graded blur: the rim gets the light level, the core also gets the
+            // heavy one — radius grows with wake strength. Alpha carries the
+            // coverage so masked layers can be composed as a sharp->blur lerp.
+            float near = SmoothStep(0.10f, 0.45f, strength);
+            float far = SmoothStep(0.40f, 0.80f, strength);
+            BlurNearPixels[index] = new Color(new Vector4(near, near, near, near));
+            BlurFarPixels[index] = new Color(new Vector4(far, far, far, far));
         }
         fieldActivity = peakStrength;
-        texture.SetData(FieldPixels);
         caMaskTexture.SetData(CaMaskPixels);
+        blurNearTexture.SetData(BlurNearPixels);
+        blurFarTexture.SetData(BlurFarPixels);
+    }
 
-        // The hook's sprite batch is already begun with the camera transform and
-        // alpha blending; draw the field over the camera's view of the world.
-        Draw.SpriteBatch.Draw(texture, camera, Color.White);
+    private static float SmoothStep(float edge0, float edge1, float value) {
+        float t = MathHelper.Clamp((value - edge0) / (edge1 - edge0), 0f, 1f);
+        return t * t * (3f - 2f * t);
     }
 
     // Separable box blur over the wake strength, in place.
@@ -427,35 +427,87 @@ public static class HighSpeedEffects {
         }
     }
 
-    // Vanilla applies the displacement map only to the entity layer; the
-    // backdrop needs its own pass. Right after BackdropRenderer draws into the
-    // level buffer, snapshot it and redraw it through a mesh whose UVs are
-    // perturbed by the wake field — warping the background with the same waves.
-    private static void BackdropRender(On.Celeste.BackdropRenderer.orig_Render orig,
-        BackdropRenderer self, Scene scene) {
-        orig(self, scene);
-        if (scene is not Level || !Active || !Settings.HighSpeedWarp || fieldActivity <= 0.01f) return;
+    // Runs right after the level buffer is fully composed (background,
+    // entities, bloom, glitch, foreground): the wake transform is applied to
+    // the finished image so every layer warps together, then the graded blur
+    // and wake-local aberration stack on top.
+    private static void GlitchApply(On.Celeste.Glitch.orig_Apply orig, VirtualRenderTarget source,
+        float timer, float seed, float amplitude) {
+        orig(source, timer, seed, amplitude);
+        BuildWakeField(Engine.Scene as Level);
+        if (source != GameplayBuffers.Level || !Active) return;
+        Level? level = Engine.Scene as Level;
+        if (level is null || level.FrozenOrPaused) return;
+        List<Entity> players = level.Tracker.GetEntities<Player>();
+        // Prefer the hottest player for direction; fall back to any player so the
+        // fringes keep their heading while the wake fades out after a stop.
+        Player? player = FindFocusPlayer(level)
+            ?? (players.Count > 0 ? (Player)players[0] : null);
+        if (player is null) return;
+        PlayerFx fx = Fx.GetOrCreateValue(player);
+        // Follow the wake, not the current speed: the post effects stay alive
+        // (and fade out with the field) after the player has already stopped.
+        if (fieldActivity <= 0.01f) return;
+
+        float intensity = Intensity;
+        Vector2 direction = ScreenDirection(player, fx);
+        float offset = MathF.Max(0.5f, (0.2f + 1.1f * MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f)) * intensity);
+
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
         RenderTarget2D tempA = (RenderTarget2D)GameplayBuffers.TempA;
+        RenderTarget2D tempB = (RenderTarget2D)GameplayBuffers.TempB;
 
         device.SetRenderTarget(tempA);
-        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp,
-            DepthStencilState.None, RasterizerState.CullNone);
+        device.Clear(Color.Transparent);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
-        WarpBackdropMesh(device, tempA, levelBuffer);
+
+        // 1. Wake warp: redraw the composed image through the warped mesh; the
+        //    vertex alpha carries the wake strength so the displacement itself
+        //    eases in and out at the wake's rim.
+        if (Settings.HighSpeedWarp)
+            WarpComposedMesh(device, tempA, levelBuffer);
+
+        // 2. Graded blur: build the downsample pyramid from the (warped) image
+        //    and blend each level in with its mask, light rim first, heavy core
+        //    on top — blur radius grows with wake strength.
+        if (Settings.HighSpeedBlur) {
+            BuildBlurPyramid(device);
+            DrawBlurredLevel(device, tempB, levelBuffer);
+        }
+
+        // 3. Wake-local chromatic aberration and brightness lift, stacked on the
+        //    current (warped and blurred) image.
+        if (!Settings.HighSpeedAberration) return;
+        DrawMaskedLayer(device, tempB, levelBuffer, direction * offset, Vector2.Zero, new Color(170, 0, 0, 255));
+        DrawMaskedLayer(device, tempB, levelBuffer, -direction * offset, Vector2.Zero, new Color(0, 0, 170, 255));
+        // A faint uniform white copy inside the wake acts as a brightness lift.
+        DrawMaskedLayer(device, tempB, levelBuffer, Vector2.Zero, Vector2.Zero, new Color(85, 85, 85, 255));
     }
 
-    private static void WarpBackdropMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
-        if (meshVertices is null || meshIndices is null || meshIndexBuffer is null) BuildBackdropMesh(device);
-        meshEffect ??= new BasicEffect(device) {
-            TextureEnabled = true,
-            VertexColorEnabled = false,
-            World = Matrix.Identity,
-            View = Matrix.Identity,
-            Projection = Matrix.CreateOrthographicOffCenter(0f, FieldWidth, FieldHeight, 0f, 0f, 1f),
-        };
+    private static void BeginSprite(BlendState blend, SamplerState sampler)
+        => Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, blend, sampler,
+            DepthStencilState.None, RasterizerState.CullNone);
+
+    // Redraws the composed level through a vertex grid whose UVs are displaced
+    // by the wake vectors; vertex alpha (wake strength) makes the warp fade at
+    // the rim, so unmixed pixels keep the sharp source underneath.
+    private static void WarpComposedMesh(GraphicsDevice device, Texture2D source, RenderTarget2D target) {
+        if (meshVertices is null || meshIndices is null || meshIndexBuffer is null || meshEffect is null) {
+            BuildMesh(device);
+            meshEffect = new BasicEffect(device) {
+                TextureEnabled = true,
+                VertexColorEnabled = true,
+                World = Matrix.Identity,
+                View = Matrix.Identity,
+                Projection = Matrix.CreateOrthographicOffCenter(0f, FieldWidth, FieldHeight, 0f, 0f, 1f),
+            };
+        }
+        VertexPositionColorTexture[] vertices = meshVertices!;
+        short[] indices = meshIndices!;
+        BasicEffect effect = meshEffect!;
 
         int vertex = 0;
         for (int j = 0; j <= MeshCellsY; j++) {
@@ -465,10 +517,14 @@ public static class HighSpeedEffects {
                 int index = sampleY * FieldWidth + sampleX;
                 float x = (float)Math.Min(i * FieldWidth / MeshCellsX, FieldWidth);
                 float y = (float)Math.Min(j * FieldHeight / MeshCellsY, FieldHeight);
-                meshVertices[vertex].Position = new Vector3(x, y, 0f);
-                meshVertices[vertex].TextureCoordinate = new Vector2(
-                    x / FieldWidth + WakeVecX[index] * BackgroundWarpScale,
-                    y / FieldHeight + WakeVecY[index] * BackgroundWarpScale);
+                float strength = WakeStrength[index];
+                byte alpha = (byte)(strength * 255f);
+                vertices[vertex].Position = new Vector3(x, y, 0f);
+                // rgb mirrors alpha so alpha blending lerps sharp -> warped.
+                vertices[vertex].Color = new Color(alpha, alpha, alpha, alpha);
+                vertices[vertex].TextureCoordinate = new Vector2(
+                    x / FieldWidth + WakeVecX[index] * MeshWarpScale,
+                    y / FieldHeight + WakeVecY[index] * MeshWarpScale);
                 vertex++;
             }
         }
@@ -476,18 +532,18 @@ public static class HighSpeedEffects {
         device.SetRenderTarget(target);
         device.Clear(Color.Transparent);
         device.Indices = meshIndexBuffer;
-        meshEffect.Texture = source;
-        foreach (EffectPass pass in meshEffect.CurrentTechnique.Passes) {
+        effect.Texture = source;
+        foreach (EffectPass pass in effect.CurrentTechnique.Passes) {
             pass.Apply();
             device.DrawUserIndexedPrimitives(PrimitiveType.TriangleList,
-                meshVertices, 0, meshVertices.Length, meshIndices, 0, meshIndices.Length / 3);
+                vertices, 0, vertices.Length, indices, 0, indices.Length / 3);
         }
     }
 
-    private static void BuildBackdropMesh(GraphicsDevice device) {
+    private static void BuildMesh(GraphicsDevice device) {
         int columns = MeshCellsX + 1;
         int rows = MeshCellsY + 1;
-        meshVertices = new VertexPositionTexture[columns * rows];
+        meshVertices = new VertexPositionColorTexture[columns * rows];
         meshIndices = new short[MeshCellsX * MeshCellsY * 6];
         int index = 0;
         for (int j = 0; j < MeshCellsY; j++) {
@@ -506,67 +562,54 @@ public static class HighSpeedEffects {
         meshIndexBuffer.SetData(meshIndices);
     }
 
-    // Runs right after the level buffer is finished (bloom, glitch, foreground):
-    // the level render target is still bound, which is exactly where a fullscreen
-    // pass can rebuild the image with speed-driven aberration and ghosting.
-    private static void GlitchApply(On.Celeste.Glitch.orig_Apply orig, VirtualRenderTarget source,
-        float timer, float seed, float amplitude) {
-        orig(source, timer, seed, amplitude);
-        if (source != GameplayBuffers.Level || !Active || !Settings.HighSpeedAberration)
-            return;
-        Level? level = Engine.Scene as Level;
-        if (level is null || level.FrozenOrPaused) return;
-        List<Entity> players = level.Tracker.GetEntities<Player>();
-        // Prefer the hottest player for direction; fall back to any player so the
-        // fringes keep their heading while the wake fades out after a stop.
-        Player? player = FindFocusPlayer(level)
-            ?? (players.Count > 0 ? (Player)players[0] : null);
-        if (player is null) return;
-        PlayerFx fx = Fx.GetOrCreateValue(player);
-        // Follow the wake, not the current speed: the fringes stay alive (and
-        // fade out with the field) after the player has already stopped.
-        if (fieldActivity <= 0.01f) return;
-
-        float intensity = Intensity;
-        Vector2 direction = ScreenDirection(player, fx);
-        float offset = MathF.Max(0.5f, (0.2f + 1.1f * MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f)) * intensity);
-        // The aberration region is the wake field itself: the strength mask
-        // generated alongside the displacement map fades in and out with the
-        // waves, so the fringes appear and vanish smoothly.
-        if (caMaskTexture is null) return;
-        // The field is regenerated in camera space each frame, so it lines up
-        // with the level buffer one to one.
-        Vector2 maskPosition = Vector2.Zero;
-
-        GraphicsDevice device = Engine.Instance.GraphicsDevice;
+    // The blur pyramid: two successive halvings of the composed level, each
+    // sampled linearly, act as cheap box-filter mip levels.
+    private static void BuildBlurPyramid(GraphicsDevice device) {
+        blurHalf ??= new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        blurQuarter ??= new RenderTarget2D(device, FieldWidth / 4, FieldHeight / 4, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
-        RenderTarget2D tempA = (RenderTarget2D)GameplayBuffers.TempA;
-        RenderTarget2D tempB = (RenderTarget2D)GameplayBuffers.TempB;
 
-        device.SetRenderTarget(tempA);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.PointClamp);
-        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
+        device.SetRenderTarget(blurHalf);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
         Draw.SpriteBatch.End();
-
-        device.SetRenderTarget(levelBuffer);
-        device.Clear(Color.Transparent);
-        BeginSprite(BlendState.Additive, SamplerState.PointClamp);
-        Draw.SpriteBatch.Draw(tempA, Vector2.Zero, Color.White);
+        device.SetRenderTarget(blurQuarter);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(blurHalf, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
         Draw.SpriteBatch.End();
-
-        DrawMaskedLayer(device, tempB, tempA, direction * offset, maskPosition, new Color(170, 0, 0, 255));
-        DrawMaskedLayer(device, tempB, tempA, -direction * offset, maskPosition, new Color(0, 0, 170, 255));
-        // A faint uniform white copy inside the wake acts as a brightness lift.
-        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, maskPosition, new Color(85, 85, 85, 255));
-        // Two slight along-motion copies soften the wake with directional blur.
-        DrawMaskedLayer(device, tempB, tempA, direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
-        DrawMaskedLayer(device, tempB, tempA, -direction * (offset * 0.35f), maskPosition, new Color(38, 38, 38, 255));
     }
 
-    private static void BeginSprite(BlendState blend, SamplerState sampler)
-        => Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, blend, sampler,
-            DepthStencilState.None, RasterizerState.CullNone);
+    // Composes the graded blur: each pyramid level is multiplied by its graded
+    // mask in the work buffer (which keeps the mask in alpha), then alpha
+    // blended over the level — a true sharp->blurred lerp whose radius follows
+    // the wake strength.
+    private static void DrawBlurredLevel(GraphicsDevice device, RenderTarget2D work, RenderTarget2D levelBuffer) {
+        DrawMaskedReplace(device, work, blurHalf!, blurNearTexture!, levelBuffer);
+        DrawMaskedReplace(device, work, blurQuarter!, blurFarTexture!, levelBuffer);
+    }
+
+    private static void DrawMaskedReplace(GraphicsDevice device, RenderTarget2D work, Texture2D source,
+        Texture2D mask, RenderTarget2D target) {
+        device.SetRenderTarget(work);
+        device.Clear(Color.Transparent);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        // The mask is drawn with its alpha as coverage; colour is white so the
+        // multiply below only scales the blurred copy.
+        Draw.SpriteBatch.Draw(mask, Vector2.Zero, Color.White);
+        Draw.SpriteBatch.End();
+        BeginSprite(MultiplyBlend, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(source, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, target.Width / (float)source.Width,
+            SpriteEffects.None, 0f);
+        Draw.SpriteBatch.End();
+
+        device.SetRenderTarget(target);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        // work is premultiplied (rgb and alpha both carry the mask).
+        Draw.SpriteBatch.Draw(work, Vector2.Zero, Color.White);
+        Draw.SpriteBatch.End();
+    }
 
     private static void DrawMaskedLayer(GraphicsDevice device, RenderTarget2D work, RenderTarget2D source,
         Vector2 shift, Vector2 maskPosition, Color tint) {
@@ -668,27 +711,10 @@ public static class HighSpeedEffects {
         }
         Player? player = level.Tracker.GetEntity<Player>();
         PlayerFx? fx = player is null ? null : Fx.GetOrCreateValue(player);
-        int visibleSegments = 0;
-        int fastSegments = 0;
-        if (fx is not null) {
-            Vector2 camera = level.Camera.Position;
-            float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
-            for (int i = 0; i < fx.Count - 1; i++) {
-                Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
-                Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
-                if ((newer - older).Length() < 2f) continue;
-                if (fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples] / threshold - 0.5f > 0.03f)
-                    fastSegments++;
-                Vector2 local = newer - camera;
-                if (local.X >= -80f && local.X <= FieldWidth + 80f && local.Y >= -80f && local.Y <= FieldHeight + 80f)
-                    visibleSegments++;
-            }
-        }
         Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
             $"wakestat: camera={level.Camera.Position} player={(player is null ? "none" : player.Center.ToString())} "
             + $"heat={(fx is null ? 0f : fx.Heat):0.00} speed={(player is null ? 0f : player.Speed.Length()):0} "
-            + $"segments={fx?.Count ?? 0}/{TrailSamples} fast={fastSegments} visible={visibleSegments} "
-            + $"activity={fieldActivity:0.00} hook={level.Tracker.GetEntity<SpaceCrushHook>() != null}");
+            + $"segments={fx?.Count ?? 0}/{TrailSamples} activity={fieldActivity:0.00}");
     }
 
     private static Player? FindFocusPlayer(Level? level) {

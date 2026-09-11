@@ -1597,6 +1597,7 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
                 Toggle("拖尾光带", () => settings.HighSpeedTrail, value => settings.HighSpeedTrail = value),
                 Toggle("空间尾波", () => settings.HighSpeedWarp, value => settings.HighSpeedWarp = value),
                 Toggle("尾迹色差", () => settings.HighSpeedAberration, value => settings.HighSpeedAberration = value),
+                Toggle("尾迹模糊", () => settings.HighSpeedBlur, value => settings.HighSpeedBlur = value),
                 Toggle("高速粒子", () => settings.HighSpeedParticles, value => settings.HighSpeedParticles = value)
             ]),
             new SettingsTab("Profiler", "speed", [], ProfilerPage: true),

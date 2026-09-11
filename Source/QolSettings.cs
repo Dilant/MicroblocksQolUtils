@@ -60,6 +60,9 @@ public sealed class QolSettings : EverestModuleSettings {
     public bool HighSpeedAberration { get; set; } = true;
 
     [DefaultValue(true)]
+    public bool HighSpeedBlur { get; set; } = true;
+
+    [DefaultValue(true)]
     public bool HighSpeedParticles { get; set; } = true;
 
     [SettingNeedsRelaunch]
