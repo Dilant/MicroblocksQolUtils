@@ -1,3 +1,4 @@
+using Microsoft.Xna.Framework;
 using Monocle;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
@@ -17,6 +18,25 @@ public static class QolCommands {
 
     [Command("qol_watch_list", "List watched MiaoNet players")]
     public static void List() => Engine.Commands.Log(WatchList.Describe());
+
+    [Command("qol_speedfx", "Preview the high-speed effects: qol_speedfx <speed> [seconds] (0 to stop)")]
+    public static void SpeedFx(string speedText, string secondsText = "4") {
+        if (!float.TryParse(speedText, System.Globalization.CultureInfo.InvariantCulture, out float speed)
+            || float.IsNaN(speed) || float.IsInfinity(speed)) {
+            Engine.Commands.Log("Usage: qol_speedfx <speed> [seconds] — 0 stops the preview");
+            return;
+        }
+        if (speed <= 0f) {
+            HighSpeedEffects.DebugSpeed = null;
+            Engine.Commands.Log("High-speed preview stopped");
+            return;
+        }
+        if (!float.TryParse(secondsText, System.Globalization.CultureInfo.InvariantCulture, out float seconds))
+            seconds = 4f;
+        HighSpeedEffects.DebugSpeed = speed;
+        HighSpeedEffects.DebugSpeedTimer = MathHelper.Clamp(seconds, 0.5f, 60f);
+        Engine.Commands.Log($"Previewing high-speed effects at {speed} px/frame for {HighSpeedEffects.DebugSpeedTimer:0.#}s");
+    }
 }
 
 public static class WatchList {
