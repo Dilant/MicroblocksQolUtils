@@ -59,6 +59,9 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(true)]
     public bool HighSpeedAberration { get; set; } = true;
 
+    [DefaultValue(true)]
+    public bool HighSpeedParticles { get; set; } = true;
+
     [SettingNeedsRelaunch]
     [DefaultValue(true)]
     public bool HiDpiFix { get; set; } = true;

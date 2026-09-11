@@ -4,6 +4,7 @@ modoptions_microblocksqolutils_highspeedthreshold=High-speed threshold (px/frame
 modoptions_microblocksqolutils_highspeedintensity=High-speed effect intensity
 modoptions_microblocksqolutils_highspeedtrail=High-speed motion ribbon
 modoptions_microblocksqolutils_highspeedwarp=High-speed space warp
+modoptions_microblocksqolutils_highspeedparticles=High-speed particles
 modoptions_microblocksqolutils_highspeedaberration=High-speed chromatic aberration and ghosting
 modoptions_microblocksqolutils_recordingautosaveontransition=Auto-save on room transitions while recording (video continuity)
 modoptions_microblocksqolutils_hidpifix=HiDPI fix
