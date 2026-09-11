@@ -455,7 +455,9 @@ public static class HighSpeedEffects {
         device.SetRenderTarget(screenWork);
         Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp,
             DepthStencilState.None, RasterizerState.CullNone, effect);
-        Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
+        // Drive the shader with a quad covering the whole output — the source
+        // texture's own size would leave the rest of the target as garbage.
+        Draw.SpriteBatch.Draw(levelBuffer, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
         Draw.SpriteBatch.End();
 
         // Blend the processed wake over the composed frame in the viewport.
