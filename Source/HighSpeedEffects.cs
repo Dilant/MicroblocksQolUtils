@@ -74,6 +74,9 @@ public static class HighSpeedEffects {
     private static readonly Color[] CaMaskPixels = new Color[FieldWidth * FieldHeight];
     private static Texture2D? fieldTexture;
     private static Texture2D? caMaskTexture;
+    // Peak wake strength from the last field build; gates the aberration pass so
+    // it follows the wake's own fade-out instead of the player's speed.
+    private static float fieldActivity;
 
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
@@ -247,11 +250,15 @@ public static class HighSpeedEffects {
         float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
         float intensity = Intensity;
         List<Entity> players = level.Tracker.GetEntities<Player>();
+        float peakStrength = 0f;
 
         foreach (Entity entity in players) {
             Player player = (Player)entity;
             PlayerFx fx = Fx.GetOrCreateValue(player);
-            if (fx.Heat <= 0f || fx.Count < 2) continue;
+            // Speed is only the *generation* condition: segments that were fast
+            // enough keep rendering while they age out, so the wake fades with
+            // its own curve instead of being gated by the player's current heat.
+            if (fx.Count < 2) continue;
             for (int i = 0; i < fx.Count - 1; i++) {
                 Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
                 Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
@@ -292,6 +299,8 @@ public static class HighSpeedEffects {
                         if (fromBand > band) continue;
                         float bandShape = 1f - fromBand / band;
                         if (bandShape <= 0f || distance < 0.01f) continue;
+                        // Rounded band profile so the wave edges taper smoothly.
+                        bandShape = bandShape * bandShape * (3f - 2f * bandShape);
                         Vector2 radial = offset / distance;
                         // Cut away the forward half: the wake only opens backward.
                         float forwardness = radial.X * direction.X + radial.Y * direction.Y;
@@ -305,27 +314,29 @@ public static class HighSpeedEffects {
                         WakeVecX[index] += radial.X * amplitude;
                         WakeVecY[index] += radial.Y * amplitude;
                         float strength = MathHelper.Clamp(amplitude / (WakePushScale * intensity), 0f, 1f);
-                        if (strength > WakeStrength[index]) WakeStrength[index] = strength;
+                        if (strength > WakeStrength[index]) {
+                            WakeStrength[index] = strength;
+                            if (strength > peakStrength) peakStrength = strength;
+                        }
                     }
                 }
             }
         }
 
-        // Bake the accumulated field into the displacement map; the player is
-        // punched back out so the sprite stays crisp.
+        // Bake the accumulated field into the displacement map; every player is
+        // punched back out (even from other players' wakes) so sprites stay
+        // crisp.
         for (int p = 0; p < players.Count; p++) {
             Player player = (Player)players[p];
-            PlayerFx fx = Fx.GetOrCreateValue(player);
-            if (fx.Heat <= 0f) continue;
             Vector2 local = player.Center - camera;
-            int x0 = Math.Max(0, (int)(local.X - 13f));
-            int x1 = Math.Min(FieldWidth - 1, (int)(local.X + 13f));
-            int y0 = Math.Max(0, (int)(local.Y - 13f));
-            int y1 = Math.Min(FieldHeight - 1, (int)(local.Y + 13f));
+            int x0 = Math.Max(0, (int)(local.X - 17f));
+            int x1 = Math.Min(FieldWidth - 1, (int)(local.X + 17f));
+            int y0 = Math.Max(0, (int)(local.Y - 17f));
+            int y1 = Math.Min(FieldHeight - 1, (int)(local.Y + 17f));
             for (int y = y0; y <= y1; y++) {
                 for (int x = x0; x <= x1; x++) {
                     float distance = MathF.Sqrt((x - local.X) * (x - local.X) + (y - local.Y) * (y - local.Y));
-                    float falloff = MathHelper.Clamp(distance / 12f, 0f, 1f);
+                    float falloff = MathHelper.Clamp(distance / 16f, 0f, 1f);
                     if (falloff >= 1f) continue;
                     falloff = falloff * falloff * (3f - 2f * falloff);
                     int index = y * FieldWidth + x;
@@ -342,9 +353,11 @@ public static class HighSpeedEffects {
                 0.5f + WakeVecX[index],
                 0.5f + WakeVecY[index],
                 0f, 1f));
-            float mask = MathF.Pow(strength, 0.8f);
+            // Steeper curve: the fringes/blur ramp gently near the edges.
+            float mask = MathF.Pow(strength, 1.25f);
             CaMaskPixels[index] = new Color(new Vector4(mask, mask, mask, 1f));
         }
+        fieldActivity = peakStrength;
         texture.SetData(FieldPixels);
         caMaskTexture.SetData(CaMaskPixels);
 
@@ -363,16 +376,20 @@ public static class HighSpeedEffects {
             return;
         Level? level = Engine.Scene as Level;
         if (level is null || level.FrozenOrPaused) return;
-        Player? player = FindFocusPlayer(level);
+        List<Entity> players = level.Tracker.GetEntities<Player>();
+        // Prefer the hottest player for direction; fall back to any player so the
+        // fringes keep their heading while the wake fades out after a stop.
+        Player? player = FindFocusPlayer(level)
+            ?? (players.Count > 0 ? (Player)players[0] : null);
         if (player is null) return;
         PlayerFx fx = Fx.GetOrCreateValue(player);
-        float heat = fx.Heat;
-        float speed = MotionSpeed(player, fx);
-        if (heat <= 0f || speed < 1f) return;
+        // Follow the wake, not the current speed: the fringes stay alive (and
+        // fade out with the field) after the player has already stopped.
+        if (fieldActivity <= 0.01f) return;
 
         float intensity = Intensity;
         Vector2 direction = ScreenDirection(player, fx);
-        float offset = MathF.Max(0.5f, (0.2f + 1.1f * heat) * intensity);
+        float offset = MathF.Max(0.5f, (0.2f + 1.1f * MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f)) * intensity);
         // The aberration region is the wake field itself: the strength mask
         // generated alongside the displacement map fades in and out with the
         // waves, so the fringes appear and vanish smoothly.
