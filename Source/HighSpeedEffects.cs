@@ -99,14 +99,14 @@ public static class HighSpeedEffects {
         On.Celeste.Player.Update += PlayerUpdate;
         On.Celeste.Player.Render += PlayerRender;
         On.Celeste.Glitch.Apply += GlitchApply;
-        Everest.Events.Level.OnLoadLevel += OnLoadLevel;
+        On.Celeste.Level.LoadLevel += LevelLoadLevel;
     }
 
     public static void Unload() {
         On.Celeste.Player.Update -= PlayerUpdate;
         On.Celeste.Player.Render -= PlayerRender;
         On.Celeste.Glitch.Apply -= GlitchApply;
-        Everest.Events.Level.OnLoadLevel -= OnLoadLevel;
+        On.Celeste.Level.LoadLevel -= LevelLoadLevel;
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
@@ -127,15 +127,23 @@ public static class HighSpeedEffects {
     private static float HeatCurve(float speed, float threshold)
         => MathHelper.Clamp((speed - 0.5f * threshold) / (1.5f * threshold), 0f, 1f);
 
-    private static void OnLoadLevel(Level level, Player.IntroTypes intro, bool fromLoader) {
-        if (level.Tracker.GetEntity<SpaceCrushHook>() is null) level.Add(new SpaceCrushHook());
+    // Room transitions reuse the Level instance and clear non-persistent
+    // entities; attach the hook after every LoadLevel completes and keep it
+    // persistent so no transition path can leave the level without one.
+    private static void LevelLoadLevel(On.Celeste.Level.orig_LoadLevel orig, Level self,
+        Player.IntroTypes intro, bool fromLoader) {
+        orig(self, intro, fromLoader);
+        if (self.Tracker.GetEntity<SpaceCrushHook>() is null) self.Add(new SpaceCrushHook());
     }
 
     // Carries the displacement hook; vanilla's DisplacementRenderer collects one
     // callback per hook component while filling the displacement buffer.
     [Tracked] // Tracker.GetEntity<> throws for types that are not registered as tracked.
     private sealed class SpaceCrushHook : Entity {
-        public SpaceCrushHook() => Add(new DisplacementRenderHook(RenderCrush));
+        public SpaceCrushHook() {
+            Tag = Tags.Persistent;
+            Add(new DisplacementRenderHook(RenderCrush));
+        }
 
         private void RenderCrush() => RenderTrailWake(Engine.Scene as Level);
     }
@@ -550,6 +558,39 @@ public static class HighSpeedEffects {
                 Draw.Rect(particle.Position - Vector2.One * size * 0.5f, size, size, particle.Tint * (0.6f * alpha));
             }
         }
+    }
+
+    // Diagnostics for the qol_wakestat command: dumps the wake pipeline state to
+    // the log so scroll-related issues can be located from log.txt alone.
+    internal static void DumpWakeStats() {
+        Level? level = Engine.Scene as Level;
+        if (level is null) {
+            Logger.Log(LogLevel.Info, "MicroblocksQolUtils", "wakestat: no level");
+            return;
+        }
+        Player? player = level.Tracker.GetEntity<Player>();
+        PlayerFx? fx = player is null ? null : Fx.GetOrCreateValue(player);
+        int visibleSegments = 0;
+        int fastSegments = 0;
+        if (fx is not null) {
+            Vector2 camera = level.Camera.Position;
+            float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
+            for (int i = 0; i < fx.Count - 1; i++) {
+                Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
+                Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
+                if ((newer - older).Length() < 2f) continue;
+                if (fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples] / threshold - 0.5f > 0.03f)
+                    fastSegments++;
+                Vector2 local = newer - camera;
+                if (local.X >= -80f && local.X <= FieldWidth + 80f && local.Y >= -80f && local.Y <= FieldHeight + 80f)
+                    visibleSegments++;
+            }
+        }
+        Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
+            $"wakestat: camera={level.Camera.Position} player={(player is null ? "none" : player.Center.ToString())} "
+            + $"heat={(fx is null ? 0f : fx.Heat):0.00} speed={(player is null ? 0f : player.Speed.Length()):0} "
+            + $"segments={fx?.Count ?? 0}/{TrailSamples} fast={fastSegments} visible={visibleSegments} "
+            + $"activity={fieldActivity:0.00} hook={level.Tracker.GetEntity<SpaceCrushHook>() != null}");
     }
 
     private static Player? FindFocusPlayer(Level? level) {
