@@ -28,6 +28,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         MaterialChapterSelect.Load();
         MaterialModOptions.Load();
         QolPauseMenu.Load();
+        MaterialTouch.Load();
         MaterialAcrylicRenderer.Load();
         MaterialUiSmoke.Load();
         CaptureSource.Load();
@@ -52,6 +53,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         MaterialModOptions.Unload();
         MaterialChapterSelect.Unload();
         QolPauseMenu.Unload();
+        MaterialTouch.Unload();
         MaterialUiSmoke.Unload();
         NativeCaptureCommands.Unload();
         AutoRecorder.Unload();

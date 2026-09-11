@@ -40,7 +40,11 @@ internal readonly record struct MaterialInteractionTarget(
     string Key,
     MaterialRect Bounds,
     bool Enabled = true,
-    bool Focused = false
+    bool Focused = false,
+    string TouchKind = "tap",
+    string TouchText = "",
+    int TouchMaxLength = 128,
+    Action<string>? TouchTextChanged = null
 );
 
 internal sealed class MaterialMotionController : IDisposable {
@@ -50,10 +54,10 @@ internal sealed class MaterialMotionController : IDisposable {
 
     public void Update(IEnumerable<MaterialInteractionTarget> targets) {
         frame++;
-        Vector2 mouse = MInput.Mouse.Position;
+        Vector2 mouse = MaterialTouch.Position;
         List<MaterialInteractionTarget> current = targets.ToList();
 
-        if (MInput.Mouse.PressedLeftButton) {
+        if (MaterialTouch.PressedLeftButton) {
             capturedKey = current
                 .Where(target => target.Enabled && target.Bounds.Contains(mouse))
                 .OrderBy(target => target.Bounds.Width * target.Bounds.Height)
@@ -66,14 +70,14 @@ internal sealed class MaterialMotionController : IDisposable {
             MaterialInteractionState state = State(target.Key);
             state.LastSeenFrame = frame;
             bool hovered = target.Enabled && target.Bounds.Contains(mouse);
-            bool pressed = target.Enabled && capturedKey == target.Key && MInput.Mouse.CheckLeftButton;
+            bool pressed = target.Enabled && capturedKey == target.Key && MaterialTouch.CheckLeftButton;
             state.Update(hovered, pressed, target.Focused, Engine.RawDeltaTime);
         }
 
         foreach (MaterialInteractionState state in states.Values.Where(state => state.LastSeenFrame != frame))
             state.Update(false, false, false, Engine.RawDeltaTime);
 
-        if (MInput.Mouse.ReleasedLeftButton || !MInput.Mouse.CheckLeftButton) capturedKey = null;
+        if (MaterialTouch.ReleasedLeftButton || !MaterialTouch.CheckLeftButton) capturedKey = null;
         if (states.Count > 512) {
             foreach (string key in states
                 .Where(pair => frame - pair.Value.LastSeenFrame > 120 && pair.Value.IsIdle)
