@@ -34,6 +34,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         NativeCaptureSmoke.Load();
         FrameProfiler.Load();
         CollisionBoxRenderer.Load();
+        HighSpeedEffects.Load();
         InstantTransitions.Load();
         InstantDeaths.Load();
         AutoRecorder.Load(Path.GetDirectoryName(Metadata.DLL) ?? "");
@@ -56,6 +57,7 @@ public sealed class MicroblocksQolUtilsModule : EverestModule {
         AutoRecorder.Unload();
         CaptureSource.Unload();
         CollisionBoxRenderer.Unload();
+        HighSpeedEffects.Unload();
         InstantDeaths.Unload();
         InstantTransitions.Unload();
         FrameProfiler.Unload();
