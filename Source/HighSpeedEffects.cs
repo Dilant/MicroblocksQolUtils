@@ -416,7 +416,10 @@ public static class HighSpeedEffects {
         if (level is null || !Active || fieldActivity <= 0.01f || HiresRenderer.DrawToBuffer) return;
         if (!Settings.HighSpeedWarp && !Settings.HighSpeedBlur && !Settings.HighSpeedAberration) return;
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
-        Viewport viewport = device.Viewport;
+        // Engine.Viewport is Celeste's presentation viewport (what the level
+        // composite targets); the device's current viewport could belong to
+        // whatever render target is bound right now (e.g. a 320x180 buffer).
+        Viewport viewport = Engine.Viewport;
         if (viewport.Width < 16 || viewport.Height < 16) return;
         EnsureScreenTargets(device, viewport.Width, viewport.Height);
 
@@ -483,8 +486,8 @@ public static class HighSpeedEffects {
         // write-back is a plain opaque replace — no blending semantics involved.
         device.SetRenderTarget(null);
         device.Viewport = viewport;
-        BeginSprite(BlendState.Opaque, SamplerState.PointClamp);
-        Draw.SpriteBatch.Draw(screenWork, Vector2.Zero, Color.White);
+        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(screenWork, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
         Draw.SpriteBatch.End();
         if (diagnose) {
             Color[] after = ReadBackbufferCentre(device, viewport);
@@ -522,6 +525,7 @@ public static class HighSpeedEffects {
         screenEighth?.Dispose();
         screenWidth = width;
         screenHeight = height;
+        Logger.Log(LogLevel.Info, "MicroblocksQolUtils", $"waketargets: {width}x{height}");
         screenWork = new RenderTarget2D(device, width, height, false, SurfaceFormat.Color,
             DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
         screenHalf = new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
