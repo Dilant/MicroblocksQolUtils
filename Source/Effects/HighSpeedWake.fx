@@ -89,11 +89,15 @@ float4 WakePixel(float2 uv : TEXCOORD0) : COLOR0 {
         tex2D(screenS, AvoidPlayer(wuv - CaShift)).b);
     col = lerp(col, shifted, fringe);
     col += BrightnessLift * strength;
-    // Coverage in alpha, colour not premultiplied — composited with
-    // NonPremultiplied blending; untouched pixels keep the vanilla upscale.
+    // Compose inside the shader: outside the wake, emit the untouched frame
+    // with nearest-neighbour sampling so the pixel-perfect upscale survives;
+    // the result is written back with opaque blending, no dst dependency.
+    float2 nnUv = (floor(uv * float2(320.0, 180.0)) + 0.5) / float2(320.0, 180.0);
+    float3 base = tex2D(screenS, nnUv);
     float coverage = saturate((strength - 0.05) / 0.20);
     coverage = Smoothstep01(coverage);
-    return float4(col, coverage);
+    col = lerp(base, col, coverage);
+    return float4(col, 1);
 }
 
 technique WakeTechnique {
