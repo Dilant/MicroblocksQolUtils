@@ -183,7 +183,9 @@ pub enum FinalizeError {
 pub fn finalize_with_progress(
     plan: &FinalizePlan,
     mut report_progress: impl FnMut(f32),
-    render_sfx: Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut std::ffi::c_void) -> i32>,
+    render_sfx: Option<
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut std::ffi::c_void) -> i32,
+    >,
     render_sfx_context: *mut std::ffi::c_void,
 ) -> Result<(), FinalizeError> {
     validate_plan(plan)?;

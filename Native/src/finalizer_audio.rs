@@ -191,7 +191,11 @@ pub fn build_audio_track(
     Ok(true)
 }
 
-fn mix_rendered_bgm(sidecar: &Path, mixed_pcm: &Path, spec: AudioSpec) -> Result<(), AudioFinalizeError> {
+fn mix_rendered_bgm(
+    sidecar: &Path,
+    mixed_pcm: &Path,
+    spec: AudioSpec,
+) -> Result<(), AudioFinalizeError> {
     let clip = FinalizeClip {
         source: String::new(),
         start_seconds: 0.0,
