@@ -70,6 +70,7 @@ public static class HighSpeedEffects {
 
     // Carries the displacement hook; vanilla's DisplacementRenderer collects one
     // callback per hook component while filling the displacement buffer.
+    [Tracked] // Tracker.GetEntity<> throws for types that are not registered as tracked.
     private sealed class SpaceCrushHook : Entity {
         public SpaceCrushHook() => Add(new DisplacementRenderHook(RenderCrush));
 
