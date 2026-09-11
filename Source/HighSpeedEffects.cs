@@ -8,17 +8,22 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// <summary>
 /// Motion feedback for the extreme speeds tech and gimmick maps reach, where
 /// vanilla effects read as teleportation: an additive motion ribbon in world
-/// space, a water-wake space crush driven through vanilla's displacement map
-/// (with the player itself punched out of the field), wake-local chromatic
-/// aberration with a saturation boost, sparks and wall-impact shockwaves.
-/// Purely visual; physics are untouched.
+/// space, a CPU-simulated water surface (classic two-buffer wave propagation —
+/// the player's path stirs the field and the ripples spread, oscillate and
+/// decay on their own) feeding vanilla's displacement map, wake-local
+/// chromatic aberration with a saturation boost, scattering sparks and
+/// wall-impact shockwaves. Purely visual; physics are untouched.
 /// </summary>
 public static class HighSpeedEffects {
     private const int TrailSamples = 24;
-    private const int CrushTextureWidth = 128;
-    private const int CrushTextureHeight = 64;
-    private const int DirectionSteps = 16;
-    private const int ParticleCapacity = 128;
+    private const int ParticleCapacity = 160;
+
+    // Water surface simulation resolution matches the displacement buffer 1:1.
+    private const int FieldWidth = 320;
+    private const int FieldHeight = 180;
+    private const float FieldDamping = 0.987f;
+    private const float FieldGradientScale = 9f;
+    private const int FieldStepsPerFrame = 2;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -49,13 +54,16 @@ public static class HighSpeedEffects {
     // untouched here or gameplay rolls would depend on this mod's activity.
     private static readonly Random Random = new();
 
-    // Displacement textures must be pre-rotated per direction: the vanilla
-    // distort shader interprets the R/G channels as screen-space X/Y, so a
-    // rotated sprite would rotate the pattern but not the push vectors.
-    private static Texture2D[]? crushDirections;
-    private static Texture2D[]? waveDirections;
-    private static Texture2D? holeTexture;
-    private static Texture2D? aberrationMaskTexture;
+    // Two-buffer wave height field: current and previous step. The next buffer
+    // is scratch for the propagation pass (the three rotate every step).
+    private static float[] WaveCurrent = new float[FieldWidth * FieldHeight];
+    private static float[] WavePrevious = new float[FieldWidth * FieldHeight];
+    private static float[] WaveScratch = new float[FieldWidth * FieldHeight];
+    private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
+    private static Texture2D? fieldTexture;
+    private static Vector2 fieldCamera;
+
+    private static Texture2D? wakeMaskTexture;
 
     // Debug override driven by the qol_speedfx command: feeds the given speed to
     // every layer while the player moves for real, so the wake follows the
@@ -88,7 +96,12 @@ public static class HighSpeedEffects {
         Fx.Clear();
         DebugSpeed = null;
         Array.Clear(Particles);
-        DisposeTextures();
+        Array.Clear(WaveCurrent);
+        Array.Clear(WavePrevious);
+        fieldTexture?.Dispose();
+        fieldTexture = null;
+        wakeMaskTexture?.Dispose();
+        wakeMaskTexture = null;
     }
 
     private static QolSettings Settings => MicroblocksQolUtilsModule.Settings;
@@ -97,10 +110,10 @@ public static class HighSpeedEffects {
 
     private static float Intensity => Settings.HighSpeedEffectIntensity / 100f;
 
-    // Effects begin just below the threshold and saturate at 3x, so the wake is
-    // already faintly visible at the threshold itself.
+    // Effects begin at half the threshold and saturate at 2x, so light dashes
+    // already stir a faint ripple and the wake reads clearly from the threshold.
     private static float HeatCurve(float speed, float threshold)
-        => MathHelper.Clamp((speed - 0.7f * threshold) / (2.3f * threshold), 0f, 1f);
+        => MathHelper.Clamp((speed - 0.5f * threshold) / (1.5f * threshold), 0f, 1f);
 
     private static void OnLoadLevel(Level level, Player.IntroTypes intro, bool fromLoader) {
         if (level.Tracker.GetEntity<SpaceCrushHook>() is null) level.Add(new SpaceCrushHook());
@@ -112,7 +125,7 @@ public static class HighSpeedEffects {
     private sealed class SpaceCrushHook : Entity {
         public SpaceCrushHook() => Add(new DisplacementRenderHook(RenderCrush));
 
-        private void RenderCrush() => RenderSpaceCrush(Engine.Scene as Level);
+        private void RenderCrush() => RenderWaterField(Engine.Scene as Level);
     }
 
     private static void PlayerUpdate(On.Celeste.Player.orig_Update orig, Player self) {
@@ -130,17 +143,26 @@ public static class HighSpeedEffects {
         PushSample(fx, self.Center, speed);
 
         if (Active && self.Scene is Level level && !level.FrozenOrPaused) {
+            if (Settings.HighSpeedWarp) {
+                // Stir the water surface along the path; the amplitude scales with
+                // speed so slow movement only dimples the surface.
+                float excess = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
+                if (excess > 0f)
+                    InjectWave(level, self.Center, -(1.5f + 8f * excess * excess) * Intensity,
+                        2.5f + 3.5f * excess);
+                // A sudden stop (wall impact, ground slam) dumps the built-up
+                // momentum into the surface plus a vanilla-style burst.
+                float drop = fx.PreviousSpeed - speed;
+                if (drop > 400f && fx.PreviousSpeed > threshold * 1.1f) {
+                    float power = MathHelper.Clamp(drop / 900f, 0.25f, 1.25f) * Intensity;
+                    InjectWave(level, self.Center, -14f * power, 7f);
+                    level.Displacement.AddBurst(self.Center, 0.55f, 4f, 40f + 48f * power,
+                        0.45f * power, Ease.QuadOut, Ease.QuadOut);
+                    SpawnImpactSparks(self.Center, fx.LastDirection, power);
+                }
+            }
             if (Settings.HighSpeedParticles)
                 SpawnTrailParticles(self, fx, speed, threshold);
-            // A sudden stop at high speed (wall impact, ground slam) releases the
-            // built-up wake as a vanilla-style displacement burst plus sparks.
-            float drop = fx.PreviousSpeed - speed;
-            if (drop > 400f && fx.PreviousSpeed > threshold * 1.1f) {
-                float power = MathHelper.Clamp(drop / 900f, 0.25f, 1.25f) * Intensity;
-                level.Displacement.AddBurst(self.Center, 0.55f, 4f, 40f + 48f * power,
-                    0.45f * power, Ease.QuadOut, Ease.QuadOut);
-                SpawnImpactSparks(self.Center, fx.LastDirection, power);
-            }
         }
         fx.PreviousSpeed = speed;
         UpdateParticles(Engine.DeltaTime);
@@ -195,7 +217,7 @@ public static class HighSpeedEffects {
             // Streaks shooting off the sprite keep the direction legible even when
             // the ribbon itself has already left the visible area.
             Vector2 direction = player.Speed.LengthSquared() > 1f ? Vector2.Normalize(player.Speed) : fx.LastDirection;
-            float streak = MathHelper.Clamp((speed - 300f) * 0.05f, 8f, 80f) * heat * intensity;
+            float streak = MathHelper.Clamp((speed - 250f) * 0.05f, 8f, 80f) * heat * intensity;
             for (int i = 0; i < 3; i++) {
                 Vector2 side = new Vector2(-direction.Y, direction.X) * ((i - 1) * 7f);
                 Vector2 start = player.Center + side - direction * 8f;
@@ -236,47 +258,58 @@ public static class HighSpeedEffects {
         RenderTarget2D levelBuffer = (RenderTarget2D)GameplayBuffers.Level;
         RenderTarget2D tempA = (RenderTarget2D)GameplayBuffers.TempA;
         RenderTarget2D tempB = (RenderTarget2D)GameplayBuffers.TempB;
+
         device.SetRenderTarget(tempA);
         device.Clear(Color.Transparent);
-        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp,
-            DepthStencilState.None, RasterizerState.CullNone);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(levelBuffer, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        // Build the wake-local layer: shifted red/blue fringes plus a copy of the
-        // image itself (a saturation boost where it overlaps), then clip all of
-        // it to a wake-shaped mask behind the player so the rest of the screen is
-        // left untouched.
-        device.SetRenderTarget(tempB);
-        device.Clear(Color.Transparent);
-        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Additive, SamplerState.PointClamp,
-            DepthStencilState.None, RasterizerState.CullNone);
-        Draw.SpriteBatch.Draw(tempA, direction * offset, new Color(255, 0, 0, 255));
-        Draw.SpriteBatch.Draw(tempA, -direction * offset, new Color(0, 0, 255, 255));
-        Draw.SpriteBatch.Draw(tempA, Vector2.Zero, new Color(52, 52, 52, 255)); // ~20% self-overlap
-        Draw.SpriteBatch.End();
-        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, MultiplyBlend, SamplerState.LinearClamp,
-            DepthStencilState.None, RasterizerState.CullNone);
-        DrawWakeMask(focus, direction, heat);
-        Draw.SpriteBatch.End();
-
+        // Rebuild the level as the clean image plus wake-masked copies. Each
+        // masked layer is composed in tempB as: clear, draw the mask (black
+        // outside the fan), multiply the shifted copy — so nothing leaks outside
+        // the wake region, then it is accumulated additively into the level.
         device.SetRenderTarget(levelBuffer);
         device.Clear(Color.Transparent);
-        Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Additive, SamplerState.PointClamp,
-            DepthStencilState.None, RasterizerState.CullNone);
+        BeginSprite(BlendState.Additive, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(tempA, Vector2.Zero, Color.White);
-        Draw.SpriteBatch.Draw(tempB, Vector2.Zero, Color.White);
+        Draw.SpriteBatch.End();
+
+        DrawMaskedLayer(device, tempB, tempA, direction * offset, focus, direction, heat, new Color(255, 0, 0, 255));
+        DrawMaskedLayer(device, tempB, tempA, -direction * offset, focus, direction, heat, new Color(0, 0, 255, 255));
+        // A faint self-overlap copy inside the wake acts as a saturation boost.
+        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, focus, direction, heat, new Color(52, 52, 52, 255));
+    }
+
+    private static void BeginSprite(BlendState blend, SamplerState sampler)
+        => Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, blend, sampler,
+            DepthStencilState.None, RasterizerState.CullNone);
+
+    private static void DrawMaskedLayer(GraphicsDevice device, RenderTarget2D work, RenderTarget2D source,
+        Vector2 shift, Vector2 focus, Vector2 direction, float heat, Color tint) {
+        device.SetRenderTarget(work);
+        device.Clear(Color.Transparent);
+        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        DrawWakeMask(focus, direction, heat);
+        Draw.SpriteBatch.End();
+        BeginSprite(MultiplyBlend, SamplerState.PointClamp);
+        Draw.SpriteBatch.Draw(source, shift, tint);
+        Draw.SpriteBatch.End();
+
+        device.SetRenderTarget((RenderTarget2D)GameplayBuffers.Level);
+        BeginSprite(BlendState.Additive, SamplerState.PointClamp);
+        Draw.SpriteBatch.Draw(work, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
     }
 
-    // A wake-shaped fan behind the player: narrow at the player, widening and
-    // fading with distance, matching the space-crush corridor's extent.
+    // A fan-shaped mask: bright at the apex (right edge midpoint), fading toward
+    // the left opening — used to clip the aberration layer to the wake region.
     private static void DrawWakeMask(Vector2 focus, Vector2 direction, float heat) {
-        Texture2D mask = GetAberrationMaskTexture();
+        Texture2D mask = GetWakeMaskTexture();
         // The fan apex sits at the right edge of the texture and opens leftward;
         // aligning the +x axis with the motion points the fan back over the wake.
-        float length = MathHelper.Clamp(40f + 120f * heat, 48f, 176f);
-        float spread = MathHelper.Clamp(8f + 22f * heat, 10f, 34f);
+        float length = MathHelper.Clamp(56f + 130f * heat, 64f, 190f);
+        float spread = MathHelper.Clamp(10f + 26f * heat, 12f, 40f);
         Draw.SpriteBatch.Draw(mask, focus, null, Color.White,
             MathF.Atan2(direction.Y, direction.X),
             new Vector2(mask.Width, mask.Height * 0.5f),
@@ -284,103 +317,138 @@ public static class HighSpeedEffects {
             SpriteEffects.None, 0f);
     }
 
-    // The wake: two layers per path segment. The fresh crush strip squeezes the
-    // world aside right behind the player and closes again quickly; the wave lobe
-    // starts narrow near the path and spreads outward as the segment ages, like
-    // ripples propagating away from a boat's track. The player itself is punched
-    // back out of the displacement field so its sprite stays crisp.
-    private static void RenderSpaceCrush(Level? level) {
+    // The water surface: propagate the classic two-buffer wave simulation, then
+    // encode the height gradient as the displacement map. The field is anchored
+    // to the world (shifted with the camera) so ripples stay where they were
+    // stirred and spread outward on their own. The player is punched back out of
+    // the field so the sprite is not smeared by its own wake.
+    private static void RenderWaterField(Level? level) {
         if (level is null || !Active || !Settings.HighSpeedWarp || level.FrozenOrPaused) return;
-        float intensity = Intensity;
-        float threshold = MathF.Max(1f, Settings.HighSpeedThreshold);
-        Texture2D[] crush = GetCrushTextures();
-        Texture2D[] wave = GetWaveTextures();
+        Texture2D texture = fieldTexture ??= new Texture2D(Engine.Instance.GraphicsDevice, FieldWidth, FieldHeight);
 
-        foreach (Player player in level.Tracker.GetEntities<Player>()) {
-            PlayerFx fx = Fx.GetOrCreateValue(player);
-            if (fx.Heat <= 0f || fx.Count < 2) continue;
-            for (int i = 0; i < fx.Count - 1; i++) {
-                Vector2 newer = fx.Positions[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
-                Vector2 older = fx.Positions[(fx.Head - 2 - i + TrailSamples * 2) % TrailSamples];
-                Vector2 delta = newer - older;
-                float length = delta.Length();
-                if (length < 2f) continue;
-                Vector2 direction = delta / length;
-                int angleIndex = (int)MathF.Round(MathF.Atan2(direction.Y, direction.X)
-                    / (MathF.PI * 2f / DirectionSteps) + DirectionSteps) % DirectionSteps;
+        ShiftField(level.Camera.Position);
+        for (int step = 0; step < FieldStepsPerFrame; step++)
+            PropagateWave();
 
-                float speed = fx.Speeds[(fx.Head - 1 - i + TrailSamples * 2) % TrailSamples];
-                float speedFactor = MathHelper.Clamp(speed / threshold, 0f, 2.5f);
-                if (speedFactor <= 0.4f) continue;
-                float age = i / (float)(fx.Count - 1);
-                float speedStrength = MathHelper.Clamp(speedFactor, 0f, 1.6f);
-                // Kept at or below player height at the fresh end so the wake
-                // collects into (nearly) a point at the player and only widens
-                // once the ripple has travelled away.
-                float halfWidth = 2.5f + 3.5f * MathHelper.Clamp(speedFactor, 0f, 1.3f);
-                Vector2 centre = (newer + older) * 0.5f;
-                Vector2 stretch = new Vector2(length, 1f) / CrushTextureWidth * 1.12f;
+        List<Entity> players = level.Tracker.GetEntities<Player>();
 
-                // Squeeze layer: strong when fresh, gone by mid-history.
-                float crushAlpha = fx.Heat * MathF.Pow(1f - age, 2.4f) * speedStrength * 0.5f * intensity;
-                if (crushAlpha > 0.01f) {
-                    Draw.SpriteBatch.Draw(crush[angleIndex], centre, null, Color.White * crushAlpha, 0f,
-                        new Vector2(CrushTextureWidth, CrushTextureHeight) * 0.5f,
-                        new Vector2(stretch.X, halfWidth * 2f / CrushTextureHeight), SpriteEffects.None, 0f);
+        float gradientScale = FieldGradientScale * Intensity;
+        for (int y = 0; y < FieldHeight; y++) {
+            int row = y * FieldWidth;
+            for (int x = 0; x < FieldWidth; x++) {
+                int index = row + x;
+                float wave = WaveCurrent[index];
+                float gradientX = 0f, gradientY = 0f;
+                if (x > 0 && x < FieldWidth - 1 && y > 0 && y < FieldHeight - 1 && wave != 0f) {
+                    gradientX = WaveCurrent[index - 1] - WaveCurrent[index + 1];
+                    gradientY = WaveCurrent[index - FieldWidth] - WaveCurrent[index + FieldWidth];
                 }
-
-                // Wave layer: one outward lobe per side, widening as it ages out.
-                float waveAlpha = fx.Heat * MathF.Pow(1f - age, 0.8f) * speedStrength * 0.35f * intensity;
-                if (waveAlpha > 0.01f) {
-                    float spread = (0.5f + 1.8f * age) * halfWidth * 1.6f;
-                    Draw.SpriteBatch.Draw(wave[angleIndex], centre, null, Color.White * waveAlpha, 0f,
-                        new Vector2(CrushTextureWidth, CrushTextureHeight) * 0.5f,
-                        new Vector2(stretch.X, spread * 2f / CrushTextureHeight), SpriteEffects.None, 0f);
+                float shield = 1f;
+                for (int p = 0; p < players.Count; p++) {
+                    Player player = (Player)players[p];
+                    Vector2 local = player.Center - fieldCamera;
+                    float distanceX = x - local.X, distanceY = y - local.Y;
+                    float distanceSquared = distanceX * distanceX + distanceY * distanceY;
+                    if (distanceSquared < 121f) {
+                        float falloff = MathF.Sqrt(distanceSquared) / 11f;
+                        shield *= MathHelper.Clamp(falloff, 0f, 1f);
+                    }
                 }
+                float weight = gradientScale * shield;
+                FieldPixels[index] = new Color(new Vector4(
+                    0.5f + gradientX * weight,
+                    0.5f + gradientY * weight,
+                    0f, 1f));
             }
         }
+        texture.SetData(FieldPixels);
 
-        // Punch the player back out of the displacement field so the sprite is
-        // not smeared by its own wake.
-        Player? focusPlayer = FindFocusPlayer(level);
-        if (focusPlayer != null) {
-            float heat = Fx.GetOrCreateValue(focusPlayer).Heat;
-            if (heat > 0f) {
-                Texture2D hole = GetHoleTexture();
-                float radius = 9f + 5f * heat;
-                Draw.SpriteBatch.Draw(hole, focusPlayer.Center, null, Color.White, 0f,
-                    new Vector2(hole.Width, hole.Height) * 0.5f,
-                    radius * 2f / hole.Width, SpriteEffects.None, 0f);
+        // The hook's sprite batch is already begun with the camera transform and
+        // alpha blending; draw the full field at its world anchor.
+        Draw.SpriteBatch.Draw(texture, fieldCamera, Color.White);
+    }
+
+    // Keeps the simulation anchored to the world when the camera scrolls.
+    private static void ShiftField(Vector2 camera) {
+        int deltaX = (int)MathF.Floor(camera.X - fieldCamera.X);
+        int deltaY = (int)MathF.Floor(camera.Y - fieldCamera.Y);
+        if (deltaX == 0 && deltaY == 0) return;
+        ShiftBuffer(WaveCurrent, deltaX, deltaY);
+        ShiftBuffer(WavePrevious, deltaX, deltaY);
+        fieldCamera += new Vector2(deltaX, deltaY);
+    }
+
+    private static void ShiftBuffer(float[] buffer, int deltaX, int deltaY) {
+        Array.Clear(WaveScratch);
+        for (int y = 0; y < FieldHeight; y++) {
+            int sourceY = y - deltaY;
+            if (sourceY < 0 || sourceY >= FieldHeight) continue;
+            for (int x = 0; x < FieldWidth; x++) {
+                int sourceX = x - deltaX;
+                if (sourceX < 0 || sourceX >= FieldWidth) continue;
+                WaveScratch[y * FieldWidth + x] = buffer[sourceY * FieldWidth + sourceX];
+            }
+        }
+        Array.Copy(WaveScratch, buffer, buffer.Length);
+    }
+
+    // Classic two-buffer wave propagation: the next height is the neighbourhood
+    // average minus the previous step, damped over time. Ripples spread,
+    // oscillate through zero and fade out entirely on their own.
+    private static void PropagateWave() {
+        for (int y = 1; y < FieldHeight - 1; y++) {
+            int row = y * FieldWidth;
+            for (int x = 1; x < FieldWidth - 1; x++) {
+                int index = row + x;
+                float value = (WaveCurrent[index - 1] + WaveCurrent[index + 1]
+                    + WaveCurrent[index - FieldWidth] + WaveCurrent[index + FieldWidth]) * 0.5f
+                    - WavePrevious[index];
+                WaveScratch[index] = value * FieldDamping;
+            }
+        }
+        float[] swap = WavePrevious;
+        WavePrevious = WaveCurrent;
+        WaveCurrent = WaveScratch;
+        WaveScratch = swap;
+        // Edges stay at zero; the loop above never writes them.
+    }
+
+    private static void InjectWave(Level level, Vector2 world, float strength, float radius) {
+        ShiftField(level.Camera.Position);
+        Vector2 local = world - fieldCamera;
+        int x0 = Math.Max(1, (int)(local.X - radius));
+        int x1 = Math.Min(FieldWidth - 2, (int)(local.X + radius));
+        int y0 = Math.Max(1, (int)(local.Y - radius));
+        int y1 = Math.Min(FieldHeight - 2, (int)(local.Y + radius));
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                float distance = MathF.Sqrt((x - local.X) * (x - local.X) + (y - local.Y) * (y - local.Y));
+                float falloff = MathHelper.Clamp(1f - distance / radius, 0f, 1f);
+                if (falloff > 0f)
+                    WaveCurrent[y * FieldWidth + x] += strength * falloff;
             }
         }
     }
 
     private static void SpawnTrailParticles(Player player, PlayerFx fx, float speed, float threshold) {
-        float spawnRate = fx.Heat * MathHelper.Clamp(speed / threshold, 0f, 2.5f);
-        int count = (int)spawnRate / 2 + (NextFloat() < spawnRate % 2f ? 1 : 0);
-        for (int i = 0; i < count && i < 4; i++) {
-            bool streak = NextFloat() < 0.25f;
-            Vector2 velocity = -fx.LastDirection * speed * 0.03f;
-            if (streak) {
-                SpawnParticle(new Particle {
-                    Position = player.Center + Range(-Vector2.One * 6f, Vector2.One * 6f),
-                    Velocity = velocity * 0.7f,
-                    Life = 0.55f, MaxLife = 0.55f,
-                    Length = 8f + NextFloat() * 14f,
-                    Streak = true,
-                    Tint = Color.Lerp(Color.Cyan, Color.White, NextFloat() * 0.6f),
-                });
-            } else {
-                SpawnParticle(new Particle {
-                    Position = player.Center + Range(-Vector2.One * 5f, Vector2.One * 5f),
-                    Velocity = velocity + Range(-Vector2.One * 40f, Vector2.One * 40f),
-                    Life = 0.35f + NextFloat() * 0.35f,
-                    MaxLife = 0.7f,
-                    Length = 1f + NextFloat(),
-                    Streak = false,
-                    Tint = Color.Lerp(Color.Cyan, Color.White, NextFloat() * 0.7f),
-                });
-            }
+        float excess = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
+        int count = 1 + (int)(excess * 2f);
+        for (int i = 0; i < count && i < 5; i++) {
+            // Scatter: sparks fly off against the motion with a random radial
+            // kick, then drag against the air as they fade.
+            Vector2 radial = Calc.AngleToVector(NextFloat() * MathF.PI * 2f, 1f)
+                * (40f + 130f * NextFloat());
+            Vector2 velocity = -fx.LastDirection * speed * 0.08f + radial;
+            bool streak = NextFloat() < 0.3f;
+            SpawnParticle(new Particle {
+                Position = player.Center + Range(-Vector2.One * 4f, Vector2.One * 4f),
+                Velocity = velocity,
+                Life = 0.45f + NextFloat() * 0.4f,
+                MaxLife = 0.85f,
+                Length = streak ? 9f + NextFloat() * 14f : 1.6f + NextFloat(),
+                Streak = streak,
+                Tint = Color.Lerp(Color.Cyan, Color.White, NextFloat() * 0.7f),
+            });
         }
     }
 
@@ -388,7 +456,7 @@ public static class HighSpeedEffects {
         int count = (int)(18 + 18 * power);
         for (int i = 0; i < count; i++) {
             float angle = NextFloat() * MathF.PI * 2f;
-            Vector2 radial = Calc.AngleToVector(angle, 40f + 130f * power * NextFloat());
+            Vector2 radial = Calc.AngleToVector(angle, 40f + 150f * power * NextFloat());
             SpawnParticle(new Particle {
                 Position = centre,
                 Velocity = radial - direction * (NextFloat() * 60f),
@@ -401,21 +469,18 @@ public static class HighSpeedEffects {
         }
     }
 
-    private static float NextFloat() => (float)Random.NextDouble();
-
-    private static Vector2 Range(Vector2 min, Vector2 max)
-        => new(min.X + NextFloat() * (max.X - min.X), min.Y + NextFloat() * (max.Y - min.Y));
-
     private static void SpawnParticle(Particle particle) {
         Particles[particleCursor] = particle;
         particleCursor = (particleCursor + 1) % ParticleCapacity;
     }
 
     private static void UpdateParticles(float delta) {
+        float drag = MathF.Pow(0.25f, delta);
         for (int i = 0; i < ParticleCapacity; i++) {
             if (Particles[i].Life > 0f) {
                 Particles[i].Life -= delta;
                 Particles[i].Position += Particles[i].Velocity * delta;
+                Particles[i].Velocity *= drag;
             }
         }
     }
@@ -430,86 +495,18 @@ public static class HighSpeedEffects {
                 Vector2 direction = particle.Velocity.LengthSquared() > 1f
                     ? Vector2.Normalize(particle.Velocity) : Vector2.UnitX;
                 Draw.Line(particle.Position, particle.Position - direction * particle.Length,
-                    particle.Tint * (0.35f * alpha), 1f);
+                    particle.Tint * (0.4f * alpha), 1f);
             } else {
-                float size = particle.Length * alpha;
-                Draw.Rect(particle.Position - Vector2.One * size * 0.5f, size, size, particle.Tint * (0.55f * alpha));
+                float size = particle.Length * (0.5f + 0.5f * alpha);
+                Draw.Rect(particle.Position - Vector2.One * size * 0.5f, size, size, particle.Tint * (0.6f * alpha));
             }
         }
-    }
-
-    // Displacement textures are generated per direction: the pixel pattern is the
-    // rotated base strip and the R/G channels already carry world-space vectors,
-    // because the vanilla distort shader reads them as screen X/Y offsets.
-    private static Texture2D[] CreateDirectionalTextures(
-        Func<float, float, float, Vector2> field) {
-        Texture2D[] textures = new Texture2D[DirectionSteps];
-        Vector2 centre = new(CrushTextureWidth * 0.5f, CrushTextureHeight * 0.5f);
-        Vector2 half = new(CrushTextureWidth * 0.5f - 1f, CrushTextureHeight * 0.5f - 1f);
-        for (int k = 0; k < DirectionSteps; k++) {
-            float angle = k * MathF.PI * 2f / DirectionSteps;
-            Vector2 path = Calc.AngleToVector(angle, 1f);
-            Vector2 normal = new(-path.Y, path.X);
-            Color[] pixels = new Color[CrushTextureWidth * CrushTextureHeight];
-            for (int y = 0; y < CrushTextureHeight; y++) {
-                for (int x = 0; x < CrushTextureWidth; x++) {
-                    // Rotate the pixel back into the strip's own frame.
-                    Vector2 local = new((x - centre.X) / half.X, (y - centre.Y) / half.Y);
-                    Vector2 rotated = new(
-                        local.X * MathF.Cos(-angle) - local.Y * MathF.Sin(-angle),
-                        local.X * MathF.Sin(-angle) + local.Y * MathF.Cos(-angle));
-                    float along = MathHelper.Clamp(rotated.X * 0.5f + 0.5f, 0f, 1f);
-                    float across = MathHelper.Clamp(rotated.Y, -1f, 1f);
-                    Vector2 push = field(MathF.Abs(across), MathF.Sign(across), along);
-                    pixels[y * CrushTextureWidth + x] = new Color(new Vector4(
-                        0.5f + 0.5f * (push.X * path.X + push.Y * normal.X),
-                        0.5f + 0.5f * (push.X * path.Y + push.Y * normal.Y),
-                        0f, 1f));
-                }
-            }
-            textures[k] = new Texture2D(Engine.Instance.GraphicsDevice, CrushTextureWidth, CrushTextureHeight);
-            textures[k].SetData(pixels);
-        }
-        return textures;
-    }
-
-    private static Texture2D[] GetCrushTextures()
-        => crushDirections ??= CreateDirectionalTextures((acrossAbs, acrossSign, along) => {
-            float cap = MathF.Pow(MathF.Sin(MathF.PI * along), 0.35f);
-            float push = acrossAbs * (1f - acrossAbs) * 4f;
-            return new Vector2(-0.28f * (1f - acrossAbs), acrossSign * push) * cap;
-        });
-
-    private static Texture2D[] GetWaveTextures()
-        => waveDirections ??= CreateDirectionalTextures((acrossAbs, acrossSign, along) => {
-            float cap = MathF.Pow(MathF.Sin(MathF.PI * along), 0.35f);
-            float lobe = acrossAbs <= 0.15f ? 0f : MathF.Sin(MathF.PI * (acrossAbs - 0.15f) / 0.85f);
-            return new Vector2(0f, acrossSign * lobe * cap);
-        });
-
-    // A soft round hole of neutral displacement (0.5, 0.5) with premultiplied
-    // alpha, stamped over the player to cancel the wake around the sprite.
-    private static Texture2D GetHoleTexture() {
-        if (holeTexture is { } texture) return texture;
-        const int size = 32;
-        Color[] pixels = new Color[size * size];
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size; x++) {
-                Vector2 offset = new(x - (size - 1) * 0.5f, y - (size - 1) * 0.5f);
-                float distance = offset.Length() / ((size - 1) * 0.5f);
-                float alpha = MathHelper.Clamp(1f - distance * distance, 0f, 1f);
-                pixels[y * size + x] = new Color(new Vector4(0.5f * alpha, 0.5f * alpha, 0f, alpha));
-            }
-        }
-        holeTexture = new Texture2D(Engine.Instance.GraphicsDevice, size, size);
-        holeTexture.SetData(pixels);
-        return holeTexture;
     }
 
     // A fan-shaped mask: bright at the apex (right edge midpoint), fading toward
-    // the left opening — used to clip the aberration layer to the wake region.
-    private static Texture2D GetAberrationMaskTexture() {
-        if (aberrationMaskTexture is { } texture) return texture;
+    // the left opening, black everywhere else.
+    private static Texture2D GetWakeMaskTexture() {
+        if (wakeMaskTexture is { } texture) return texture;
         const int size = 64;
         Color[] pixels = new Color[size * size];
         Vector2 apex = new(size - 1f, (size - 1f) * 0.5f);
@@ -524,20 +521,9 @@ public static class HighSpeedEffects {
                 pixels[y * size + x] = new Color(new Vector4(brightness, brightness, brightness, 1f));
             }
         }
-        aberrationMaskTexture = new Texture2D(Engine.Instance.GraphicsDevice, size, size);
-        aberrationMaskTexture.SetData(pixels);
-        return aberrationMaskTexture;
-    }
-
-    private static void DisposeTextures() {
-        if (crushDirections is { } crush) foreach (Texture2D texture in crush) texture.Dispose();
-        if (waveDirections is { } wave) foreach (Texture2D texture in wave) texture.Dispose();
-        crushDirections = null;
-        waveDirections = null;
-        holeTexture?.Dispose();
-        holeTexture = null;
-        aberrationMaskTexture?.Dispose();
-        aberrationMaskTexture = null;
+        wakeMaskTexture = new Texture2D(Engine.Instance.GraphicsDevice, size, size);
+        wakeMaskTexture.SetData(pixels);
+        return wakeMaskTexture;
     }
 
     private static Player? FindFocusPlayer(Level? level) {
@@ -562,4 +548,9 @@ public static class HighSpeedEffects {
         if (SaveData.Instance?.Assists.MirrorMode == true) direction.X = -direction.X;
         return direction;
     }
+
+    private static float NextFloat() => (float)Random.NextDouble();
+
+    private static Vector2 Range(Vector2 min, Vector2 max)
+        => new(min.X + NextFloat() * (max.X - min.X), min.Y + NextFloat() * (max.Y - min.Y));
 }
