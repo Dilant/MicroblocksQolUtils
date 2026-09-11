@@ -466,10 +466,9 @@ public static class HighSpeedEffects {
         if (SaveData.Instance.Assists.MirrorMode) playerLocal.X = 320f - playerLocal.X;
         effect.Parameters["PlayerUV"].SetValue(playerLocal / new Vector2(FieldWidth, FieldHeight));
         effect.Parameters["PlayerRadiusUV"].SetValue(20f / FieldWidth);
-        if (!diagnosedWake) {
-            diagnosedWake = true;
-            DiagnoseWakePass(device, viewport);
-        }
+        bool diagnose = !diagnosedWake;
+        diagnosedWake = true;
+        Color[]? before = diagnose ? ReadBackbufferCentre(device, viewport) : null;
         device.SetRenderTarget(screenWork);
         device.Clear(Color.Transparent);
         Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp,
@@ -478,6 +477,7 @@ public static class HighSpeedEffects {
         // texture's own size would leave the rest of the target as garbage.
         Draw.SpriteBatch.Draw(levelBuffer, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
         Draw.SpriteBatch.End();
+        Color[]? work = diagnose ? ReadTargetCentre(screenWork!) : null;
 
         // Blend the processed wake over the composed frame in the viewport. The
         // shader emits non-premultiplied colour with coverage in alpha.
@@ -486,21 +486,32 @@ public static class HighSpeedEffects {
         BeginSprite(BlendState.NonPremultiplied, SamplerState.LinearClamp);
         Draw.SpriteBatch.Draw(screenWork, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
+        if (diagnose) {
+            Color[] after = ReadBackbufferCentre(device, viewport);
+            PresentationParameters presentation = device.PresentationParameters;
+            Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
+                $"wakediag: viewport={viewport.X},{viewport.Y},{viewport.Width},{viewport.Height} "
+                + $"backbuffer={presentation.BackBufferWidth}x{presentation.BackBufferHeight} "
+                + $"drawToBuffer={HiresRenderer.DrawToBuffer} "
+                + $"before={before![0]} shaderOut={work![0]} after={after[0]}");
+        }
     }
 
-    // One-shot diagnostics when the wake first renders: if the backdrop is
-    // already dark at this point the pass is running before the composite.
+    // One-shot diagnostics when the wake first renders: samples the backbuffer
+    // before, the shader output, and the backbuffer after compositing.
     private static bool diagnosedWake;
 
-    private static void DiagnoseWakePass(GraphicsDevice device, Viewport viewport) {
-        PresentationParameters presentation = device.PresentationParameters;
+    private static Color[] ReadBackbufferCentre(GraphicsDevice device, Viewport viewport) {
         Color[] centre = new Color[1];
         device.GetBackBufferData(
             new Rectangle(viewport.X + viewport.Width / 2, viewport.Y + viewport.Height / 2, 1, 1), centre, 0, 1);
-        Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
-            $"wakediag: viewport={viewport.X},{viewport.Y},{viewport.Width},{viewport.Height} "
-            + $"backbuffer={presentation.BackBufferWidth}x{presentation.BackBufferHeight} "
-            + $"drawToBuffer={HiresRenderer.DrawToBuffer} centre={centre[0]}");
+        return centre;
+    }
+
+    private static Color[] ReadTargetCentre(RenderTarget2D target) {
+        Color[] centre = new Color[1];
+        target.GetData(0, new Rectangle(target.Width / 2, target.Height / 2, 1, 1), centre, 0, 1);
+        return centre;
     }
 
     private static void EnsureScreenTargets(GraphicsDevice device, int width, int height) {

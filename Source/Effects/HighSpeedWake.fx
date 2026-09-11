@@ -16,23 +16,23 @@ texture BlurHalfTex;
 texture BlurQuarterTex;
 texture BlurEighthTex;
 
-sampler2D screenS = sampler_state {
+sampler2D screenS : register(s0) = sampler_state {
     Texture = (ScreenTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
-sampler2D fieldS = sampler_state {
+sampler2D fieldS : register(s1) = sampler_state {
     Texture = (FieldTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
-sampler2D halfS = sampler_state {
+sampler2D halfS : register(s2) = sampler_state {
     Texture = (BlurHalfTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
-sampler2D quarterS = sampler_state {
+sampler2D quarterS : register(s3) = sampler_state {
     Texture = (BlurQuarterTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
-sampler2D eighthS = sampler_state {
+sampler2D eighthS : register(s4) = sampler_state {
     Texture = (BlurEighthTex); MinFilter = Linear; MagFilter = Linear; MipFilter = Point;
     AddressU = Clamp; AddressV = Clamp;
 };
