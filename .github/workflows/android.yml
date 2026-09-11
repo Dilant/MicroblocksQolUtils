@@ -1,0 +1,73 @@
+name: Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, 'ci/android-*']
+    paths: ['Source/**', 'Native/**', 'Cargo.*', 'Dialog/**', 'everest.yaml', 'scripts/build-android*', '.github/workflows/android.yml']
+  pull_request:
+    branches: [master]
+    paths: ['Source/**', 'Native/**', 'Cargo.*', 'Dialog/**', 'everest.yaml', 'scripts/build-android*', '.github/workflows/android.yml']
+
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android ARM64 with FFmpeg
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      EVEREST_VERSION: stable-1.6485.0
+      NDK_VERSION: 28.2.13676358
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev make pkg-config xz-utils unzip zip
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .work/android-target
+          key: android-cargo-${{ env.NDK_VERSION }}-${{ hashFiles('Cargo.lock', 'Native/**') }}
+          restore-keys: android-cargo-${{ env.NDK_VERSION }}-
+      - uses: actions/cache@v6
+        with:
+          path: .work/android-ffmpeg
+          key: android-ffmpeg-${{ env.NDK_VERSION }}-${{ hashFiles('scripts/build-android-mod.sh') }}
+      - name: Download Everest references
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .work/everest
+          gh release download "$EVEREST_VERSION" --repo EverestAPI/Everest --pattern lib-stripped.zip --dir .work/everest
+          unzip -q .work/everest/lib-stripped.zip -d .work/everest
+      - name: Build full Android package
+        env:
+          CELESTE_ROOT: ${{ github.workspace }}/.work/everest/lib-stripped
+        run: bash scripts/build-android-mod.sh
+      - name: Upload Android package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicroblocksQolUtils-android-arm64
+          path: |
+            .work/MicroblocksQolUtils-android-arm64.zip
+            .work/MicroblocksQolUtils-android-arm64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
