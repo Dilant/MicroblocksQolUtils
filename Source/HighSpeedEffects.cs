@@ -21,9 +21,12 @@ public static class HighSpeedEffects {
     // Water surface simulation resolution matches the displacement buffer 1:1.
     private const int FieldWidth = 320;
     private const int FieldHeight = 180;
-    private const float FieldDamping = 0.987f;
+    private const float FieldDamping = 0.982f;
     private const float FieldGradientScale = 9f;
     private const int FieldStepsPerFrame = 2;
+    // Waves entering this margin get progressively swallowed instead of
+    // reflecting off the field borders.
+    private const int FieldAbsorbMargin = 14;
 
     private sealed class PlayerFx {
         public readonly Vector2[] Positions = new Vector2[TrailSamples];
@@ -60,6 +63,8 @@ public static class HighSpeedEffects {
     private static float[] WavePrevious = new float[FieldWidth * FieldHeight];
     private static float[] WaveScratch = new float[FieldWidth * FieldHeight];
     private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
+    private static readonly float[] EdgeDampX = BuildEdgeDamp(FieldWidth);
+    private static readonly float[] EdgeDampY = BuildEdgeDamp(FieldHeight);
     private static Texture2D? fieldTexture;
     private static Vector2 fieldCamera;
 
@@ -144,18 +149,20 @@ public static class HighSpeedEffects {
 
         if (Active && self.Scene is Level level && !level.FrozenOrPaused) {
             if (Settings.HighSpeedWarp) {
-                // Stir the water surface along the path; the amplitude scales with
-                // speed so slow movement only dimples the surface.
+                // Stir the water surface just behind the player; the amplitude
+                // scales with speed so slow movement only dimples the surface.
                 float excess = MathHelper.Clamp(speed / threshold - 0.5f, 0f, 2f);
-                if (excess > 0f)
-                    InjectWave(level, self.Center, -(1.5f + 8f * excess * excess) * Intensity,
-                        2.5f + 3.5f * excess);
+                if (excess > 0f) {
+                    Vector2 behind = self.Center - fx.LastDirection * MathHelper.Clamp(2f + speed * 0.02f, 2f, 24f);
+                    InjectWave(level, behind, fx.LastDirection,
+                        -(1.5f + 8f * excess * excess) * Intensity, 2.5f + 3.5f * excess);
+                }
                 // A sudden stop (wall impact, ground slam) dumps the built-up
                 // momentum into the surface plus a vanilla-style burst.
                 float drop = fx.PreviousSpeed - speed;
                 if (drop > 400f && fx.PreviousSpeed > threshold * 1.1f) {
                     float power = MathHelper.Clamp(drop / 900f, 0.25f, 1.25f) * Intensity;
-                    InjectWave(level, self.Center, -14f * power, 7f);
+                    InjectWave(level, self.Center, Vector2.Zero, -14f * power, 7f);
                     level.Displacement.AddBurst(self.Center, 0.55f, 4f, 40f + 48f * power,
                         0.45f * power, Ease.QuadOut, Ease.QuadOut);
                     SpawnImpactSparks(self.Center, fx.LastDirection, power);
@@ -394,16 +401,18 @@ public static class HighSpeedEffects {
 
     // Classic two-buffer wave propagation: the next height is the neighbourhood
     // average minus the previous step, damped over time. Ripples spread,
-    // oscillate through zero and fade out entirely on their own.
+    // oscillate through zero and fade out entirely on their own. A margin of
+    // extra damping absorbs waves at the borders so they do not bounce back.
     private static void PropagateWave() {
         for (int y = 1; y < FieldHeight - 1; y++) {
             int row = y * FieldWidth;
+            float dampY = EdgeDampY[y];
             for (int x = 1; x < FieldWidth - 1; x++) {
                 int index = row + x;
                 float value = (WaveCurrent[index - 1] + WaveCurrent[index + 1]
                     + WaveCurrent[index - FieldWidth] + WaveCurrent[index + FieldWidth]) * 0.5f
                     - WavePrevious[index];
-                WaveScratch[index] = value * FieldDamping;
+                WaveScratch[index] = value * FieldDamping * dampY * EdgeDampX[x];
             }
         }
         float[] swap = WavePrevious;
@@ -413,19 +422,41 @@ public static class HighSpeedEffects {
         // Edges stay at zero; the loop above never writes them.
     }
 
-    private static void InjectWave(Level level, Vector2 world, float strength, float radius) {
+    private static float[] BuildEdgeDamp(int size) {
+        float[] factors = new float[size];
+        for (int i = 0; i < size; i++) {
+            int edge = Math.Min(i, size - 1 - i);
+            factors[i] = edge >= FieldAbsorbMargin
+                ? 1f
+                : MathHelper.Clamp(0.55f + 0.45f * edge / FieldAbsorbMargin, 0f, 1f);
+        }
+        return factors;
+    }
+
+    // Drops a disturbance into the field. A non-zero direction biases the blob
+    // backwards: the leading edge is weakened so the wake stays behind the
+    // player instead of chasing it.
+    private static void InjectWave(Level level, Vector2 world, Vector2 direction, float strength, float radius) {
         ShiftField(level.Camera.Position);
         Vector2 local = world - fieldCamera;
+        bool directional = direction.LengthSquared() > 0.1f;
+        Vector2 normalized = directional ? Vector2.Normalize(direction) : Vector2.Zero;
         int x0 = Math.Max(1, (int)(local.X - radius));
         int x1 = Math.Min(FieldWidth - 2, (int)(local.X + radius));
         int y0 = Math.Max(1, (int)(local.Y - radius));
         int y1 = Math.Min(FieldHeight - 2, (int)(local.Y + radius));
         for (int y = y0; y <= y1; y++) {
             for (int x = x0; x <= x1; x++) {
-                float distance = MathF.Sqrt((x - local.X) * (x - local.X) + (y - local.Y) * (y - local.Y));
+                float offsetX = x - local.X, offsetY = y - local.Y;
+                float distance = MathF.Sqrt(offsetX * offsetX + offsetY * offsetY);
                 float falloff = MathHelper.Clamp(1f - distance / radius, 0f, 1f);
-                if (falloff > 0f)
-                    WaveCurrent[y * FieldWidth + x] += strength * falloff;
+                if (falloff <= 0f) continue;
+                if (directional && distance > 0.5f) {
+                    // 1 straight behind, 0.25 straight ahead.
+                    float behind = 0.5f - 0.5f * (offsetX * normalized.X + offsetY * normalized.Y) / distance;
+                    falloff *= 0.25f + 0.75f * MathHelper.Clamp(behind, 0f, 1f);
+                }
+                WaveCurrent[y * FieldWidth + x] += strength * falloff;
             }
         }
     }
