@@ -76,12 +76,13 @@ public static class HighSpeedEffects {
     private static readonly Color[] FieldPixels = new Color[FieldWidth * FieldHeight];
     private static Texture2D? fieldTexture;
 
-    // Render-resolution scratch: the shader output plus the two-level blur
+    // Render-resolution scratch: the shader output plus the three-level blur
     // pyramid (the pyramid is field-sized; the shader resolves it at output
     // resolution through linear sampling).
     private static RenderTarget2D? screenWork;
     private static RenderTarget2D? screenHalf;
     private static RenderTarget2D? screenQuarter;
+    private static RenderTarget2D? screenEighth;
     private static int screenWidth;
     private static int screenHeight;
 
@@ -120,8 +121,11 @@ public static class HighSpeedEffects {
         screenHalf = null;
         screenQuarter?.Dispose();
         screenQuarter = null;
+        screenEighth?.Dispose();
+        screenEighth = null;
         wakeEffect?.Dispose();
         wakeEffect = null;
+        diagnosedWake = false;
         screenWidth = 0;
         screenHeight = 0;
     }
@@ -434,9 +438,13 @@ public static class HighSpeedEffects {
         BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
         Draw.SpriteBatch.Draw(screenHalf, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
         Draw.SpriteBatch.End();
+        device.SetRenderTarget(screenEighth);
+        BeginSprite(BlendState.Opaque, SamplerState.LinearClamp);
+        Draw.SpriteBatch.Draw(screenQuarter, Vector2.Zero, null, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 0f);
+        Draw.SpriteBatch.End();
 
         // One shader pass: warp + graded blur + aberration + brightness lift,
-        // premultiplied by wake coverage so only the wake region is replaced.
+        // with wake coverage in alpha so only the wake region is replaced.
         float activity = MathHelper.Clamp(fieldActivity * 1.5f, 0f, 1f);
         float intensity = Intensity;
         Effect effect = GetWakeEffect();
@@ -444,6 +452,7 @@ public static class HighSpeedEffects {
         effect.Parameters["FieldTex"].SetValue(fieldTexture);
         effect.Parameters["BlurHalfTex"].SetValue(screenHalf);
         effect.Parameters["BlurQuarterTex"].SetValue(screenQuarter);
+        effect.Parameters["BlurEighthTex"].SetValue(screenEighth);
         effect.Parameters["WarpScale"].SetValue(Settings.HighSpeedWarp ? 0.06f : 0f);
         effect.Parameters["BlurAmount"].SetValue(Settings.HighSpeedBlur ? 1f : 0f);
         Vector2 direction = ScreenDirection(player, fx);
@@ -452,7 +461,17 @@ public static class HighSpeedEffects {
             ? direction * offsetPixels / new Vector2(viewport.Width, viewport.Height)
             : Vector2.Zero);
         effect.Parameters["BrightnessLift"].SetValue(Settings.HighSpeedAberration ? 0.10f * activity : 0f);
+        // Keep displaced sampling away from the player's sprite.
+        Vector2 playerLocal = player.Center - level.Camera.Position;
+        if (SaveData.Instance.Assists.MirrorMode) playerLocal.X = 320f - playerLocal.X;
+        effect.Parameters["PlayerUV"].SetValue(playerLocal / new Vector2(FieldWidth, FieldHeight));
+        effect.Parameters["PlayerRadiusUV"].SetValue(20f / FieldWidth);
+        if (!diagnosedWake) {
+            diagnosedWake = true;
+            DiagnoseWakePass(device, viewport);
+        }
         device.SetRenderTarget(screenWork);
+        device.Clear(Color.Transparent);
         Draw.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp,
             DepthStencilState.None, RasterizerState.CullNone, effect);
         // Drive the shader with a quad covering the whole output — the source
@@ -460,12 +479,28 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.Draw(levelBuffer, new Rectangle(0, 0, viewport.Width, viewport.Height), Color.White);
         Draw.SpriteBatch.End();
 
-        // Blend the processed wake over the composed frame in the viewport.
+        // Blend the processed wake over the composed frame in the viewport. The
+        // shader emits non-premultiplied colour with coverage in alpha.
         device.SetRenderTarget(null);
         device.Viewport = viewport;
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
+        BeginSprite(BlendState.NonPremultiplied, SamplerState.LinearClamp);
         Draw.SpriteBatch.Draw(screenWork, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
+    }
+
+    // One-shot diagnostics when the wake first renders: if the backdrop is
+    // already dark at this point the pass is running before the composite.
+    private static bool diagnosedWake;
+
+    private static void DiagnoseWakePass(GraphicsDevice device, Viewport viewport) {
+        PresentationParameters presentation = device.PresentationParameters;
+        Color[] centre = new Color[1];
+        device.GetBackBufferData(
+            new Rectangle(viewport.X + viewport.Width / 2, viewport.Y + viewport.Height / 2, 1, 1), centre, 0, 1);
+        Logger.Log(LogLevel.Info, "MicroblocksQolUtils",
+            $"wakediag: viewport={viewport.X},{viewport.Y},{viewport.Width},{viewport.Height} "
+            + $"backbuffer={presentation.BackBufferWidth}x{presentation.BackBufferHeight} "
+            + $"drawToBuffer={HiresRenderer.DrawToBuffer} centre={centre[0]}");
     }
 
     private static void EnsureScreenTargets(GraphicsDevice device, int width, int height) {
@@ -473,6 +508,7 @@ public static class HighSpeedEffects {
         screenWork?.Dispose();
         screenHalf?.Dispose();
         screenQuarter?.Dispose();
+        screenEighth?.Dispose();
         screenWidth = width;
         screenHeight = height;
         screenWork = new RenderTarget2D(device, width, height, false, SurfaceFormat.Color,
@@ -480,6 +516,8 @@ public static class HighSpeedEffects {
         screenHalf = new RenderTarget2D(device, FieldWidth / 2, FieldHeight / 2, false, SurfaceFormat.Color,
             DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
         screenQuarter = new RenderTarget2D(device, FieldWidth / 4, FieldHeight / 4, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
+        screenEighth = new RenderTarget2D(device, FieldWidth / 8, FieldHeight / 8, false, SurfaceFormat.Color,
             DepthFormat.None, 0, RenderTargetUsage.DiscardContents);
     }
 
