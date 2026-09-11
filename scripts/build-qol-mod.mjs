@@ -13,8 +13,13 @@ const argumentValue = (name) => {
   return value;
 };
 const target = argumentValue("--target");
-const archive = resolve(root, argumentValue("--archive") ?? "MicroblocksQolUtils.zip");
 const disableFfmpeg = process.argv.includes("--no-ffmpeg");
+if (disableFfmpeg && process.argv.includes("--install")) {
+  throw new Error("Cannot install a --no-ffmpeg build: it cannot record videos. Remove --no-ffmpeg to build and install the complete mod.");
+}
+const archive = resolve(root, argumentValue("--archive")
+  ?? (disableFfmpeg ? "MicroblocksQolUtils-no-recording.zip" : "MicroblocksQolUtils.zip"));
+if (disableFfmpeg) console.warn("Diagnostic build only: video recording is unavailable without FFmpeg.");
 const managedOutput = resolve(root, "Source/bin/Release/net8.0");
 const dll = resolve(managedOutput, "MicroblocksQolUtils.dll");
 const celesteRoot = resolve(process.env.CELESTE_ROOT ?? "C:/SteamLibrary/steamapps/common/Celeste");
@@ -46,6 +51,7 @@ const run = (command, args, env = process.env) => {
     shell: false,
     env,
   });
+  if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
 };
 
