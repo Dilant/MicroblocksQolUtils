@@ -16,7 +16,14 @@ public static class NativeCaptureBridge {
 
     public static void InitializeFromMod(EverestModuleMetadata metadata) {
         ArgumentNullException.ThrowIfNull(metadata);
-        AndroidNativeLibrary.Load(metadata);
+        try {
+            AndroidNativeLibrary.Load(metadata);
+        } catch (Exception exception) {
+            // A missing optional native backend must not prevent the managed QoL
+            // module (touch controls, transitions, HUD, etc.) from loading.
+            Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder",
+                $"Android native backend unavailable; continuing without capture: {exception.Message}");
+        }
         Initialize(null);
     }
 
