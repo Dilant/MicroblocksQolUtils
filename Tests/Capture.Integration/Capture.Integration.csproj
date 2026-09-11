@@ -9,11 +9,16 @@
     <Content Include="$(CelesteRoot)/*.dll" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest"/>
     <Compile Include="../../Source/CaptureSource.cs" Link="CaptureSource.cs"/>
     <Compile Include="../../Source/FmodPcmQueue.cs" Link="FmodPcmQueue.cs"/>
+    <Compile Include="../../Source/AudioEventJournal.cs" Link="AudioEventJournal.cs"/>
+    <Compile Include="../../Source/AudioEventCapture.cs" Link="AudioEventCapture.cs"/>
     <Compile Include="../../Source/MusicCapture.cs" Link="MusicCapture.cs"/>
     <Compile Include="../../Source/MusicJournal.cs" Link="MusicJournal.cs"/>
     <Compile Include="../../Source/CaptureSubscription.cs" Link="CaptureSubscription.cs"/><Compile Include="../../Source/CaptureFramePool.cs" Link="CaptureFramePool.cs"/>
     <Compile Include="../../Source/FmodSfxTap.cs" Link="FmodSfxTap.cs"/>
     <Compile Include="../../Source/FmodCaptureClock.cs" Link="FmodCaptureClock.cs"/>
+    <Compile Include="../../Source/AudioEventReplayRenderer.cs" Link="AudioEventReplayRenderer.cs"/>
+    <Compile Include="../../Source/AudioEventSource.cs" Link="AudioEventSource.cs"/>
+    <Compile Include="../../Source/MusicEventReplayRenderer.cs" Link="MusicEventReplayRenderer.cs"/>
     <Compile Include="../../Source/SdlFrameSource.cs" Link="SdlFrameSource.cs"/>
     <Compile Include="../../Source/NativeCaptureBridge.cs" Link="NativeCaptureBridge.cs"/>
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs"/>

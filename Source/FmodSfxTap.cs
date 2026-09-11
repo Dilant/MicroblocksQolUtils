@@ -3,13 +3,10 @@ using System.Reflection;
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 /// <summary>
-/// Installs pass-through DSPs at the tail of Celeste's gameplay audio buses. FMOD calls the
-/// read callbacks on its mixer thread, so the callback only copies the bus audio
-/// to the output and offers samples once to the shared source bounded queue.
+/// Installs a pass-through DSP at Celeste's music bus. Gameplay/UI SFX are
+/// journaled as FMOD commands and rendered after the video edit.
 /// </summary>
 internal sealed class FmodSfxTap : IDisposable {
-    private const int GameplayBusId = 1;
-    private const int UiBusId = 2;
     private const int MusicBusId = 3;
 
     private readonly List<BusTap> taps = [];
@@ -24,8 +21,8 @@ internal sealed class FmodSfxTap : IDisposable {
             Check(lowLevel.getSoftwareFormat(out int sampleRate, out _, out _), "get software format");
 
             FmodSfxTap owner = new();
-            owner.TryAttachBus(studio, lowLevel, "bus:/gameplay_sfx", GameplayBusId, sampleRate);
-            owner.TryAttachBus(studio, lowLevel, "bus:/ui_sfx", UiBusId, sampleRate);
+            // Gameplay and UI SFX are event-journaled. Only adaptive music remains
+            // PCM-backed for the post-edit music path.
             owner.TryAttachBus(studio, lowLevel, "bus:/music", MusicBusId, sampleRate);
 
             if (owner.taps.Count == 0) {
@@ -155,11 +152,7 @@ internal sealed class FmodSfxTap : IDisposable {
 
         private static char[] DspName(string path) {
             char[] name = new char[32];
-            string value = path.EndsWith("ui_sfx", StringComparison.Ordinal)
-                ? "MQOL UI SFX tap"
-                : path.EndsWith("music", StringComparison.Ordinal)
-                    ? "MQOL music tap"
-                    : "MQOL gameplay SFX tap";
+            string value = "MQOL music tap";
             value.AsSpan(0, Math.Min(value.Length, name.Length - 1)).CopyTo(name);
             return name;
         }

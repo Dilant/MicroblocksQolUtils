@@ -55,6 +55,21 @@ Fmod(studio.getEvent("event:/ui/main/button_select",out var description));
 Fmod(studio.getEvent("event:/char/madeline/jump",out var jumpDescription));
 NativeCaptureBridge.Initialize(null); Check(NativeCaptureBridge.Available,"native load failed");
 CaptureSource.Load(); Check(CaptureSource.VideoError is null,$"hook failed: {CaptureSource.VideoError}");
+if (Environment.GetEnvironmentVariable("MQOL_TEST_EVENT_RENDER") == "1") {
+    string journal = Path.Combine(output, "event-render.jsonl");
+    File.WriteAllLines(journal, new[] {
+        "{\"type\":\"header\",\"version\":2,\"clock\":\"capture-monotonic-nanos\"}",
+        "{\"type\":\"origin\",\"timestampNanos\":1000000000}",
+        "{\"type\":\"event\",\"sequence\":1,\"TimestampNanos\":1000000000,\"InstanceId\":1,\"EventPath\":\"event:/char/madeline/jump\",\"Operation\":\"start\",\"Parameter\":null,\"Value\":null,\"bus\":\"sfx\"}",
+        "{\"type\":\"footer\",\"complete\":true,\"events\":1}"
+    });
+    string sidecar = Path.Combine(output, "event-render.sfxchunks");
+    Check(AudioEventReplayRenderer.RenderToSidecar(journal, sidecar, 0.25), "FMOD NRT render failed");
+    Check(new FileInfo(sidecar).Length > 8, "FMOD NRT output was empty");
+    CaptureSource.Unload(); Fmod(studio.release()); Sdl.DeleteContext(context); Sdl.DestroyWindow(window); Sdl.Quit();
+    Console.WriteLine("PASS Celeste FMOD NRT event replay");
+    return;
+}
 if (Environment.GetEnvironmentVariable("MQOL_TEST_FRAME_ROUTES") == "1") {
     FrameRoutingTests.Run(window, i => { clearColor((i%256)/255f,.3f,.7f,1); clear(0x4000); }, output, encoder);
     CaptureSource.Unload(); Fmod(studio.release());
@@ -141,7 +156,7 @@ slow.Dispose();slow.Completion.GetAwaiter().GetResult();
 CaptureSource.Update();
 Check(frameCount>100 && audioCount>0,$"no callbacks: {frameCount} frames, {audioCount} audio; {CaptureSource.VideoError}");
 Check(badPixels==0,$"pixel/order errors: {badPixels}");
-Check(surroundChunks>0 && bgmChunks>0,$"real 7.1 BGM PCM was not observed: surround={surroundChunks} bgm={bgmChunks} audio={audioCount}");
+Check(bgmChunks>0,$"independent BGM PCM was not observed: surround={surroundChunks} bgm={bgmChunks} audio={audioCount}");
 Check(musicChanges.Any(e=>e.Kind=="pause") && musicChanges.Any(e=>e.Kind=="resume")
     && musicChanges.Any(e=>e.Kind=="seek") && musicChanges.Any(e=>e.Kind=="start"),"music control hooks missed commands");
 Check(musicChanges.Count(e=>e.Kind=="parameter") is >0 and <20,"redundant parameter setters split continuous music");
@@ -150,9 +165,11 @@ Check(CaptureSource.SubscriberCount==0 && !CaptureSource.AudioAvailable,"last un
 foreach(var name in new[]{"first.mkv","second.mkv"}) {
     string path=Path.Combine(output,name);
     Check(File.Exists(path)&&new FileInfo(path).Length>1000,"missing video");
-    Check(new FileInfo(path+".sfxchunks").Length>8,"missing FMOD PCM");
-    Check(new FileInfo(path+".bgmchunks").Length>8,"missing independent BGM PCM");
+    Check(new FileInfo(path+".sfxevents").Length>8,"missing SFX event journal");
+    Check(File.ReadLines(path+".sfxevents").Last().Contains("\"complete\":true"),"incomplete SFX event journal");
     Check(File.ReadAllLines(path+".music.jsonl").Last().Contains("\"complete\":true"),"incomplete music journal");
+    Check(!File.Exists(path+".bgmchunks"),"BGM PCM sidecar was persisted during capture");
+    Check(!File.Exists(path+".sfxchunks"),"SFX PCM sidecar was persisted during capture");
 }
 NativeCaptureBridge.FinalizeRecordingAsync([new RecordingClip(Path.Combine(output,"first.mkv"),0,1.5,"",0)],
     Path.Combine(output,"final.mp4"),encoder,1000,30,false,false,"").GetAwaiter().GetResult();

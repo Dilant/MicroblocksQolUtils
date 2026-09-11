@@ -13,9 +13,9 @@ internal sealed class NativeRoomRecording {
     private readonly long initialSourceAudioDrops = CaptureSource.DroppedAudioChunks;
 
     public string Path { get; }
-    public string AudioPath => Path + ".sfxchunks";
     public string BgmPath => Path + ".bgmchunks";
     public string MusicEventsPath => Path + ".music.jsonl";
+    public string SfxEventsPath => Path + ".sfxevents";
     public string CaptureReportPath => Path + ".capture.json";
     public bool HasAudioTap => capture.HasAudioTap;
 
@@ -81,8 +81,7 @@ internal sealed class NativeRoomRecording {
                 settings.RecordingFrameRate,
                 output,
                 settings.RecordingEncoder,
-                settings.RecordingBitrateKbps,
-                includeUiSfx: settings.RecordingIncludeUiSfx
+                settings.RecordingBitrateKbps
             );
             return new NativeRoomRecording(capture, output);
         } catch (Exception exception) {
@@ -95,21 +94,8 @@ internal sealed class NativeRoomRecording {
         if (Interlocked.Exchange(ref stopped, 1) != 0) return Task.CompletedTask;
         // Disposing this sink unregisters only its callbacks; the shared DSP stays for other consumers.
         CaptureStatistics statistics = Statistics;
-        if (!capture.HasAudioTap || statistics.AudioFramesCaptured == 0) {
-            Logger.Log(
-                LogLevel.Warn,
-                "MicroblocksQolUtils/Recorder",
-                $"Recording stopped without captured FMOD audio (tap={capture.HasAudioTap}, "
-                + $"videoFrames={statistics.FramesCaptured}, audioFrames={statistics.AudioFramesCaptured})."
-            );
-        } else {
-            Logger.Log(
-                LogLevel.Info,
-                "MicroblocksQolUtils/Recorder",
-                $"Captured {statistics.AudioFramesCaptured} FMOD audio frame(s); "
-                + $"dropped {statistics.AudioChunksDropped} chunk(s)."
-            );
-        }
+        Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Recorder",
+            "Recording audio sources: SFX and music event journals; no PCM is written during capture.");
         Task drain = capture.CompleteInput();
         return FinishAsync();
 

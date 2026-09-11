@@ -175,7 +175,9 @@ pub fn build_audio_track(
         create_empty_mix(mixed_pcm, spec)?;
     }
     if reconstruct_bgm {
-        if bgm_sidecar.exists() {
+        if separate_bgm.exists() {
+            mix_rendered_bgm(&separate_bgm, mixed_pcm, spec)?;
+        } else if bgm_sidecar.exists() {
             mix_captured_bgm(bgm_sidecar, mixed_pcm, clips, &bgm_map, spec)?;
         }
         if has_mapped_bgm {
@@ -183,10 +185,23 @@ pub fn build_audio_track(
         }
     } else if separate_bgm.exists() {
         // Normal export still cuts music with video, but never mixes it into the SFX source.
-        mix_separate_bgm_with_video(&separate_bgm, mixed_pcm, clips, spec)?;
+        mix_rendered_bgm(&separate_bgm, mixed_pcm, spec)?;
     }
     encode_aac(mixed_pcm, audio_output, spec)?;
     Ok(true)
+}
+
+fn mix_rendered_bgm(sidecar: &Path, mixed_pcm: &Path, spec: AudioSpec) -> Result<(), AudioFinalizeError> {
+    let clip = FinalizeClip {
+        source: String::new(),
+        start_seconds: 0.0,
+        duration_seconds: spec.total_frames as f64 / f64::from(spec.sample_rate),
+        music_event: String::new(),
+        music_timeline_milliseconds: 0,
+        seamless_from_previous: false,
+        bgm_follows_video: false,
+    };
+    mix_separate_bgm_with_video(sidecar, mixed_pcm, &[clip], spec)
 }
 
 fn render_mix(

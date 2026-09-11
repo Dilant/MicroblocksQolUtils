@@ -309,9 +309,6 @@ public sealed class QolSettings : EverestModuleSettings {
     [DefaultValue(BgmRecordingMode.SfxOnlyWithPostMix)]
     public BgmRecordingMode BgmMode { get; set; } = BgmRecordingMode.SfxOnlyWithPostMix;
 
-    [DefaultValue(true)]
-    public bool RecordingIncludeUiSfx { get; set; } = true;
-
     [DefaultValue(false)]
     public bool RecordingRemoveFreezeFrames { get; set; }
 

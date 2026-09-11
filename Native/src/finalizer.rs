@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ffmpeg::{Packet, Rational, codec, encoder, format, frame, media, software};
 use ffmpeg_next as ffmpeg;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::encoder::{
@@ -45,7 +45,7 @@ impl Default for FinalizePlan {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FinalizeClip {
     pub source: String,
     pub start_seconds: f64,
@@ -176,15 +176,15 @@ pub enum FinalizeError {
     },
     #[error("cannot finalize recording audio: {0}")]
     Audio(#[from] finalizer_audio::AudioFinalizeError),
-}
-
-pub fn finalize(plan: &FinalizePlan) -> Result<(), FinalizeError> {
-    finalize_with_progress(plan, |_| {})
+    #[error("offline SFX rendering failed: {0}")]
+    SfxRender(String),
 }
 
 pub fn finalize_with_progress(
     plan: &FinalizePlan,
     mut report_progress: impl FnMut(f32),
+    render_sfx: Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut std::ffi::c_void) -> i32>,
+    render_sfx_context: *mut std::ffi::c_void,
 ) -> Result<(), FinalizeError> {
     validate_plan(plan)?;
     report_progress(0.0);
@@ -224,6 +224,27 @@ pub fn finalize_with_progress(
     };
     if effective_clips.is_empty() {
         return Err(FinalizeError::NoFrames);
+    }
+    if let Some(callback) = render_sfx {
+        let sidecar = format!("{}.sfxchunks", source_path.display());
+        let _ = fs::remove_file(&sidecar);
+        let clips_json = serde_json::to_vec(&effective_clips)
+            .map_err(|error| FinalizeError::SfxRender(error.to_string()))?;
+        let sidecar_bytes = sidecar.as_bytes();
+        let status = unsafe {
+            callback(
+                clips_json.as_ptr(),
+                clips_json.len(),
+                sidecar_bytes.as_ptr(),
+                sidecar_bytes.len(),
+                render_sfx_context,
+            )
+        };
+        if status != 0 {
+            return Err(FinalizeError::SfxRender(
+                "managed FMOD renderer returned a failure status".to_owned(),
+            ));
+        }
     }
     let copied = if plan.prefer_video_copy && !plan.remove_freeze_frames {
         match crate::finalizer_copy::copy_video(&effective_clips, &video_temporary) {
@@ -1353,6 +1374,8 @@ mod tests {
                     ..FinalizePlan::default()
                 },
                 |p| progress.push(p),
+                None,
+                std::ptr::null_mut(),
             )
             .unwrap();
             assert_eq!(progress.last(), Some(&1.));

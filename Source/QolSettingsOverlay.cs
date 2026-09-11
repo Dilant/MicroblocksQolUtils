@@ -1659,7 +1659,6 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
             Toggle("切面自动存档（保持视频连续）", () => settings.RecordingAutoSaveOnTransition,
                 value => settings.RecordingAutoSaveOnTransition = value),
             EnumRow("BGM 拼接", () => settings.BgmMode, value => settings.BgmMode = value),
-            Toggle("录制 UI 音效", () => settings.RecordingIncludeUiSfx, value => settings.RecordingIncludeUiSfx = value),
             Toggle("剪辑冻结帧", () => settings.RecordingRemoveFreezeFrames, value => settings.RecordingRemoveFreezeFrames = value, highlightWhenOn: true),
             Range("录制帧率", () => settings.RecordingFrameRate, value => settings.RecordingFrameRate = value,
                 30, 120, 30, value => $"{value} FPS"),

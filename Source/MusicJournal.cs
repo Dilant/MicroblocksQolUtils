@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
-/// <summary>A per-sink durable music event stream. PCM lives in .bgmchunks, not this metadata file.</summary>
+/// <summary>A per-sink durable music event stream. The recording phase stores no audio PCM.</summary>
 internal sealed class MusicJournal : IDisposable {
     private readonly StreamWriter writer;
     private readonly List<CaptureMusic> pending = new(256);

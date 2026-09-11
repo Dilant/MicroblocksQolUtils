@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
@@ -30,7 +30,7 @@ mod finalizer_audio;
 #[cfg(feature = "ffmpeg")]
 mod finalizer_copy;
 
-const ABI_VERSION: u32 = 10;
+const ABI_VERSION: u32 = 11;
 const OK: i32 = 0;
 const ERR_INVALID_ARGUMENT: i32 = -1;
 const ERR_NOT_FOUND: i32 = -2;
@@ -836,52 +836,15 @@ fn run_consumer(session: &Arc<CaptureSession>) -> Result<(), String> {
 }
 
 fn run_audio_writer(session: &Arc<CaptureSession>) -> Result<(), String> {
-    let create_writer = |path: PathBuf| -> Result<BufWriter<File>, String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create audio sidecar directory: {error}"))?;
-        }
-        let file = File::create(&path)
-            .map_err(|error| format!("cannot create audio sidecar {}: {error}", path.display()))?;
-        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-        writer
-            .write_all(b"MQOLAUD1")
-            .map_err(|error| format!("cannot write audio sidecar header: {error}"))?;
-        Ok(writer)
-    };
-    let mut writer = audio_sidecar_path(&session.config)
-        .map(&create_writer)
-        .transpose()?;
-    let mut bgm = audio_sidecar_path(&session.config)
-        .map(|path| create_writer(path.with_extension("bgmchunks")))
-        .transpose()?;
-
+    // Recording is event-only. Retire any legacy public PCM submissions without
+    // creating an audio file; the managed recorder never submits PCM.
     while let Some(chunk) = session.audio_queue.pop() {
-        let target = if chunk.bus_id == 3 {
-            &mut bgm
-        } else {
-            &mut writer
-        };
-        if let Some(writer) = target.as_mut() {
-            write_audio_chunk(writer, &chunk)?;
-        }
         session.audio_queue.recycle(chunk);
-    }
-    for writer in [&mut writer, &mut bgm].into_iter().flatten() {
-        writer
-            .flush()
-            .map_err(|error| format!("cannot flush audio sidecar: {error}"))?;
     }
     Ok(())
 }
 
-fn audio_sidecar_path(config: &CaptureConfig) -> Option<PathBuf> {
-    config
-        .output_path
-        .as_ref()
-        .map(|path| PathBuf::from(format!("{path}.sfxchunks")))
-}
-
+#[cfg(test)]
 fn write_audio_chunk(writer: &mut impl Write, chunk: &AudioChunk) -> Result<(), String> {
     let frames = chunk.samples.len() / chunk.channels as usize;
     writer
@@ -1205,10 +1168,11 @@ pub unsafe extern "C" fn mqol_capture_last_error(buffer: *mut c_char, capacity: 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mqol_recording_finalize(plan_json: *const u8, plan_length: usize) -> i32 {
     // SAFETY: Forward the same validated buffer to the extended entry point without a callback.
-    unsafe { mqol_recording_finalize_with_progress(plan_json, plan_length, None, ptr::null_mut()) }
+    unsafe { mqol_recording_finalize_with_progress(plan_json, plan_length, None, ptr::null_mut(), None, ptr::null_mut()) }
 }
 
 type FinalizeProgressCallback = unsafe extern "C" fn(f32, *mut c_void);
+type FinalizeSfxCallback = unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut c_void) -> i32;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mqol_recording_finalize_with_progress(
@@ -1216,6 +1180,8 @@ pub unsafe extern "C" fn mqol_recording_finalize_with_progress(
     plan_length: usize,
     progress: Option<FinalizeProgressCallback>,
     progress_context: *mut c_void,
+    render_sfx: Option<FinalizeSfxCallback>,
+    render_sfx_context: *mut c_void,
 ) -> i32 {
     ffi_status(|| {
         #[cfg(feature = "ffmpeg")]
@@ -1231,7 +1197,7 @@ pub unsafe extern "C" fn mqol_recording_finalize_with_progress(
                     // SAFETY: The caller keeps the callback and context alive for this synchronous call.
                     unsafe { callback(value, progress_context) };
                 }
-            })
+            }, render_sfx, render_sfx_context)
             .map_err(|error| {
                 set_last_error(error.to_string());
                 ERR_CAPTURE
@@ -1240,7 +1206,7 @@ pub unsafe extern "C" fn mqol_recording_finalize_with_progress(
         }
         #[cfg(not(feature = "ffmpeg"))]
         {
-            let _ = (plan_json, plan_length, progress, progress_context);
+            let _ = (plan_json, plan_length, progress, progress_context, render_sfx, render_sfx_context);
             set_last_error("native FFmpeg finalization is unavailable in this build");
             Err(ERR_PLATFORM)
         }
