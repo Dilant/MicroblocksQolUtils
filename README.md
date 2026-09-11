@@ -27,6 +27,25 @@ MiaoNet、CollabUtils2 和 SpeedrunTool 都是运行时可选集成，不是硬�
 
 ### HUD 与小地图
 
+### 高帧率显示
+
+Celeste 的游戏逻辑仍然固定在 60 Hz。安装可选的 MotionSmoothing 模组并打开其
+解耦 Tick 后，本模组会自动识别它，并让录制和 HUD 与插值后的显示保持兼容。
+可以在 Everest 控制台执行 `qol_framestat` 查看当前识别状态。
+
+这里没有把 FSR Frame Generation 或 NVIDIA DLSS Frame Generation 做成后处理开关。
+这些技术需要渲染器提供 swapchain，以及每帧的颜色、深度和运动向量纹理；Celeste
+使用的 FNA/XNA 2D 渲染器没有这个接入点。直接插值最终画面还会破坏像素边缘、菜单、
+粒子和游戏时序。显卡驱动支持时仍可在模组之外使用驱动级帧生成，但它不属于本模组。
+
+本项目的 native hook 已经位于 D3D11 `IDXGISwapChain::Present` 边界，这适合做诊断，
+但对正确接入 FSR/DLSS 来说已经太晚：此时只剩合成后的 backbuffer。再增加一个
+Present hook 只会重复这张最终图像，无法提供帧生成所需的深度和运动向量输入。
+
+对 Celeste 来说，MotionSmoothing 是游戏内可用的方案：它只插值摄像机和角色的显示，
+同时保持 60 Hz 物理逻辑。不要同时启用两层插值；如果启用了驱动级帧生成后出现画面
+伪影或额外延迟，请关闭驱动级功能。
+
 - 滚动 FPS、CPU 帧耗时，以及在 Motion Smoothing 可用时分别显示物理帧率和渲染帧率。
 - 可选帧卡顿提示和帧分析 HUD。
 - 基于当前固体网格绘制的圆形/方形小地图：
