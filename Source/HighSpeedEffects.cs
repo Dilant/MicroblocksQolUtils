@@ -254,11 +254,6 @@ public static class HighSpeedEffects {
 
         float intensity = Intensity;
         Vector2 direction = ScreenDirection(player, fx);
-        Vector2 focus = player.Center - level.Camera.Position;
-        if (SaveData.Instance.Assists.MirrorMode) {
-            focus.X = 320f - focus.X;
-            direction.X = -direction.X;
-        }
         float offset = MathF.Max(0.5f, (0.2f + 1.1f * heat) * intensity);
 
         GraphicsDevice device = Engine.Instance.GraphicsDevice;
@@ -273,8 +268,8 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
 
         // Rebuild the level as the clean image plus wake-masked copies. Each
-        // masked layer is composed in tempB as: clear, draw the mask (black
-        // outside the fan), multiply the shifted copy — so nothing leaks outside
+        // masked layer is composed in tempB as: clear, draw the mask chain (black
+        // outside the wake), multiply the shifted copy — so nothing leaks outside
         // the wake region, then it is accumulated additively into the level.
         device.SetRenderTarget(levelBuffer);
         device.Clear(Color.Transparent);
@@ -282,10 +277,10 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.Draw(tempA, Vector2.Zero, Color.White);
         Draw.SpriteBatch.End();
 
-        DrawMaskedLayer(device, tempB, tempA, direction * offset, focus, direction, heat, new Color(255, 0, 0, 255));
-        DrawMaskedLayer(device, tempB, tempA, -direction * offset, focus, direction, heat, new Color(0, 0, 255, 255));
+        DrawMaskedLayer(device, tempB, tempA, direction * offset, level, fx, heat, new Color(255, 0, 0, 255));
+        DrawMaskedLayer(device, tempB, tempA, -direction * offset, level, fx, heat, new Color(0, 0, 255, 255));
         // A faint self-overlap copy inside the wake acts as a saturation boost.
-        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, focus, direction, heat, new Color(52, 52, 52, 255));
+        DrawMaskedLayer(device, tempB, tempA, Vector2.Zero, level, fx, heat, new Color(52, 52, 52, 255));
     }
 
     private static void BeginSprite(BlendState blend, SamplerState sampler)
@@ -293,11 +288,11 @@ public static class HighSpeedEffects {
             DepthStencilState.None, RasterizerState.CullNone);
 
     private static void DrawMaskedLayer(GraphicsDevice device, RenderTarget2D work, RenderTarget2D source,
-        Vector2 shift, Vector2 focus, Vector2 direction, float heat, Color tint) {
+        Vector2 shift, Level level, PlayerFx fx, float heat, Color tint) {
         device.SetRenderTarget(work);
         device.Clear(Color.Transparent);
-        BeginSprite(BlendState.AlphaBlend, SamplerState.LinearClamp);
-        DrawWakeMask(focus, direction, heat);
+        BeginSprite(BlendState.Additive, SamplerState.LinearClamp);
+        DrawWakeMasks(level, fx, heat);
         Draw.SpriteBatch.End();
         BeginSprite(MultiplyBlend, SamplerState.PointClamp);
         Draw.SpriteBatch.Draw(source, shift, tint);
@@ -309,19 +304,34 @@ public static class HighSpeedEffects {
         Draw.SpriteBatch.End();
     }
 
-    // A fan-shaped mask: bright at the apex (right edge midpoint), fading toward
-    // the left opening — used to clip the aberration layer to the wake region.
-    private static void DrawWakeMask(Vector2 focus, Vector2 direction, float heat) {
+    // The aberration region follows the trail itself: one small fan per recent
+    // trail point, aimed along that segment's direction and dimming with age —
+    // the chromatic fringe traces the path the player actually took.
+    private static void DrawWakeMasks(Level level, PlayerFx fx, float heat) {
         Texture2D mask = GetWakeMaskTexture();
-        // The fan apex sits at the right edge of the texture and opens leftward;
-        // aligning the +x axis with the motion points the fan back over the wake.
-        float length = MathHelper.Clamp(56f + 130f * heat, 64f, 190f);
-        float spread = MathHelper.Clamp(10f + 26f * heat, 12f, 40f);
-        Draw.SpriteBatch.Draw(mask, focus, null, Color.White,
-            MathF.Atan2(direction.Y, direction.X),
-            new Vector2(mask.Width, mask.Height * 0.5f),
-            new Vector2(length / mask.Width, spread / (mask.Height * 0.5f)),
-            SpriteEffects.None, 0f);
+        bool mirror = SaveData.Instance?.Assists.MirrorMode == true;
+        for (int i = 0; i < fx.Count; i++) {
+            int index = (fx.Head - 1 - i + TrailSamples * 2) % TrailSamples;
+            int older = (fx.Head - 2 - i + TrailSamples * 2) % TrailSamples;
+            Vector2 point = fx.Positions[index];
+            Vector2 delta = point - fx.Positions[older];
+            if (delta.LengthSquared() < 1f) continue;
+            Vector2 direction = Vector2.Normalize(delta);
+            float age = i / (float)TrailSamples;
+            Vector2 focus = point - level.Camera.Position;
+            if (mirror) {
+                focus.X = 320f - focus.X;
+                direction.X = -direction.X;
+            }
+            float segment = MathHelper.Clamp(delta.Length() * 1.4f, 26f, 72f);
+            float spread = (9f + 18f * heat) * (0.5f + 0.5f * (1f - age));
+            float brightness = MathF.Pow(1f - age, 1.2f) * 0.9f;
+            Draw.SpriteBatch.Draw(mask, focus, null, Color.White * brightness,
+                MathF.Atan2(direction.Y, direction.X),
+                new Vector2(mask.Width, mask.Height * 0.5f),
+                new Vector2(segment / mask.Width, spread / (mask.Height * 0.5f)),
+                SpriteEffects.None, 0f);
+        }
     }
 
     // The water surface: propagate the classic two-buffer wave simulation, then
@@ -385,13 +395,16 @@ public static class HighSpeedEffects {
         fieldCamera += new Vector2(deltaX, deltaY);
     }
 
+    // Camera-space index i maps to world i + camera. After the camera moves by
+    // delta, the new buffer must therefore read from the OLD index i + delta so
+    // the waves stay anchored to the world instead of sliding with the screen.
     private static void ShiftBuffer(float[] buffer, int deltaX, int deltaY) {
         Array.Clear(WaveScratch);
         for (int y = 0; y < FieldHeight; y++) {
-            int sourceY = y - deltaY;
+            int sourceY = y + deltaY;
             if (sourceY < 0 || sourceY >= FieldHeight) continue;
             for (int x = 0; x < FieldWidth; x++) {
-                int sourceX = x - deltaX;
+                int sourceX = x + deltaX;
                 if (sourceX < 0 || sourceX >= FieldWidth) continue;
                 WaveScratch[y * FieldWidth + x] = buffer[sourceY * FieldWidth + sourceX];
             }
