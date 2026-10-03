@@ -66,8 +66,48 @@ internal static class AudioReplayTests {
         Check(!AudioEventReplayRenderer.RenderCommandsToSidecar(
             [new(0, 1, "event:/missing/replay-regression", "start", Bus: "music")], sidecar, 1),
             "Missing music event was reported as success");
+        TestStreamPrime(studio, output);
         TestModBank(studio, output);
         TestSfx(studio, output);
+    }
+
+    private static void TestStreamPrime(FMOD.Studio.System studio, string output) {
+        // Streamed music decodes on FMOD's wall-clock stream thread. Offline replay
+        // runs far faster than real time and must not record its buffering gap.
+        const string remix = "event:/music/remix/04_cliffside";
+        Ok(studio.getEvent(remix, out var description));
+        Ok(description.isStream(out bool stream)); Check(stream, "Test music is not streamed");
+        string sidecar = Path.Combine(output, "stream-prime.bgmchunks");
+        AudioInstanceState At(int timeline) => new(new Dictionary<string, float>(), 1, 1, false, timeline, null);
+        // Studio schedules every new event a few mixer blocks ahead; that latency is
+        // also present live. Only silence beyond a sample-loaded event's start is a gap.
+        double Lead(string path, int timeline, double restartAt) {
+            // IMMEDIATE stop, so the restart measures a stream opened mid-render.
+            AudioCommand[] commands = [
+                new(0, 1, path, "start", Bus: "music", State: At(timeline)),
+                new((ulong)((restartAt - 0.5) * 1e9), 1, path, "stop", Bus: "music", Value: 1),
+                new((ulong)(restartAt * 1e9), 2, path, "start", Bus: "music", State: At(timeline + 3000))];
+            Check(AudioEventReplayRenderer.RenderCommandsToSidecar(commands, sidecar, restartAt + 3), "Stream render failed");
+            float[] samples = ReadSamples(sidecar);
+            return Math.Max(LeadingSilence(samples, 0), LeadingSilence(samples, restartAt));
+        }
+        double reference = Lead("event:/music/lvl1/main", 0, 3);
+        Console.WriteLine($"Sample-loaded music start latency: {reference * 1000:F1}ms");
+        foreach (int timeline in new[] { 40_000, 0 }) {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                double lead = Lead(remix, timeline, 3);
+                Console.WriteLine($"Stream @{timeline}ms try {attempt}: worst start silence {lead * 1000:F1}ms, " +
+                    $"render {clock.ElapsedMilliseconds}ms");
+                Check(lead < reference + 0.03, $"Streamed BGM started with {lead:F3}s of silence");
+            }
+        }
+    }
+
+    private static double LeadingSilence(float[] samples, double from) {
+        for (int i = (int)(from * 48000) * 2; i < samples.Length; i++)
+            if (Math.Abs(samples[i]) > 1e-4f) return i / 96000d - from;
+        return samples.Length / 96000d - from;
     }
 
     private static void TestSfx(FMOD.Studio.System studio, string output) {
