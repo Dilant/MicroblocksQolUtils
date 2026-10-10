@@ -188,7 +188,32 @@ internal static class AudioReplayTests {
         double dashRms = Rms(dashSamples, 0, 1);
         Console.WriteLine($"Dash SFX RMS: {dashRms:F6}");
         Check(dashRms > .002, $"Dash SFX rendered silent (RMS {dashRms:F6})");
+        TestManagedPlayCapture();
         Console.WriteLine("PASS one-shot completion, loop stops, discarded events, metadata splits and exact sample counts");
+    }
+
+    // FMOD's EventInstance.start is a tiny wrapper the JIT can inline into Celeste.Audio.Play,
+    /// which makes a detour on it miss positional gameplay SFX entirely. Celeste's own audio
+    /// entry points are NoInlining, so they must capture the command exactly once.
+    private static void TestManagedPlayCapture() {
+        (string Name, Action Play)[] calls = [
+            ("positional", () => Celeste.Audio.Play("event:/char/madeline/dash_red_left",
+                new Microsoft.Xna.Framework.Vector2(-60, 8), null, 0f, "raining", 0f)),
+            ("plain", () => Celeste.Audio.Play("event:/char/madeline/jump")),
+            ("loop", () => Celeste.Audio.Loop("event:/char/madeline/wallslide", new Microsoft.Xna.Framework.Vector2(10, 4)))
+        ];
+        foreach (var (name, play) in calls) {
+            string journalPath = Path.Combine(Path.GetTempPath(), $"mqol-managed-{name}-{Guid.NewGuid():N}.sfxevents");
+            AudioEventCapture.Suppress = false;
+            using (var journal = new AudioEventJournal(journalPath)) {
+                journal.Start(SdlFrameSource.ClockNanos());
+                play();
+            }
+            List<string> lines = [.. File.ReadAllLines(journalPath)];
+            File.Delete(journalPath);
+            int starts = lines.Count(line => line.Contains("\"Operation\":\"start\""));
+            Check(starts == 1, $"Audio.Play/Loop ({name}) journalled {starts} start commands instead of 1");
+        }
     }
 
     private sealed class BankAsset(byte[] data) : Celeste.Mod.ModAsset(null!) {
