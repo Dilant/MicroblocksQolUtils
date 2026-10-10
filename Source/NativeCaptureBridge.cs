@@ -509,7 +509,8 @@ public sealed class NativeCaptureSession : IDisposable {
                             ? LogLevel.Info : LogLevel.Warn;
                         Logger.Log(level, "MicroblocksQolUtils/Recorder",
                             $"SFX event journal: {sfxJournal.EventCount} events, "
-                            + $"{sfxJournal.StartCount} starts, {sfxJournal.DroppedCount} dropped"
+                            + $"{sfxJournal.StartCount} starts ({sfxJournal.StartBreakdown}), "
+                            + $"{sfxJournal.DroppedCount} dropped"
                             + (AudioEventCapture.Failure is { } failure ? $", hook failure: {failure}" : ""));
                     }
                     if (journalError is not null) throw journalError;

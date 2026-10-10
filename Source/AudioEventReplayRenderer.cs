@@ -23,8 +23,39 @@ internal static class AudioEventReplayRenderer {
     internal static bool RenderToSidecar(string journalPath, string sidecarPath,
         IReadOnlyList<RecordingClip> clips) {
         AudioEventSource source = AudioEventSource.Read(journalPath);
-        return RenderToSidecar(new AudioEventSource(0, PlanSfxCommands(source, clips)),
+        IReadOnlyList<AudioCommand> planned = PlanSfxCommands(source, clips);
+        ReportStartBreakdown(source.Commands, planned);
+        return RenderToSidecar(new AudioEventSource(0, planned),
             sidecarPath, clips.Sum(c => c.DurationSeconds), clips);
+    }
+
+    /// <summary>Per-event start counts decide whether a "silent event" report means the
+    /// capture never saw it or the retained clips cut it out.</summary>
+    private static void ReportStartBreakdown(IReadOnlyList<AudioCommand> journal,
+        IReadOnlyList<AudioCommand> planned) {
+        static string Breakdown(IReadOnlyList<AudioCommand> commands) {
+            Dictionary<string, int> counts = new(StringComparer.Ordinal);
+            int dashes = 0, total = 0;
+            foreach (AudioCommand command in commands) {
+                if (command.Operation != "start") continue;
+                total++;
+                if (command.EventPath.Contains("dash_", StringComparison.Ordinal)) dashes++;
+                counts[command.EventPath] = counts.GetValueOrDefault(command.EventPath) + 1;
+            }
+            string top = string.Join(", ", counts.OrderByDescending(pair => pair.Value).Take(5)
+                .Select(pair => $"{Path.GetFileName(pair.Key)}={pair.Value}"));
+            return $"{total} starts (dash={dashes}{(top.Length == 0 ? "" : ", " + top)})";
+        }
+        int journalDashes = journal.Count(command => command.Operation == "start"
+            && command.EventPath.Contains("dash_", StringComparison.Ordinal));
+        int plannedDashes = planned.Count(command => command.Operation == "start"
+            && command.EventPath.Contains("dash_", StringComparison.Ordinal));
+        Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Recorder/OfflineAudio",
+            $"SFX journal {Breakdown(journal)} -> planned {Breakdown(planned)}");
+        if (journalDashes > 0 && plannedDashes == 0)
+            Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder/OfflineAudio",
+                $"SFX journal holds {journalDashes} dash start(s) but none fall inside the retained clips; "
+                + "dash sounds will be missing from the export");
     }
 
     internal static bool RenderCommandsToSidecar(IReadOnlyList<AudioCommand> commands,

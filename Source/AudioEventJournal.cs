@@ -19,6 +19,7 @@ internal sealed class AudioEventJournal : IDisposable {
     private long sequence;
     private long starts;
     private long dropped;
+    private readonly Dictionary<string, int> startsByPath = new(StringComparer.Ordinal);
     private bool closed, incomplete;
     private Exception? failure;
 
@@ -26,6 +27,19 @@ internal sealed class AudioEventJournal : IDisposable {
     internal long EventCount => Interlocked.Read(ref sequence);
     internal long StartCount => Interlocked.Read(ref starts);
     internal long DroppedCount => Interlocked.Read(ref dropped);
+
+    /// <summary>Most frequent start events, so a missing event class is visible in the log.</summary>
+    internal string StartBreakdown {
+        get {
+            lock (Gate) {
+                int dashes = startsByPath.Where(pair => pair.Key.Contains("dash_", StringComparison.Ordinal))
+                    .Sum(pair => pair.Value);
+                string top = string.Join(", ", startsByPath.OrderByDescending(pair => pair.Value).Take(5)
+                    .Select(pair => $"{pair.Key[(pair.Key.LastIndexOf('/') + 1)..]}={pair.Value}"));
+                return $"dash={dashes}{(top.Length == 0 ? "" : ", " + top)}";
+            }
+        }
+    }
 
     internal AudioEventJournal(string path, int capacity = 16384) {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
@@ -54,7 +68,10 @@ internal sealed class AudioEventJournal : IDisposable {
         lock (Gate) AcceptLocked(command);
     }
     private void AcceptLocked(AudioCommand command) {
-        if (command.Operation == "start") Interlocked.Increment(ref starts);
+        if (command.Operation == "start") {
+            Interlocked.Increment(ref starts);
+            startsByPath[command.EventPath] = startsByPath.GetValueOrDefault(command.EventPath) + 1;
+        }
         Enqueue(new {
             type = "event", sequence = ++sequence, command.TimestampNanos,
             command.InstanceId, command.EventPath, command.Operation, command.Parameter, command.Value
