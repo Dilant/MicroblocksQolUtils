@@ -179,6 +179,15 @@ internal static class AudioReplayTests {
             "Discarded boundary start leaked into SFX plan");
         Check(plan.Where(c => c.Operation == "start").Select(c => c.InstanceId).Distinct().Count() == 2,
             "A reused source instance controls the previous branch's tail");
+        // The player's dash is the loudest, most-reported gameplay event. A captured
+        // journal entry for it must survive the clip-planned render at full level, and
+        // the renderer must report a non-silent peak for the diagnostics log.
+        const string dash = "event:/char/madeline/dash_red_left";
+        RecordingClip[] dashClip = [new("run.mkv", 20, 1.5, "", 0)];
+        float[] dashSamples = Render("sfx-dash", [new(20_000_000_000, 7, dash, "start", Bus: "sfx")], dashClip);
+        double dashRms = Rms(dashSamples, 0, 1);
+        Console.WriteLine($"Dash SFX RMS: {dashRms:F6}");
+        Check(dashRms > .002, $"Dash SFX rendered silent (RMS {dashRms:F6})");
         Console.WriteLine("PASS one-shot completion, loop stops, discarded events, metadata splits and exact sample counts");
     }
 

@@ -17,8 +17,15 @@ internal sealed class AudioEventJournal : IDisposable {
     private readonly Channel<object> queue;
     private readonly Task writerTask;
     private long sequence;
+    private long starts;
+    private long dropped;
     private bool closed, incomplete;
     private Exception? failure;
+
+    /// <summary>Journal diagnostics surfaced with the recording's stop/render log lines.</summary>
+    internal long EventCount => Interlocked.Read(ref sequence);
+    internal long StartCount => Interlocked.Read(ref starts);
+    internal long DroppedCount => Interlocked.Read(ref dropped);
 
     internal AudioEventJournal(string path, int capacity = 16384) {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
@@ -47,6 +54,7 @@ internal sealed class AudioEventJournal : IDisposable {
         lock (Gate) AcceptLocked(command);
     }
     private void AcceptLocked(AudioCommand command) {
+        if (command.Operation == "start") Interlocked.Increment(ref starts);
         Enqueue(new {
             type = "event", sequence = ++sequence, command.TimestampNanos,
             command.InstanceId, command.EventPath, command.Operation, command.Parameter, command.Value
@@ -58,7 +66,9 @@ internal sealed class AudioEventJournal : IDisposable {
         lock (Gate) Enqueue(new { type = "origin", timestampNanos });
     }
     private void Enqueue(object value) {
-        if (!closed && !queue.Writer.TryWrite(value)) incomplete = true;
+        // A full queue drops the command silently from the recording's point of view.
+        // Count it so a silent SFX track can be told apart from a lost event stream.
+        if (!closed && !queue.Writer.TryWrite(value)) { incomplete = true; Interlocked.Increment(ref dropped); }
     }
     internal void Finish(bool complete) {
         lock (Gate) {

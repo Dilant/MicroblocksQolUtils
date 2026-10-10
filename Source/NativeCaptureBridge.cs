@@ -156,6 +156,10 @@ public static class NativeCaptureBridge {
                     sfxCallback,
                     sfxHandle.IsAllocated ? GCHandle.ToIntPtr(sfxHandle) : IntPtr.Zero
                 ), sfxContext?.Error is Exception error ? $"finalize SFX ({error.Message})" : "finalize");
+                LastFinalizeMissingSfx = sfxContext?.SfxMissing ?? sfxCallback is null;
+                if (LastFinalizeMissingSfx)
+                    Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder",
+                        "Exported video has no gameplay SFX track; keeping the source files for a re-render");
                 progress?.Invoke(1d);
                 GC.KeepAlive(callback);
                 GC.KeepAlive(sfxCallback);
@@ -170,7 +174,12 @@ public static class NativeCaptureBridge {
         internal SfxRenderContext(bool reconstructBgm) => ReconstructBgm = reconstructBgm;
         public bool ReconstructBgm { get; }
         public Exception? Error;
+        /// <summary>The export's SFX track is missing or silent; callers keep the sources.</summary>
+        public bool SfxMissing;
     }
+
+    /// <summary>Set by the last finalize call: its SFX track was missing or silent.</summary>
+    internal static bool LastFinalizeMissingSfx { get; private set; }
 
     private sealed record FinalizeClipDto(
         [property: JsonPropertyName("source")] string Source,
@@ -206,8 +215,29 @@ public static class NativeCaptureBridge {
                 clip.SeamlessFromPrevious, clip.BgmFollowsVideo)).ToArray();
             if (clips.Length == 0) throw new InvalidDataException("native SFX render clip list is empty");
             string journal = clips[0].Source + ".sfxevents";
-            if (File.Exists(journal) && !AudioEventReplayRenderer.RenderToSidecar(journal, sidecar, clips))
+            long journalBytes = File.Exists(journal) ? new FileInfo(journal).Length : -1;
+            Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Recorder/EventReplay",
+                $"Export {clips.Length} clip(s) from {Path.GetFileName(clips[0].Source)}: "
+                + $"SFX journal {(journalBytes < 0 ? "missing" : journalBytes + " bytes")}");
+            // A missing journal is not an export failure: the video is still valid and the
+            // music journal can still be mixed. It must never pass silently, though, because
+            // the result is a recording whose gameplay SFX are simply absent.
+            if (!File.Exists(journal)) {
+                renderContext.SfxMissing = true;
+                Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder/EventReplay",
+                    $"SFX event journal is missing ({journal}); exporting with music only");
+            } else if (!AudioEventReplayRenderer.RenderToSidecar(journal, sidecar, clips)) {
+                renderContext.SfxMissing = true;
                 throw new InvalidDataException("offline FMOD SFX rendering produced no samples");
+            } else if (!SidecarHasAudio(sidecar)) {
+                // The renderer reports success for a silent mix (it only needs to write
+                // frames). A silent SFX sidecar means every recorded start was outside the
+                // retained clip windows or the journal never captured one.
+                renderContext.SfxMissing = true;
+                Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder/EventReplay",
+                    $"SFX journal {Path.GetFileName(journal)} replayed as silence; "
+                    + "the exported video will have music without gameplay sound effects");
+            }
             string musicJournal = clips[0].Source + ".music.jsonl";
             string musicSidecar = Path.ChangeExtension(sidecar, "bgmchunks");
             if (File.Exists(musicJournal) && !MusicEventReplayRenderer.RenderToSidecar(
@@ -215,8 +245,10 @@ public static class NativeCaptureBridge {
                 throw new InvalidDataException("offline FMOD music rendering produced no samples");
             return 0;
         } catch (Exception exception) {
-            if (context != IntPtr.Zero && GCHandle.FromIntPtr(context).Target is SfxRenderContext renderContext)
+            if (context != IntPtr.Zero && GCHandle.FromIntPtr(context).Target is SfxRenderContext renderContext) {
                 renderContext.Error = exception;
+                renderContext.SfxMissing = true;
+            }
             Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/EventReplay");
             return 1;
         }
@@ -226,6 +258,30 @@ public static class NativeCaptureBridge {
         byte[] bytes = new byte[length];
         if (length != 0) Marshal.Copy(pointer, bytes, 0, length);
         return bytes;
+    }
+
+    /// <summary>True when a rendered sidecar contains at least one non-zero sample.</summary>
+    private static bool SidecarHasAudio(string path) {
+        try {
+            using FileStream stream = File.OpenRead(path);
+            using var reader = new BinaryReader(stream);
+            if (stream.Length < 8 || new string(reader.ReadChars(8)) != "MQOLAUD1") return false;
+            while (stream.Position + 24 <= stream.Length) {
+                _ = reader.ReadUInt64(); _ = reader.ReadInt32();
+                _ = reader.ReadUInt16(); _ = reader.ReadUInt16();
+                _ = reader.ReadUInt32();
+                uint count = reader.ReadUInt32();
+                long bytes = (long)count * sizeof(float);
+                if (bytes < 0 || stream.Position + bytes > stream.Length) return false;
+                for (uint index = 0; index < count; index++) {
+                    if (Math.Abs(reader.ReadSingle()) > 1e-4f) return true;
+                }
+            }
+            return false;
+        } catch (Exception exception) {
+            Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/EventReplay");
+            return false;
+        }
     }
 
     private static void ReportFinalizeProgress(float value, IntPtr context) {
@@ -445,6 +501,17 @@ public sealed class NativeCaptureSession : IDisposable {
                     try { musicJournal?.Finish(complete); } catch (Exception e) { journalError = e; }
                     try { audioEventJournal?.Finish(complete && AudioEventCapture.Failure is null); }
                     catch (Exception e) { journalError ??= e; }
+                    // The journals are deleted after a successful export, so their content
+                    // must be summarised here: a recording whose SFX journal holds no start
+                    // command can never render gameplay sound effects afterwards.
+                    if (audioEventJournal is { } sfxJournal) {
+                        LogLevel level = sfxJournal.StartCount > 0 && sfxJournal.DroppedCount == 0
+                            ? LogLevel.Info : LogLevel.Warn;
+                        Logger.Log(level, "MicroblocksQolUtils/Recorder",
+                            $"SFX event journal: {sfxJournal.EventCount} events, "
+                            + $"{sfxJournal.StartCount} starts, {sfxJournal.DroppedCount} dropped"
+                            + (AudioEventCapture.Failure is { } failure ? $", hook failure: {failure}" : ""));
+                    }
                     if (journalError is not null) throw journalError;
                 } finally { musicJournal?.Dispose(); audioEventJournal?.Dispose(); }
             }

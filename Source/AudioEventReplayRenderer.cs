@@ -92,6 +92,18 @@ internal static class AudioEventReplayRenderer {
                 }
                 Check(studio.flushCommands(), "flush offline Studio commands");
                 capture.Detach(master);
+                // Audio that renders as digital silence is indistinguishable from a
+                // recording whose journal never captured a start. Report both numbers so
+                // a "missing dash" report can be told apart from a broken replay.
+                int starts = commands.Count(command => command.Operation == "start");
+                string label = busId == 3 ? "music" : "SFX";
+                Logger.Log(LogLevel.Info, "MicroblocksQolUtils/Recorder/OfflineAudio",
+                    $"Offline {label} render: {commands.Count} commands ({starts} starts), "
+                    + $"{capture.WrittenFrames} frames, peak {capture.Peak:F5}");
+                if (busId != 3 && (starts == 0 || capture.Peak <= 1e-4f))
+                    Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder/OfflineAudio",
+                        $"Offline {label} track is silent ({starts} starts, peak {capture.Peak:F5}); "
+                        + "the exported video will play without gameplay sound effects");
                 return capture.WrittenFrames > 0;
             } catch (Exception exception) {
                 Logger.LogDetailed(exception, "MicroblocksQolUtils/Recorder/OfflineSfx");
@@ -359,6 +371,8 @@ internal static class AudioEventReplayRenderer {
         private float[] monoToStereo = [];
         private Exception? failure;
         internal long WrittenFrames { get; private set; }
+        /// <summary>Largest absolute sample written; zero means the track is digital silence.</summary>
+        internal float Peak { get; private set; }
         /// <summary>While set, mixed blocks belong to no output time and are discarded.</summary>
         internal volatile bool Hold;
         internal double TimeSeconds => timelineFrame / (double)SampleRate;
@@ -423,6 +437,10 @@ internal static class AudioEventReplayRenderer {
                         writer.Write((uint)frames); writer.Write((uint)(frames * Channels));
                         writer.Write(MemoryMarshal.AsBytes(samples.Slice(first * Channels, frames * Channels)));
                         WrittenFrames += frames;
+                        for (int sample = 0; sample < frames * Channels; sample++) {
+                            float value = Math.Abs(samples[first * Channels + sample]);
+                            if (value > Peak) Peak = value;
+                        }
                         first += frames;
                     }
                 }
