@@ -68,6 +68,7 @@ internal static class RecordingRecovery {
     }
 
     internal static string[] SourceFiles(string source) => [source, source + ".sfxchunks", source + ".bgmchunks",
-        source + ".music.jsonl", source + ".capture.json", ManifestPath(source), ManifestPath(source) + ".new"];
+        source + ".sfxevents", source + ".music.jsonl", source + ".capture.json",
+        ManifestPath(source), ManifestPath(source) + ".new"];
     private sealed record CheckpointData(int Version, double Seconds);
 }

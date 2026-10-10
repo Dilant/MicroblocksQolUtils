@@ -1097,6 +1097,12 @@ public static class AutoRecorder {
                     preferVideoCopy: job.PreferVideoCopy
                 ).ConfigureAwait(false)) {
                     completed = false;
+                } else if (NativeCaptureBridge.LastFinalizeMissingSfx) {
+                    // Keep the source mkv and the event journals: an export without a
+                    // gameplay SFX track can only be repaired from them.
+                    completed = false;
+                    Logger.Log(LogLevel.Warn, "MicroblocksQolUtils/Recorder",
+                        $"Export {Path.GetFileName(job.Output)} has no SFX track; keeping the recording sources for a re-render");
                 }
                 lock (FinalizationProgressLock) {
                     string path = Path.GetFullPath(job.Output);
@@ -1110,7 +1116,7 @@ public static class AutoRecorder {
                 Logger.Log(
                     LogLevel.Warn,
                     "MicroblocksQolUtils/Recorder",
-                    $"Finalization failed; preserved continuous recording files under {Path.GetDirectoryName(temporaryFiles.FirstOrDefault() ?? "")}"
+                    $"Finalization did not produce a complete export; preserved continuous recording files under {Path.GetDirectoryName(temporaryFiles.FirstOrDefault() ?? "")}"
                 );
             }
             CleanupRecordings();
