@@ -6,6 +6,11 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 internal static class AudioEventCapture {
     private static readonly List<Hook> Hooks = [];
     private static readonly Dictionary<IntPtr, ulong> Instances = [];
+    // FMOD's own command wrappers (EventInstance.start/stop/...) are tiny methods that the
+    // JIT inlines into their caller. When that happens the detour is bypassed and the
+    // command never reaches the journal, so the matching Celeste.Audio entry points (which
+    // are marked NoInlining) are observed as well and de-duplicated here.
+    private static readonly HashSet<IntPtr> StartedByBinding = [];
     private static readonly object Gate = new();
     private static ulong nextId;
     [ThreadStatic] internal static bool Suppress;
@@ -25,7 +30,123 @@ internal static class AudioEventCapture {
             Hooks.Add(new Hook(typeof(FMOD.Studio.EventInstance).GetMethod("setPitch")!, (setPitchHook)setPitch));
             Hooks.Add(new Hook(typeof(FMOD.Studio.EventInstance).GetMethod("set3DAttributes")!, (set3DHook)set3D));
             Hooks.Add(new Hook(typeof(FMOD.Studio.System).GetMethod("setListenerAttributes")!, (listenerHook)listener));
+            AddManagedHooks();
         } catch (Exception e) { Unload(); Failure = e.Message; }
+    }
+    private static void AddManagedHooks() {
+        Type vector = typeof(Microsoft.Xna.Framework.Vector2);
+        Add("Play", [], (playHook)play0);
+        Add("Play", [typeof(string), typeof(float)], (playParamHook)playParam);
+        Add("Play", [vector], (playPositionHook)playPosition);
+        Add("Play", [vector, typeof(string), typeof(float)], (playPositionParamHook)playPositionParam);
+        Add("Play", [vector, typeof(string), typeof(float), typeof(string), typeof(float)], (playPositionParamsHook)playPositionParams);
+        Add("Loop", [], (loopHook)loop0);
+        Add("Loop", [typeof(string), typeof(float)], (loopParamHook)loopParam);
+        Add("Loop", [vector], (loopPositionHook)loopPosition);
+        Add("Loop", [vector, typeof(string), typeof(float)], (loopPositionParamHook)loopPositionParam);
+        Hooks.Add(new Hook(typeof(Audio).GetMethod("Stop")!, (stopInstanceHook)stopInstance));
+        Hooks.Add(new Hook(typeof(Audio).GetMethod("Pause")!, (pauseInstanceHook)pauseInstance));
+        Hooks.Add(new Hook(typeof(Audio).GetMethod("Resume")!, (resumeInstanceHook)resumeInstance));
+        Hooks.Add(new Hook(typeof(Audio).GetMethod("SetParameter")!, (setParameterHook)setParameter));
+
+        void Add(string name, Type[] parameters, Delegate detour) {
+            System.Reflection.MethodInfo? method = parameters.Length == 0
+                ? typeof(Audio).GetMethod(name, [typeof(string)])
+                : typeof(Audio).GetMethod(name, [typeof(string), .. parameters]);
+            if (method is null) throw new MissingMethodException($"Audio.{name} overload is unavailable");
+            Hooks.Add(new Hook(method, detour));
+        }
+    }
+    /// <summary>The binding-level start hook recorded this instance already.</summary>
+    private static bool MarkBindingStart(FMOD.Studio.EventInstance instance) {
+        lock (Gate) {
+            if (StartedByBinding.Count > 4096) StartedByBinding.Clear();
+            return StartedByBinding.Add(instance.getRaw());
+        }
+    }
+    /// <summary>Celeste.Audio started an instance; journal it unless the binding hook did.</summary>
+    private static void NoteManagedStart(FMOD.Studio.EventInstance? instance) {
+        if (Suppress || instance is null || !instance.isValid()) return;
+        lock (Gate) if (!StartedByBinding.Remove(instance.getRaw())) Record(instance, "start", null, null);
+    }
+    private delegate FMOD.Studio.EventInstance playHook(playOrig orig, string path);
+    private delegate FMOD.Studio.EventInstance playOrig(string path);
+    private static FMOD.Studio.EventInstance play0(playOrig orig, string path) {
+        FMOD.Studio.EventInstance result = orig(path); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance playParamHook(playParamOrig orig, string path, string param, float value);
+    private delegate FMOD.Studio.EventInstance playParamOrig(string path, string param, float value);
+    private static FMOD.Studio.EventInstance playParam(playParamOrig orig, string path, string param, float value) {
+        FMOD.Studio.EventInstance result = orig(path, param, value); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance playPositionHook(playPositionOrig orig, string path, Microsoft.Xna.Framework.Vector2 position);
+    private delegate FMOD.Studio.EventInstance playPositionOrig(string path, Microsoft.Xna.Framework.Vector2 position);
+    private static FMOD.Studio.EventInstance playPosition(playPositionOrig orig, string path, Microsoft.Xna.Framework.Vector2 position) {
+        FMOD.Studio.EventInstance result = orig(path, position); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance playPositionParamHook(playPositionParamOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value);
+    private delegate FMOD.Studio.EventInstance playPositionParamOrig(string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value);
+    private static FMOD.Studio.EventInstance playPositionParam(playPositionParamOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value) {
+        FMOD.Studio.EventInstance result = orig(path, position, param, value); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance playPositionParamsHook(playPositionParamsOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value, string param2, float value2);
+    private delegate FMOD.Studio.EventInstance playPositionParamsOrig(string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value, string param2, float value2);
+    private static FMOD.Studio.EventInstance playPositionParams(playPositionParamsOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value, string param2, float value2) {
+        FMOD.Studio.EventInstance result = orig(path, position, param, value, param2, value2);
+        NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance loopHook(loopOrig orig, string path);
+    private delegate FMOD.Studio.EventInstance loopOrig(string path);
+    private static FMOD.Studio.EventInstance loop0(loopOrig orig, string path) {
+        FMOD.Studio.EventInstance result = orig(path); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance loopParamHook(loopParamOrig orig, string path, string param, float value);
+    private delegate FMOD.Studio.EventInstance loopParamOrig(string path, string param, float value);
+    private static FMOD.Studio.EventInstance loopParam(loopParamOrig orig, string path, string param, float value) {
+        FMOD.Studio.EventInstance result = orig(path, param, value); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance loopPositionHook(loopPositionOrig orig, string path, Microsoft.Xna.Framework.Vector2 position);
+    private delegate FMOD.Studio.EventInstance loopPositionOrig(string path, Microsoft.Xna.Framework.Vector2 position);
+    private static FMOD.Studio.EventInstance loopPosition(loopPositionOrig orig, string path, Microsoft.Xna.Framework.Vector2 position) {
+        FMOD.Studio.EventInstance result = orig(path, position); NoteManagedStart(result); return result;
+    }
+    private delegate FMOD.Studio.EventInstance loopPositionParamHook(loopPositionParamOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value);
+    private delegate FMOD.Studio.EventInstance loopPositionParamOrig(string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value);
+    private static FMOD.Studio.EventInstance loopPositionParam(loopPositionParamOrig orig, string path,
+        Microsoft.Xna.Framework.Vector2 position, string param, float value) {
+        FMOD.Studio.EventInstance result = orig(path, position, param, value); NoteManagedStart(result); return result;
+    }
+    private delegate void stopInstanceHook(stopInstanceOrig orig, FMOD.Studio.EventInstance instance, bool allowFadeOut);
+    private delegate void stopInstanceOrig(FMOD.Studio.EventInstance instance, bool allowFadeOut);
+    private static void stopInstance(stopInstanceOrig orig, FMOD.Studio.EventInstance instance, bool allowFadeOut) {
+        orig(instance, allowFadeOut);
+        if (instance.isValid()) Record(instance, "stop", null, allowFadeOut ? 0f : 1f);
+    }
+    private delegate void pauseInstanceHook(pauseInstanceOrig orig, FMOD.Studio.EventInstance instance);
+    private delegate void pauseInstanceOrig(FMOD.Studio.EventInstance instance);
+    private static void pauseInstance(pauseInstanceOrig orig, FMOD.Studio.EventInstance instance) {
+        orig(instance);
+        if (instance.isValid()) Record(instance, "setPaused", null, 1f);
+    }
+    private delegate void resumeInstanceHook(resumeInstanceOrig orig, FMOD.Studio.EventInstance instance);
+    private delegate void resumeInstanceOrig(FMOD.Studio.EventInstance instance);
+    private static void resumeInstance(resumeInstanceOrig orig, FMOD.Studio.EventInstance instance) {
+        orig(instance);
+        if (instance.isValid()) Record(instance, "setPaused", null, 0f);
+    }
+    private delegate void setParameterHook(setParameterOrig orig, FMOD.Studio.EventInstance instance, string param, float value);
+    private delegate void setParameterOrig(FMOD.Studio.EventInstance instance, string param, float value);
+    private static void setParameter(setParameterOrig orig, FMOD.Studio.EventInstance instance, string param, float value) {
+        orig(instance, param, value);
+        if (instance.isValid()) Record(instance, "setParameterValue", param, value);
     }
     internal static void Unload() {
         foreach (var hook in Hooks) hook.Dispose();
@@ -112,7 +233,10 @@ internal static class AudioEventCapture {
     private delegate FMOD.RESULT startHook(startOrig orig, FMOD.Studio.EventInstance instance);
     private static FMOD.RESULT start(startOrig orig, FMOD.Studio.EventInstance instance) {
         var result = orig(instance);
-        if (result == FMOD.RESULT.OK) Record(instance, "start", null, null);
+        if (result == FMOD.RESULT.OK) {
+            MarkBindingStart(instance);
+            Record(instance, "start", null, null);
+        }
         return result;
     }
     private delegate FMOD.RESULT stopOrig(FMOD.Studio.EventInstance instance, FMOD.Studio.STOP_MODE mode);
