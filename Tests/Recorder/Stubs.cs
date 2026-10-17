@@ -9,15 +9,16 @@ namespace Monocle {
     public class Scene { }
     public class Entity { public Scene? Scene { get; set; } }
     public class Tracker { public Celeste.Player? Player; public T? GetEntity<T>() where T:class => Player as T; }
-    public class EntityList { public T? FindFirst<T>() where T:class => null; }
+    public class EntityList { public object? DeadBody; public T? FindFirst<T>() where T:class => DeadBody as T; }
 }
 namespace Celeste {
     public class Level : Scene {
         public Tracker Tracker = new(); public EntityList Entities = new(); public Session Session = new();
-        public bool Paused, Transitioning, Completed;
+        public bool Paused, Transitioning, Completed, InCutscene, SkippingCutscene;
         public ScreenWipe? Wipe;
     }
     public class Session { public AreaKey Area = new(); public Vector2? RespawnPoint; public object MapData = new(); public string Level = "room"; }
+    public class MapData { }
     public class AreaKey { public string SID = "test/chapter"; public int Mode; }
     public class Player : Entity { public const int StIntroRespawn=14; public bool Dead; public Leader Leader = new(); public StateMachine StateMachine = new(); }
     public class StateMachine { public int State; }
@@ -27,7 +28,7 @@ namespace Celeste {
     public class PlayerDeadBody { }
     public class LevelData { public string Name="next"; }
     public class TextMenu { }
-    public class ScreenWipe { }
+    public class ScreenWipe { public bool WipeIn; public float Percent; }
     public class HiresSnow { }
     public class LevelExit : Scene { public enum Mode { GoldenBerryRestart, GiveUp } }
 }
@@ -91,13 +92,16 @@ namespace Celeste.Mod.MicroblocksQolUtils {
     public static class SpeedrunToolBridge { public static void Load(){} public static void Unload(){} }
     public static class SpeedrunToolAutoSave { public static bool ManualOperationActive; }
     public static class RhythmMapDetector { public static bool IsRhythmSensitive(object map, string room) => false; }
+    public enum MiniMapCollectibleKind { GoldenBerry }
+    public class MiniMapCollectible { public MiniMapCollectibleKind Kind; public string Room=""; public bool IsCollected(Celeste.Session s)=>false; }
+    public static class MapCollectibleCache { public static List<MiniMapCollectible> Get(Celeste.MapData map)=>[]; }
     public class MaterialModOptions { }
     public static class QolSettingsOverlay { public static object? ActivePage => null; }
     public readonly record struct MusicPosition(string Event,int TimelineMilliseconds) { public static MusicPosition Read()=>new("",0); }
     public class NativeRoomRecording {
         public static List<NativeRoomRecording> Started=[];
         public static bool FailNextStart;
-        public string Path=""; public string AudioPath=>Path+".audio"; public string BgmPath=>Path+".bgm"; public string MusicEventsPath=>Path+".music"; public string CaptureReportPath=>Path+".capture.json"; public string RecoveryManifestPath=>Path+".recovery.json";
+        public string Path=""; public string AudioPath=>Path+".audio"; public string BgmPath=>Path+".bgm"; public string MusicEventsPath=>Path+".music"; public string SfxEventsPath=>Path+".sfxevents"; public string CaptureReportPath=>Path+".capture.json"; public string RecoveryManifestPath=>Path+".recovery.json";
         public void CheckpointRecovery() { }
         public double MediaTimeSeconds; public bool HasAudioTap=>true;
         public double TimelineTimeSeconds => MediaTimeSeconds;

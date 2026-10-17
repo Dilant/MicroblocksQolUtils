@@ -48,7 +48,9 @@ public static class AutoRecorder {
     private static bool deathReplayBranchActive;
     private static bool deathReplayWaitingForStablePlayer;
     private static bool deathReplayPauseSuspended;
-    private static bool deathReplayFinalizeRequested;
+    private static ulong deathReplayQueuedEpoch;
+    private static double deathReplayClipStartSeconds;
+    private static string deathReplayDeathRoom = "";
     private static bool fullRecordingEnabled;
     private static bool reconstructBgm;
     private static readonly RecordingSessionState SessionState = new();
@@ -171,7 +173,7 @@ public static class AutoRecorder {
         }
 
         ObserveRoom(level);
-        bool carryingGolden = !player.Dead && CarriesGolden(player);
+        bool carryingGolden = PlayerLifecycle.IsAlive(player) && CarriesGolden(player);
         SessionState.Observe(settings.AutomaticRecording, carryingGolden);
         // Mode changes are explicit user actions; save an existing auto session rather
         // than discarding it or silently changing its ownership.
@@ -188,10 +190,11 @@ public static class AutoRecorder {
         current?.CheckpointRecovery();
         deathReplayCurrent?.CheckpointRecovery();
         FlushPendingRecordingStop();
-        if (deathReplayFinalizeRequested && DeathAnimationFinished()) {
-            deathReplayFinalizeRequested = false;
-            // Keep capturing through the death animation and its final black wipe.
+        // The lifecycle ends a death replay on the first frame of the next segment
+        // (respawn wipe / level entry), then the next replay starts on that same frame.
+        if (PlayerLifecycle.AdvanceOnce(Engine.Scene as Level).LeftDying) {
             FinalizeDeathReplayCapture();
+            if (MicroblocksQolUtilsModule.Settings.DeathReplayEnabled) StartDeathReplayRecording();
         }
         if (manualSlSuspended && MicroblocksQolUtilsModule.Settings.DeathReplayEnabled && deathReplayCurrent is null) {
             StartDeathReplayRecording();
@@ -219,13 +222,13 @@ public static class AutoRecorder {
             SuspendForPause();
             return;
         }
-        if (current is null && PlayerIsRecordable(level, player)) StartRunRecording(level);
+        if (current is null && PlayerLifecycle.IsControllable(level, player)) StartRunRecording(level);
         NativeRoomRecording? recording = current;
         if (recording is null) return;
 
-        if (pauseSuspended && PlayerIsRecordable(level, player) && PauseOverlayCleared(level)) {
+        if (pauseSuspended && PlayerLifecycle.IsControllable(level, player) && PauseOverlayCleared(level)) {
             ResumeFullRecordingAfterPause(recording);
-        } else if (waitingForStablePlayer && PlayerIsRecordable(level, player)) {
+        } else if (waitingForStablePlayer && PlayerLifecycle.IsControllable(level, player)) {
             StartBranchAtCurrentTime(seamlessFromPrevious: resumeFromSavedState);
         }
 
@@ -249,24 +252,26 @@ public static class AutoRecorder {
 
     private static void UpdateDeathReplayRecording(Level level, Player player, QolSettings settings) {
         if (!settings.DeathReplayEnabled) {
-            if (deathReplayCurrent is not null || deathReplayFinalizeRequested)
+            if (deathReplayCurrent is not null)
                 DiscardDeathReplayRecording();
             return;
         }
         if (manualSlSuspended) return;
-        if (deathReplayFinalizeRequested) return;
+        if (PlayerLifecycle.InDeathSequence) return;
         if (level.Paused && !MicroblocksQolUtilsModule.Settings.RecordingKeepPausedFrames) {
             SuspendDeathReplayForPause();
             return;
         }
-        if (deathReplayCurrent is null && PlayerIsRecordable(level, player))
+        // Begin on the black frame where the next scene starts fading in.
+        if (deathReplayCurrent is null
+            && (PlayerLifecycle.IsControllable(level, player) || level.Wipe is ScreenWipe { WipeIn: true }))
             StartDeathReplayRecording();
         NativeRoomRecording? recording = deathReplayCurrent;
         if (recording is null) return;
 
-        if (deathReplayPauseSuspended && PlayerIsRecordable(level, player) && PauseOverlayCleared(level)) {
+        if (deathReplayPauseSuspended && PlayerLifecycle.IsControllable(level, player) && PauseOverlayCleared(level)) {
             ResumeDeathReplayAfterPause(recording);
-        } else if (deathReplayWaitingForStablePlayer && PlayerIsRecordable(level, player)) {
+        } else if (deathReplayWaitingForStablePlayer && PlayerLifecycle.IsControllable(level, player)) {
             StartDeathReplayBranchAtCurrentTime();
         }
 
@@ -410,16 +415,17 @@ public static class AutoRecorder {
         PlayerDeadBody? body = orig(self, direction, evenIfInvincible, registerDeathInStats);
         if (body is null) return body;
         RecordingTransitionAutoSave.Cancel();
+        // Every real death is registered; the lifecycle owns the phase from here.
+        PlayerLifecycle.NotifyDeath(self.Scene as Level);
 
-        if (deathReplayCurrent is not null) {
-            QueueDeathReplay(self, deathReplayCurrent);
-            deathReplayBranchActive = false;
-            deathReplayBranchSeamlessFromPrevious = false;
-            deathReplayWaitingForStablePlayer = true;
+        if (deathReplayCurrent is { } deathReplay) {
+            // ESC -> retry kills the player while paused, so reopen the branch here,
+            // or the death cutscene is never captured.
+            if (!deathReplayBranchActive) StartDeathReplayBranchAtCurrentTime(seamlessFromPrevious: false);
+            double bufferSeconds = Math.Clamp(MicroblocksQolUtilsModule.Settings.DeathReplayBufferSeconds, 10, 60);
+            deathReplayClipStartSeconds = Math.Max(0, deathReplay.TimelineTimeSeconds - bufferSeconds);
+            deathReplayDeathRoom = (self.Scene as Level)?.Session.Level ?? recordingRoomName ?? "room";
             deathReplayPauseSuspended = false;
-            // Player.Die runs from inside EntityList.Update; the capture is stopped later by
-            // AfterEngineUpdate rather than doing synchronous FMOD teardown in this hook.
-            deathReplayFinalizeRequested = true;
         }
 
         if (current is null || pendingRecordingStop is not null) return body;
@@ -510,6 +516,7 @@ public static class AutoRecorder {
 
     private static void BeginRun(Level level) {
         SessionState.ResetRun(keepManualRequest: true);
+        PlayerLifecycle.ResetRun();
         runKey = RunKey(level);
         areaSid = level.Session.Area.SID;
         observedRespawnPoint = level.Session.RespawnPoint;
@@ -620,13 +627,21 @@ public static class AutoRecorder {
             DeathReplayPrefix.Add(deathClip);
         branchActive = deathReplayBranchActive = false;
         manualSlSuspended = true;
+        // Loading rewinds the death, so end the replay on this frame and start the next one here.
+        if (loading && PlayerLifecycle.Rewind().LeftDying) {
+            FinalizeDeathReplayCapture();
+            if (MicroblocksQolUtilsModule.Settings.DeathReplayEnabled) {
+                StartDeathReplayRecording();
+                deathReplayBranchActive = false;
+            }
+        }
     }
 
     internal static void ManualSlPresented(ulong timestamp) {
         if (!CapturePresentationGate.AcceptGameplay || !manualSlSuspended || SpeedrunToolAutoSave.ManualOperationActive
             || Engine.Scene is not Level level || level.Paused
             || level.Wipe is not null || !PauseOverlayCleared(level)
-            || level.Tracker.GetEntity<Player>() is not { } player || !PlayerIsRecordable(level, player)) return;
+            || level.Tracker.GetEntity<Player>() is not { } player || !PlayerLifecycle.IsControllable(level, player)) return;
         // Observe SRT, never unfreeze it. Resume video at its first clean presented
         // frame, without waiting for a QolHud update or pausing the game ourselves.
         ObserveRoom(level);
@@ -663,11 +678,6 @@ public static class AutoRecorder {
             saveSuspendedFull = current;
         if (MicroblocksQolUtilsModule.Settings.DeathReplayEnabled && deathReplayCurrent is null)
             StartDeathReplayRecording();
-        if (deathReplayCurrent is { } death) {
-            saveSuspendedDeath = death;
-            deathReplayBranchActive = false;
-            deathReplayWaitingForStablePlayer = false;
-        }
     }
 
     internal static bool TryResumeAfterInternalSave() {
@@ -812,25 +822,29 @@ public static class AutoRecorder {
         ResetFullRecordingState();
     }
 
-    private static void QueueDeathReplay(Player player, NativeRoomRecording recording) {
-        QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        if (!settings.DeathReplayEnabled) return;
+    private static void QueueDeathReplay(NativeRoomRecording recording) {
+        if (PlayerLifecycle.DeathEpoch == deathReplayQueuedEpoch
+            || !MicroblocksQolUtilsModule.Settings.DeathReplayEnabled) return;
 
-        double bufferSeconds = Math.Clamp(settings.DeathReplayBufferSeconds, 10, 60);
-        List<RecordingClip> clips = CaptureRecentDeathReplayClips(recording, bufferSeconds);
+        QolSettings settings = MicroblocksQolUtilsModule.Settings;
+        double end = recording.TimelineTimeSeconds;
+        double start = Math.Min(deathReplayClipStartSeconds, end);
+        double windowSeconds = end - start;
+        if (windowSeconds <= 0) return;
+        List<RecordingClip> clips = CaptureRecentDeathReplayClips(recording, windowSeconds);
         bool unedited = !settings.RecordingEditingEnabled;
         if (unedited) {
-            double end = recording.TimelineTimeSeconds;
-            clips = [new(recording.Path, Math.Max(0, end - bufferSeconds), Math.Min(end, bufferSeconds), "", 0, BgmFollowsVideo: true)];
+            clips = [new(recording.Path, start, windowSeconds, "", 0, BgmFollowsVideo: true)];
         }
         if (clips.Count == 0) return;
+        // Mark the death consumed only once it actually produced an export.
+        deathReplayQueuedEpoch = PlayerLifecycle.DeathEpoch;
 
-        Level? level = player.Scene as Level;
         PendingDeathReplays.Add(new PendingDeathReplay(
             clips,
             DateTime.Now,
-            level?.Session.Area.SID ?? areaSid,
-            level?.Session.Level ?? "room",
+            areaSid,
+            deathReplayDeathRoom.Length > 0 ? deathReplayDeathRoom : "room",
             !unedited && reconstructBgm,
             !unedited && settings.RecordingRemoveFreezeFrames
         ));
@@ -913,6 +927,7 @@ public static class AutoRecorder {
 
     private static void FinalizeDeathReplayCapture() {
         NativeRoomRecording? recording = deathReplayCurrent;
+        if (recording is not null) QueueDeathReplay(recording);
         deathReplayCurrent = null;
         if (recording is not null) {
             FinishStoppedRecording(recording, recording.StopAsync(), TakeDeathReplayJobs());
@@ -929,22 +944,6 @@ public static class AutoRecorder {
             collectible.Kind == MiniMapCollectibleKind.GoldenBerry
             && string.Equals(collectible.Room, level.Session.Level, StringComparison.Ordinal)
             && !collectible.IsCollected(level.Session));
-    }
-
-    private static bool DeathAnimationFinished() {
-        if (Engine.Scene is not Level level) return true;
-        // A death replay must include the complete death cutscene and the wipe to black.
-        // Once the wipe/cutscene is gone, the next update can safely finalize it.
-        return !level.InCutscene && !level.SkippingCutscene && !level.Transitioning && level.Wipe is null;
-    }
-
-    private static bool PlayerIsRecordable(Level level, Player player) {
-        // A freshly respawned Player is already non-dead while the respawn wipe/animation is
-        // still running. Starting a retained branch there puts the tail of the death sequence
-        // back into manually and automatically saved videos.
-        return !player.Dead
-            && !level.Transitioning
-            && player.StateMachine.State != Player.StIntroRespawn;
     }
 
     private static bool PauseOverlayCleared(Level level) {
@@ -1006,7 +1005,6 @@ public static class AutoRecorder {
     }
 
     private static void DiscardDeathReplayRecording() {
-        deathReplayFinalizeRequested = false;
         NativeRoomRecording? recording = deathReplayCurrent;
         deathReplayCurrent = null;
         if (recording is not null) FinishStoppedRecording(recording, recording.StopAsync(), []);
@@ -1017,6 +1015,7 @@ public static class AutoRecorder {
     private static void StopAndReset(bool deleteSource) {
         NativeRoomRecording? recording = current;
         NativeRoomRecording? deathRecording = deathReplayCurrent;
+        if (deleteSource && deathRecording is not null) QueueDeathReplay(deathRecording);
         current = null;
         deathReplayCurrent = null;
         if (recording is not null) {
@@ -1187,6 +1186,7 @@ public static class AutoRecorder {
 
     private static void ResetTimelineState() {
         manualSlSuspended = false;
+        PlayerLifecycle.ResetRun();
         ResetFullRecordingState();
         runKey = "";
         areaSid = "";
@@ -1222,7 +1222,9 @@ public static class AutoRecorder {
         deathReplayWaitingForStablePlayer = waitForStablePlayer;
         deathReplayPauseSuspended = false;
         deathReplayPauseResumeAfterMediaSeconds = null;
-        deathReplayFinalizeRequested = false;
+        deathReplayClipStartSeconds = 0;
+        deathReplayDeathRoom = "";
+        deathReplayQueuedEpoch = PlayerLifecycle.DeathEpoch;
         if (!keepRecording) deathReplayCurrent = null;
     }
 

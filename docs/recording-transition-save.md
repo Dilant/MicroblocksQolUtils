@@ -48,8 +48,13 @@
   其他未选中的手动槽不会全局禁用自动恢复；手动 SL 只分段录像，不使用内部冻结门。
 - 金草莓重开章节、自定义 `DeathAction`、PlayerSeeker、切面中、跨房间或旧录制的状态不接管。
   `DeathAction == null` 或显式的 `level.Reload` 属于正常复活。
-- hook 只取消死亡协程并排队；帧末先结束死亡回放，再读内部槽并恢复录像时间线。
+- hook 只取消死亡协程并排队；死亡回放不再在帧末提前结束，而是保持死亡期间的分支继续录完整段死亡演出，
+  到复活渐入的黑帧（`level.Wipe` 的 `WipeIn`）才最终化，随后读内部槽并恢复录像时间线。
   失败时只回退一次原死亡流程，不把玩家留在死锁状态；离开场景后不会调用旧场景的回调。
+- 死亡过场中途手动 load 时，死亡回放按 load 帧截断保存并在同处开始下一轮，不再等载入后的关卡：
+  否则会与 `ManualSlPresented` 抢跑，把死亡过场拼进恢复后的状态。载入等待照例排除，下一轮接在恢复帧之后。
+- 生命阶段（活着 / 死亡中 / 重生 / 进入关卡）由 `PlayerLifecycle` 统一；死亡接管与切面自动保存都读它的每帧快照
+  （含 `PlayerAlive`/`PlayerDead`/`PlayerControllable`/`InCutscene` 等正交信号），不再各自判定 `player.Dead`/`StIntroRespawn`/过场。
 - 内部恢复不依赖用户的 `AutoLoadStateAfterDeath` 设置。正常死亡的会话/总计/章节时间和死亡数
   在恢复后保留，即使用户手动 SL 设置启用了 `SaveTimeAndDeaths`。
 

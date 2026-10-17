@@ -45,6 +45,7 @@ namespace Celeste {
         public Tracker Tracker = new();
         public Monocle.EntityList Entities = [];
         public bool Completed, Transitioning, Paused, InCutscene, SkippingCutscene;
+        public ScreenWipe? Wipe;
         public bool GoldenMarked;
         public bool TimerMarked => Session.GetFlag("SpeedrunTool_SavedSate");
         public int Position, CameraPosition, SceneFrame, Reloads;
@@ -55,6 +56,7 @@ namespace Celeste {
         public T? GetEntity<T>() where T : class => Player as T;
     }
     public class Player { public const int StIntroRespawn = 14; public bool Dead; public StateMachine StateMachine = new(); }
+    public class ScreenWipe { public bool WipeIn; public float Percent; }
     public class PlayerSeeker : Monocle.Entity;
     public class StateMachine { public int State; }
     public class PlayerDeadBody : Monocle.Entity {

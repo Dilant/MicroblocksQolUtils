@@ -40,7 +40,7 @@ internal static class RecordingDeathRecovery {
     internal static void AfterEngineUpdate() {
         if (pendingBody is not { } body) return;
         if (body.Scene is not Level level || !ReferenceEquals(Engine.Scene, level)
-            || level.Tracker.GetEntity<Player>() is { Dead: false }) {
+            || PlayerLifecycle.Latest.PlayerAlive) {
             pendingBody = null;
             fallback = null;
             return;

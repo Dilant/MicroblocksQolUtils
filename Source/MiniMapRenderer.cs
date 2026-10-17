@@ -125,7 +125,7 @@ public static class MiniMapRenderer {
             return true;
         }
 
-        PlayerDeadBody? deadBody = level.Entities.FindFirst<PlayerDeadBody>();
+        PlayerDeadBody? deadBody = PlayerLifecycle.Latest.DeadBody;
         if (deadBody is null) {
             center = default;
             return false;

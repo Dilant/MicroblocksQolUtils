@@ -106,8 +106,9 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Tick(l);
     Check(AutoRecorder.IsRecording==(death==GoldenRecordingDeath.Continue),"golden death choice");
     Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="自动录像")== (death==GoldenRecordingDeath.Save?1:0),"save failed attempt only when requested");
-    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"death replay independently saves");
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"death replay waits for the whole death sequence");
     var exit=new LevelExit(); Everest.Events.Level.Exit(l,exit,LevelExit.Mode.GoldenBerryRestart); Everest.Events.Level.End(l,exit);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"death replay independently saves");
     var resumed=new Level(); var respawned=new Player{Scene=resumed}; resumed.Tracker.Player=respawned;
     Tick(resumed);Advance(3);Tick(resumed);
     Check(AutoRecorder.IsRecording==(death==GoldenRecordingDeath.Continue),"continue survives golden LevelExit without pickup");
@@ -205,35 +206,37 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     Check(clips.Count==2 && clips[1].SeamlessFromPrevious,"validated saved-state recovery still crossfades");
     Check(clips.Sum(c=>c.DurationSeconds)==5,"seamless recovery kept failed gameplay");
 }
-// Real orchestrator: an internal recovery opens from the accepted source frame,
-// not the later wall clock / first QolHud.Update. Full and death sinks may lag
-// independently; both must be ready before opening either branch.
+// An internal recovery reopens the full recording from its accepted source frame
+// (not the later wall clock / first QolHud.Update).
+// A death replay keeps recording until the death sequence settles,
+// so it is never closed mid-cutscene.
 {
     var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(3);
     AutoRecorder.SuspendForInternalSave(100);
     var saved=AutoRecorder.CaptureTimeline(l)!;
     Advance(1); AutoRecorder.ResumeAfterInternalSave(200); Advance(2);
     On.Celeste.Player.Raise(p); AutoRecorder.AfterEngineUpdate();
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,
+        "death replay closed inside the death sequence");
     var full=NativeRoomRecording.Started.First();
     p.Dead=false; AutoRecorder.RestoreTimeline(l,saved);
     AutoRecorder.StageInternalRecoveryResume();
     var death=NativeRoomRecording.Started.Last();
-    Check(!ReferenceEquals(full,death) && !death.Stopped,"recovery did not create a fresh death sink while frozen");
-    full.ResumeFrameTimestamp=death.ResumeFrameTimestamp=0;
-    full.MediaTimeSeconds=10; death.MediaTimeSeconds=1;
+    Check(!ReferenceEquals(full,death) && !death.Stopped,"recovery disturbed the death sink mid-cutscene");
+    full.ResumeFrameTimestamp=0; full.MediaTimeSeconds=10; death.MediaTimeSeconds=1;
     AutoRecorder.PrepareInternalSaveResume(1000);
-    Check(full.RequestedFrame==1000 && death.RequestedFrame==1000,"recovery did not request a GOP boundary from both sinks");
-    full.ResumeFrameTimestamp=1001; full.AcceptedFrameTime=10;
+    Check(full.RequestedFrame==1000,"recovery did not request a GOP boundary from the full sink");
     Advance(0.5);
-    Check(!AutoRecorder.TryResumeAfterInternalSave(),"full sink released recovery before death sink accepted the frame");
+    Check(!AutoRecorder.TryResumeAfterInternalSave(),"full sink reopened without an accepted frame");
     Check(AutoRecorder.CaptureTimeline(l)!.Clips.SequenceEqual(saved.Clips),"GPU wait entered the saved prefix");
-    death.ResumeFrameTimestamp=1002; death.AcceptedFrameTime=1.2;
-    Check(AutoRecorder.TryResumeAfterInternalSave(),"both accepted frames did not resume recovery");
-    Advance(2); On.Celeste.Player.Raise(p); AutoRecorder.AfterEngineUpdate();
+    full.ResumeFrameTimestamp=1001; full.AcceptedFrameTime=10;
+    Check(AutoRecorder.TryResumeAfterInternalSave(),"accepted full frame did not resume recovery");
+    Advance(2);
+    Check(AutoRecorder.IsDeathReplayRecording,"death replay ended before the scene settled");
+    AutoRecorder.AfterEngineUpdate();
     var replay=NativeRecordingFinalizer.Jobs.Last(j=>j.Description=="死亡回放");
     Check(replay.PreferVideoCopy,"recovery regressed death replay to mandatory full video transcode");
-    Check(replay.Clips.Count==1 && replay.Clips[0].StartSeconds==1.2 && replay.Clips[0].SeamlessFromPrevious,
-        "death replay did not start at its accepted clean keyframe");
+    Check(replay.Clips.Count>0 && replay.Clips.Sum(c=>c.DurationSeconds)>0,"recovery dropped the death replay");
     p.Dead=false; AutoRecorder.RestoreTimeline(l,saved); AutoRecorder.StageInternalRecoveryResume();
     full.AcceptedFrameTime=20; full.MediaTimeSeconds=20.3;
     AutoRecorder.PrepareInternalSaveResume(2000);
@@ -242,6 +245,54 @@ foreach(var death in Enum.GetValues<GoldenRecordingDeath>()) foreach(var end in 
     var clips=NativeRecordingFinalizer.Jobs.Last(j=>j.Description!="死亡回放").Clips;
     Check(clips.Count==2 && clips[0].DurationSeconds==3 && clips[1].StartSeconds==20
         && clips[1].SeamlessFromPrevious,"repeated recovery retained failed gameplay or used resume wall time/crossfade");
+}
+// A death replay carries the whole death cutscene and ends on the black frame
+// where the respawn wipe appears, and the next replay begins on that same frame.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(4);
+    On.Celeste.Player.Raise(p); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"death replay closed at the death moment");
+    l.Entities.DeadBody=new PlayerDeadBody();
+    for(int i=0;i<3;i++){Advance(0.2);Tick(l);}
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"death replay closed during the death cutscene");
+    l.Wipe=new(){WipeIn=false,Percent=0.5f}; Advance(0.3); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"death replay closed on the wipe-out");
+    l.Wipe.Percent=1f; Advance(0.2); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"death replay closed before the respawn wipe");
+    // The reload replaces the room and the respawn wipe appears while the screen is black.
+    l.Entities.DeadBody=null; p.Dead=false; l.Wipe=new(){WipeIn=true,Percent=0.0f}; Advance(0.1); Tick(l);
+    var replay=NativeRecordingFinalizer.Jobs.Last(j=>j.Description=="死亡回放");
+    Check(replay.Clips[0].StartSeconds==0 && Math.Abs(replay.Clips.Sum(c=>c.DurationSeconds)-5.2)<0.01,
+        "death replay did not run from the pre-death buffer to the black frame");
+    Check(AutoRecorder.IsDeathReplayRecording,"next death replay did not begin on the black frame");
+}
+// ESC -> retry kills the player while still paused,
+// and pausing had closed the retained death branch.
+// The death cutscene and its wipe must still be recorded.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(3);
+    l.Paused=true; Tick(l); Advance(5);
+    On.Celeste.Player.Raise(p); Tick(l);
+    l.Paused=false;
+    l.Entities.DeadBody=new PlayerDeadBody(); Advance(0.4); Tick(l);
+    l.Wipe=new(){WipeIn=false,Percent=0.5f}; Advance(0.3); Tick(l);
+    l.Entities.DeadBody=null; p.Dead=false; l.Wipe=new(){WipeIn=true,Percent=0f}; Advance(0.1); Tick(l);
+    var replay=NativeRecordingFinalizer.Jobs.Last(j=>j.Description=="死亡回放");
+    Check(replay.Clips.Any(c=>c.StartSeconds>7.9 && c.DurationSeconds>0.5),
+        "pause→retry death cutscene and wipe were not recorded");
+}
+// A golden death replaces the whole Level.
+// The next replay must still begin on the restart's fade-in.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Golden,GoldenRecordingDeath.Discard,replay:true); Pickup(p,b); Tick(l); Advance(4);
+    On.Celeste.Player.Raise(p); Tick(l);
+    var exit=new LevelExit(); Everest.Events.Level.Exit(l,exit,LevelExit.Mode.GoldenBerryRestart); Everest.Events.Level.End(l,exit);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"golden death replay not saved");
+    var resumed=new Level(); var respawned=new Player{Scene=resumed};
+    respawned.StateMachine.State=Player.StIntroRespawn;
+    resumed.Tracker.Player=respawned; resumed.Wipe=new(){WipeIn=true,Percent=0.0f};
+    Tick(resumed);
+    Check(AutoRecorder.IsDeathReplayRecording,"next replay missed the golden restart fade-in");
 }
 // Saved branches contain immutable edit references to one append-only source.
 // Loading/clearing game slots must not recycle the source backing older routes.
@@ -337,5 +388,58 @@ Check(RecordingLibrary.KindOf(root,Path.Combine(root,"auto","map","a.mp4"))==Rec
 Check(RecordingLibrary.KindOf(root,Path.Combine(root,"autonomous","a.mp4"))==RecordingLibraryKind.Full,"directory boundary must be exact");
 Check(RecordingLibrary.KindOf(root,Path.Combine(root,"deaths","map","a.mp4"))==RecordingLibraryKind.DeathReplay,"classify deaths");
 Check(RecordingLibrary.KindOf(root,Path.Combine(root,"legacy-map","a.mp4"))==RecordingLibraryKind.Full,"legacy output preserved");
+// A manual load during the death cutscene
+// ends the replay on the load frame and starts the next one there.
+// It must never splice the cutscene into the restored state,
+// even when the loaded level still reports a cutscene/transition.
+foreach(bool deepCutscene in new[]{false,true}) {
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:true); Tick(l); Advance(4);
+    On.Celeste.Player.Raise(p); Tick(l);
+    l.Entities.DeadBody=new PlayerDeadBody(); Advance(0.6); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"load replay ended before the load");
+    AutoRecorder.SuspendForManualSl(loading:true);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"manual load did not end the death replay");
+    var loaded=NativeRecordingFinalizer.Jobs.Last(j=>j.Description=="死亡回放");
+    Check(loaded.Clips.Count==1 && loaded.Clips[0].StartSeconds==0
+        && Math.Abs(loaded.Clips.Sum(c=>c.DurationSeconds)-4.6)<0.01,"manual load did not stop the replay on the load frame");
+    Check(AutoRecorder.IsDeathReplayRecording,"next replay did not start at the load");
+    // The restored save fades in; ManualSlPresented reopens the new recording.
+    l.Entities.DeadBody=null; p.Dead=false; l.InCutscene=deepCutscene; l.Wipe=new(){WipeIn=true,Percent=0f};
+    Advance(0.5); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"loaded level produced a spliced replay");
+    l.Wipe=null;
+    AutoRecorder.ManualSlPresented(1000); Advance(1); Tick(l);
+    l.InCutscene=false; Advance(0.2); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==1,"manual-sl resume reproduced the spliced replay");
+    Check(AutoRecorder.IsDeathReplayRecording,"death replay stopped after the load");
+}
+// PlayerLifecycle owns the player live-state phases.
+{
+    var l=new Level(); var p=new Player{Scene=l}; l.Tracker.Player=p;
+    PlayerLifecycle.ResetRun();
+    Check(PlayerLifecycle.State==PlayerLiveState.EnteringLevel,"run starts in EnteringLevel");
+    Check(PlayerLifecycle.AdvanceOnce(l).EnteredAlive,"level entry settles to Alive");
+    Check(!PlayerLifecycle.AdvanceOnce(l).EnteredAlive && PlayerLifecycle.State==PlayerLiveState.Alive,"Alive is stable");
+    Check(PlayerLifecycle.NotifyDeath().EnteredDying && PlayerLifecycle.InDeathSequence,"death latches Dying");
+    l.Entities.DeadBody=new PlayerDeadBody();
+    Check(!PlayerLifecycle.AdvanceOnce(l).LeftDying,"dead body keeps Dying");
+    l.Entities.DeadBody=null; p.Dead=false; l.Wipe=new(){WipeIn=true,Percent=0f};
+    var respawn=PlayerLifecycle.AdvanceOnce(l);
+    Check(respawn.LeftDying && respawn.EnteredRespawning,"respawn wipe starts the next segment");
+    l.Wipe=null;
+    Check(PlayerLifecycle.AdvanceOnce(l).EnteredAlive,"respawn settles to Alive");
+    PlayerLifecycle.NotifyDeath();
+    Check(PlayerLifecycle.Rewind().LeftDying && PlayerLifecycle.State==PlayerLiveState.Alive,"manual load rewinds the death");
+}
+// A death that happened with no replay open must never be exported by a later recording.
+{
+    var(l,p,b)=Begin(AutoRecordingMode.Chapter,replay:false); Tick(l); Advance(3);
+    On.Celeste.Player.Raise(p); Tick(l);
+    MicroblocksQolUtilsModule.Settings.DeathReplayEnabled=true;
+    l.Entities.DeadBody=null; p.Dead=false; l.Wipe=new(){WipeIn=true,Percent=0f}; Advance(0.1); Tick(l);
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"a death with no open replay was exported");
+    Advance(3); Everest.Events.Level.End(l,new Scene());
+    Check(NativeRecordingFinalizer.Jobs.Count(j=>j.Description=="死亡回放")==0,"a later recording exported the earlier death");
+}
 AutoRecorder.Unload();
 Console.WriteLine($"Recorder regression checks passed: {checks}");

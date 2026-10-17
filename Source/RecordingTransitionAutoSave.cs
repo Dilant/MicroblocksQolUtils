@@ -98,10 +98,15 @@ internal static class RecordingTransitionAutoSave {
         // recording-start, room-transition or respawn-point-change requests.
         if (pendingLevel is not { } level) return;
         QolSettings settings = MicroblocksQolUtilsModule.Settings;
-        Player? player = level.Tracker.GetEntity<Player>();
         if (!settings.Enabled || !settings.RecordingAutoSaveOnTransition || !AutoRecorder.IsRecording
             || !ReferenceEquals(Engine.Scene, level) || !ReferenceEquals(level.Session, pendingSession)
-            || level.Completed || player?.Dead == true) {
+            || level.Completed) {
+            Cancel();
+            return;
+        }
+        // AutoRecorder.AfterEngineUpdate already sampled this frame (same Engine.Scene).
+        PlayerLiveSnapshot life = PlayerLifecycle.Latest;
+        if (life.PlayerDead) {
             Cancel();
             return;
         }
@@ -110,8 +115,8 @@ internal static class RecordingTransitionAutoSave {
             Cancel();
             return;
         }
-        if (player is null || player.StateMachine.State == Player.StIntroRespawn
-            || level.Paused || level.InCutscene || level.SkippingCutscene || Engine.FreezeTimer > 0f
+        if (!life.PlayerControllable
+            || level.Paused || life.InCutscene || Engine.FreezeTimer > 0f
             || !AutoRecorder.CanSaveTransitionTimeline) return;
 
         // Deep-cloning may mutate EntityList. Never call SL from QolHud.Update or

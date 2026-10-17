@@ -123,6 +123,9 @@ See [capture architecture and testing](docs/capture-architecture.md).
 - Full recordings and death replays use independent encoding/editing sessions sharing one pixel/FMOD source. Death
   replays retain the latest 30 seconds by default, configurable from 10 to 60
   seconds, save after death, and resume automatically after respawn.
+- Death replays begin on the first frame of a fade-in (or according to the configured replay
+  length) and end on the first frame of the next segment's fade-in (respawn or level entry);
+  consecutive replays join on that frame.
 - Continuous H.264 death replays reuse the live encoder's packets rather than encoding video twice;
   adjacent room/music metadata splits keep this fast path. MP4 edit lists hide decoder preroll at
   non-keyframe cuts while retaining SFX, reconstructed BGM and room-specific music policy.

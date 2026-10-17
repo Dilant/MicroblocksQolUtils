@@ -166,7 +166,8 @@ SFX 按源视频片段裁切，music 按输出时间线连续重放，再交给 
 - 保存按 `Boundary → Indicator → Save/Cloning → Clean → ResumeFrame` 推进，整个过程跳过游戏更新。
   Boundary 是保存姿态第一次干净呈现的 end-exclusive 边界；不把保存 UI 的首帧当作姿态边界。
 - 内部死亡恢复同样冻结更新；恢复实体后不等待 QolHud.Update 重新开启分支，而是在冻结状态下
-  请求两路 sink 的恢复关键帧，按各自实际接受的源帧时间戳开启分支，再放行物理更新。
+  请求完整录像 sink 的恢复关键帧，按其实际接受的源帧时间戳开启分支，再放行物理更新。
+  死亡回放不参与这个恢复门：它保持死亡期间已打开的分支，继续录到复活渐入的黑帧才最终化。
   捕获尚未结束的死亡音效在新分支之前停止。没有有效存档的死亡仍使用普通复活流程。
 - 队列延迟不会选择旧帧；恢复首个物理步不使用保存/读档耗时，首次恢复绘制前最多放行一个物理步，
   避免 fixed-step catch-up 连跑多步。普通绘制也可解除此补步门，停止采集不会造成更新死锁。
@@ -221,6 +222,24 @@ SFX 按源视频片段裁切，music 按输出时间线连续重放，再交给 
   有效硬切处若存在异常波形阶跃，仅在两侧各最多 1ms 做 SFX 去爆音；不借用被删死亡区间的样本，
   不改视频时长或加入画面 crossfade。正常连续波形、纯 metadata 分段不动，event-rendered BGM 在此步骤后混入。
   旧的混合 BGM sidecar 无法分离时不做这项 SFX 去爆音，避免误伤音乐。
+
+### 死亡回放采集窗口
+
+玩家生命阶段由 `PlayerLifecycle` 统一：4 个线性状态（`Alive`/`Dying`/`Respawning`/`EnteringLevel`）带各自的
+上升/下降沿，另加正交信号（`PlayerAlive`/`PlayerDead`/`PlayerControllable`/`InCutscene`）和本帧的 `DeadBody` 引用。
+`AutoRecorder` 每帧只调用一次 `AdvanceOnce`（上升/下降沿只由跨越它的那一次采样产生，调用点必须唯一），
+`RecordingDeathRecovery`、`RecordingTransitionAutoSave`、`InstantDeaths`、`MiniMapRenderer` 都读只读快照 `Latest`，
+不再各自判定 `player.Dead`/`PlayerDeadBody`/`StIntroRespawn`/wipe/过场；`NotifyDeath`/`Rewind` 这两个帧外入口各自重采样一次。死亡回放在“离开 `Dying`”的第一帧收尾，下一轮从同一帧开始。
+
+- 起点：`死亡时刻 − 缓冲`（`DeathReplayBufferSeconds`，10–60s，录不到则夹到 0），即裁剪区间从死前缓冲开始。
+- 终点：穿过整段死亡过场（`InCutscene`/`SkippingCutscene`），到**下一段渐入的第一帧**（复活 wipe 的 `WipeIn`
+  黑帧，或场景已可玩）才结束；没有 wipe 时，还需 `PlayerDeadBody` 消失、不在 `Transitioning` 且玩家已复活。
+  该帧即离开 `Dying` 的第一帧（`EnteredRespawning`，不是可玩帧），也是下一轮录制的起点；
+  裁剪区间为「死亡时刻 − 缓冲」到该帧，包含死前缓冲与完整死亡演出，而不只是死亡前最近的一段。
+- `Player.Die` 只登记死亡并保持死亡分支打开（暂停中 ESC→retry 会先重开分支）；
+  帧末在同一黑帧立即开始下一段回放，使连续回放无缝衔接。
+- 死亡过场中途手动 load 时，在 load 帧就收尾并立即开下一轮：SRT 的 load 是原地换状态 + 渐入 wipe（没有渐出），
+  等载入后的关卡再收尾会与 `ManualSlPresented` 抢跑，把死亡过场拼接到恢复后的状态。载入等待照例排除。
 
 ### 死亡回放快速最终化
 

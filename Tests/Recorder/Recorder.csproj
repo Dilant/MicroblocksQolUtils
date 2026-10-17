@@ -3,6 +3,7 @@
   <ItemGroup>
     <Compile Include="../../Source/CapturePresentationGate.cs" Link="CapturePresentationGate.cs" />
     <Compile Include="../../Source/AutoRecorder.cs" Link="AutoRecorder.cs" />
+    <Compile Include="../../Source/PlayerLifecycle.cs" Link="PlayerLifecycle.cs" />
     <Compile Include="../../Source/RecordingSessionState.cs" Link="RecordingSessionState.cs" />
     <Compile Include="../../Source/RecordingTimeline.cs" Link="RecordingTimeline.cs" />
     <Compile Include="../../Source/RecordingLibrary.cs" Link="RecordingLibrary.cs" />
