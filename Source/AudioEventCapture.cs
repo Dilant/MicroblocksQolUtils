@@ -128,25 +128,25 @@ internal static class AudioEventCapture {
     private delegate void stopInstanceOrig(FMOD.Studio.EventInstance instance, bool allowFadeOut);
     private static void stopInstance(stopInstanceOrig orig, FMOD.Studio.EventInstance instance, bool allowFadeOut) {
         orig(instance, allowFadeOut);
-        if (instance.isValid()) Record(instance, "stop", null, allowFadeOut ? 0f : 1f);
+        if (instance != null && instance.isValid()) Record(instance, "stop", null, allowFadeOut ? 0f : 1f);
     }
     private delegate void pauseInstanceHook(pauseInstanceOrig orig, FMOD.Studio.EventInstance instance);
     private delegate void pauseInstanceOrig(FMOD.Studio.EventInstance instance);
     private static void pauseInstance(pauseInstanceOrig orig, FMOD.Studio.EventInstance instance) {
         orig(instance);
-        if (instance.isValid()) Record(instance, "setPaused", null, 1f);
+        if (instance != null && instance.isValid()) Record(instance, "setPaused", null, 1f);
     }
     private delegate void resumeInstanceHook(resumeInstanceOrig orig, FMOD.Studio.EventInstance instance);
     private delegate void resumeInstanceOrig(FMOD.Studio.EventInstance instance);
     private static void resumeInstance(resumeInstanceOrig orig, FMOD.Studio.EventInstance instance) {
         orig(instance);
-        if (instance.isValid()) Record(instance, "setPaused", null, 0f);
+        if (instance != null && instance.isValid()) Record(instance, "setPaused", null, 0f);
     }
     private delegate void setParameterHook(setParameterOrig orig, FMOD.Studio.EventInstance instance, string param, float value);
     private delegate void setParameterOrig(FMOD.Studio.EventInstance instance, string param, float value);
     private static void setParameter(setParameterOrig orig, FMOD.Studio.EventInstance instance, string param, float value) {
         orig(instance, param, value);
-        if (instance.isValid()) Record(instance, "setParameterValue", param, value);
+        if (instance != null && instance.isValid()) Record(instance, "setParameterValue", param, value);
     }
     internal static void Unload() {
         foreach (var hook in Hooks) hook.Dispose();
