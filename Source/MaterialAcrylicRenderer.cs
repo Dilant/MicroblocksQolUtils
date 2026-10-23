@@ -67,13 +67,16 @@ internal static class MaterialAcrylicRenderer {
 
         rendering = true;
         activePage = page;
+        IMaterialAcrylicOverlay? overlay = page as IMaterialAcrylicOverlay;
         page.SuppressNormalRender = true;
         try {
+            overlay?.HideOverlaysForAcrylicCapture();
             // Keep the normal Engine render lifecycle intact. In particular, the
             // Overworld must run BeforeRender exactly once so its mountain and HUD
             // buffers are ready before RenderScene redirects the final composition.
             orig(self);
         } finally {
+            overlay?.RestoreOverlaysAfterAcrylicCapture();
             page.SuppressNormalRender = false;
             activePage = null;
             rendering = false;
@@ -86,6 +89,7 @@ internal static class MaterialAcrylicRenderer {
             orig(self);
             return;
         }
+        IMaterialAcrylicOverlay? overlay = page as IMaterialAcrylicOverlay;
 
         GraphicsDevice graphics = Engine.Graphics.GraphicsDevice;
         RenderTargetBinding[] originalTargets = graphics.GetRenderTargets();
@@ -94,6 +98,7 @@ internal static class MaterialAcrylicRenderer {
         try {
             EnsureTargets(Math.Max(1, originalViewport.Width), Math.Max(1, originalViewport.Height));
             if (sceneTarget is null || blurTemporary is null || blurredTarget is null) {
+                overlay?.RestoreOverlaysAfterAcrylicCapture();
                 RestoreOutput(graphics, originalTargets, originalViewport);
                 page.SuppressNormalRender = false;
                 orig(self);
@@ -103,7 +108,15 @@ internal static class MaterialAcrylicRenderer {
             graphics.SetRenderTarget(sceneTarget);
             graphics.Viewport = new Viewport(0, 0, sceneTarget.Width, sceneTarget.Height);
             graphics.Clear(Engine.ClearColor);
-            orig(self);
+            HiresSnow? snow = (self as Overworld)?.Snow;
+            bool renderSnow = snow is { Visible: true };
+            if (renderSnow) snow!.Visible = false;
+            try {
+                orig(self);
+            } finally {
+                overlay?.RestoreOverlaysAfterAcrylicCapture();
+                if (renderSnow) snow!.Visible = true;
+            }
             sceneRendered = true;
 
             float sampleScale = MathHelper.Lerp(0.8f, 3.1f,
@@ -123,9 +136,12 @@ internal static class MaterialAcrylicRenderer {
 
             page.SuppressNormalRender = false;
             DrawMaterialPage(page);
+            DrawOverlays(overlay);
+            if (renderSnow) snow!.Render(self);
             successfulFrames++;
         } catch (Exception exception) {
             page.SuppressNormalRender = false;
+            overlay?.RestoreOverlaysAfterAcrylicCapture();
             RestoreOutput(graphics, originalTargets, originalViewport);
             failed = true;
             Logger.LogDetailed(exception, "MicroblocksQolUtils/MaterialAcrylic");
@@ -163,6 +179,15 @@ internal static class MaterialAcrylicRenderer {
     }
 
     private static void DrawMaterialPage(IMaterialAcrylicPage page) {
+        DrawScreenBatch(() => page.RenderMaterialContent(acrylicActive: true));
+    }
+
+    private static void DrawOverlays(IMaterialAcrylicOverlay? overlay) {
+        if (overlay is null || !overlay.HasOverlaysForAcrylic) return;
+        DrawScreenBatch(() => overlay.RenderOverlaysAboveAcrylic());
+    }
+
+    private static void DrawScreenBatch(Action render) {
         bool begun = false;
         try {
             Draw.SpriteBatch.Begin(
@@ -175,9 +200,15 @@ internal static class MaterialAcrylicRenderer {
                 Engine.ScreenMatrix
             );
             begun = true;
-            page.RenderMaterialContent(acrylicActive: true);
+            render();
         } finally {
-            if (begun) Draw.SpriteBatch.End();
+            if (begun) {
+                try {
+                    Draw.SpriteBatch.End();
+                } catch (Exception exception) {
+                    Logger.LogDetailed(exception, "MicroblocksQolUtils/MaterialAcrylic");
+                }
+            }
         }
     }
 

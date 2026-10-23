@@ -96,6 +96,11 @@ internal static class MaterialTouch {
         surface.Targets = targets.ToArray();
     }
 
+    internal static void Suppress(Entity owner, MaterialMotionController motion, string context) {
+        Publish(owner, [], context);
+        motion.Update([]);
+    }
+
     private static void FinishSignature(Action<string> orig, string mode) {
         Entity? owner = ActiveOwner();
         if (owner is null || !surfaces.TryGetValue(owner, out Surface? surface)) { orig(mode); return; }

@@ -14,7 +14,7 @@ namespace Celeste.Mod.MicroblocksQolUtils;
 /// TextMenu, so custom entries and binding/config sub-pages keep their original behavior;
 /// this class only owns grouping, navigation, layout and mouse interaction.
 /// </summary>
-public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
+public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcrylicOverlay {
     private const float ScreenWidth = 1920f;
     private const float ScreenHeight = 1080f;
     private const float TabHeight = MaterialSplitPageLayout.TabHeight;
@@ -90,6 +90,9 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     private string settingSearchText = "";
     private string imeText = "";
     private SearchTarget searchTarget;
+    private bool configOverlayOpen;
+    private readonly List<Entity> externalOverlays = [];
+    private readonly List<(Entity Entity, bool Visible)> hiddenOverlays = [];
 
     public bool SuppressNormalRender { get; set; }
 
@@ -189,6 +192,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     public override void Update() {
         MaterialTouch.BeginUpdate(this);
         base.Update();
+        RefreshExternalOverlays();
         ModOptionsLayout layout = ModOptionsLayout.Create(1f - Ease.CubeOut(ease));
         tabScroll.Update(MaxTabScroll(layout));
         rowScroll.Update(MaxRowScroll(layout));
@@ -206,6 +210,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         }
 
         if (menu is null) return;
+        if (configOverlayOpen) {
+            // The key/button config screen owns input while it is open.
+            menu.Focused = false;
+            return;
+        }
         bool acceptsInput = pauseLevel is not null || Selected && Focused;
         if (acceptsInput && inputDelay <= 0f && dropdownItem is null && compositePopupItem is null
             && UpdateSearchInput(layout)) {
@@ -1004,6 +1013,46 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
         }
     }
 
+    private void RefreshExternalOverlays() {
+        externalOverlays.Clear();
+        configOverlayOpen = false;
+        if (!Visible || Scene is not { } scene) return;
+        foreach (Entity entity in scene.Entities) {
+            if (entity is KeyboardConfigUI or ButtonConfigUI) {
+                configOverlayOpen = true;
+                if (entity.Depth >= Depth) entity.Depth = Depth - 1;
+            }
+            if (!entity.Visible || !entity.TagCheck(Tags.HUD) || entity.Depth >= Depth) continue;
+            externalOverlays.Add(entity);
+        }
+    }
+
+    bool IMaterialAcrylicOverlay.HasOverlaysForAcrylic => externalOverlays.Count > 0;
+
+    void IMaterialAcrylicOverlay.HideOverlaysForAcrylicCapture() {
+        hiddenOverlays.Clear();
+        foreach (Entity entity in externalOverlays) {
+            hiddenOverlays.Add((entity, entity.Visible));
+            entity.Visible = false;
+        }
+    }
+
+    void IMaterialAcrylicOverlay.RestoreOverlaysAfterAcrylicCapture() {
+        foreach ((Entity entity, bool visible) in hiddenOverlays) entity.Visible = visible;
+        hiddenOverlays.Clear();
+    }
+
+    void IMaterialAcrylicOverlay.RenderOverlaysAboveAcrylic() {
+        foreach (Entity entity in externalOverlays) {
+            if (!entity.Visible) continue;
+            try {
+                entity.Render();
+            } catch (Exception exception) {
+                Logger.LogDetailed(exception, "MicroblocksQolUtils/MaterialAcrylic");
+            }
+        }
+    }
+
     private void SelectItem(TextMenu.Item item) {
         if (menu is null || menu.Current == item) return;
         menu.Current?.OnLeave?.Invoke();
@@ -1034,6 +1083,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage {
     }
 
     private void UpdateInteractions(ModOptionsLayout layout) {
+        if (configOverlayOpen) {
+            // Do not leave hidden setting rows alive as touch targets under the config UI.
+            MaterialTouch.Suppress(this, motion, TouchContext);
+            return;
+        }
         List<MaterialInteractionTarget> targets = [
             new MaterialInteractionTarget("mod-options.search.tabs", layout.TabSearch,
                 Focused: searchTarget == SearchTarget.Tabs, TouchKind: "text", TouchText: tabSearchText,

@@ -108,7 +108,12 @@ internal sealed class QolSettingsOverlay : Entity, IMaterialAcrylicPage {
         recordingRefreshTimer -= Engine.RawDeltaTime;
         if (IsRecorderTab && IsRecorderLibrary && recordingRefreshTimer <= 0f) RefreshRecordingFiles();
 
-        if (bindingConfig is not null) return;
+        if (bindingConfig is not null) {
+            // The key/button config screen handles its own input; do not leave the hidden
+            // setting rows alive as touch targets underneath it.
+            MaterialTouch.Suppress(this, motion, TouchContext);
+            return;
+        }
 
         OverlayLayout layout = OverlayLayout.Create(1f - Ease.CubeOut(ease));
         rowScroll.Update(MaxRowScroll(layout));
